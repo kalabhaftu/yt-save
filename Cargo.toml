@@ -13,7 +13,7 @@ authors = ["Yt Save contributors"]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 slint = { version = "1.18.1", features = ["raw-window-handle-06", "system-tray", "unstable-winit-030"] }

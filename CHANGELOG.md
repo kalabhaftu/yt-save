@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.1.8 — Audio-only output
+## 0.1.8 — Audio output and queue controls
 
 - Add per-item Video or Audio only selection and Original, MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV output choices, plus persisted Best/320/192/128 kbps quality settings for applicable conversions.
 - Preserve choices through SQLite migration, retries, and startup recovery; converted audio uses yt-dlp's FFmpeg postprocessor and reports missing bundled tools clearly. ALAC/FLAC/WAV limitations are explained in the UI and docs.
-- Add command and persistence coverage; Windows UI and real media conversion acceptance remain pending.
+- Add per-job pause and resume for queued and active downloads. Active pause stops yt-dlp and its Windows process tree, preserves partial files and queue settings, and resumes with yt-dlp `--continue`; queued pause and worker claim use conditional SQLite transitions.
+- Keep Paused rows paused after restart and recover interrupted Pausing/Canceling stop requests as Failed with progress retained for review. Add focused command, persistence, and recovery coverage; Windows UI, process-tree, partial-resume, and audio conversion acceptance remain pending.
 
 ## 0.1.7 — Active download cancellation
 

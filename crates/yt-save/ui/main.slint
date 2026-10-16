@@ -81,6 +81,8 @@ export component MainWindow inherits Window {
     callback open-download-folder();
     callback clear-completed-requested();
     callback cancel-download-requested(string);
+    callback pause-download-requested(string);
+    callback resume-download-requested(string);
     callback remove-download-requested(string);
     callback retry-download-requested(string);
     callback open-output-requested(string);
@@ -596,7 +598,23 @@ export component MainWindow inherits Window {
                                                 Text { text: "Retry"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.retry-download-requested(row.id); } }
                                             }
+                                            if row.status == "Paused" : Rectangle {
+                                                width: 54px;
+                                                height: 24px;
+                                                border-radius: 6px;
+                                                background: #252a39;
+                                                Text { text: "Resume"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea { clicked => { root.resume-download-requested(row.id); } }
+                                            }
                                             if row.status == "Queued" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" : Rectangle {
+                                                width: 54px;
+                                                height: 24px;
+                                                border-radius: 6px;
+                                                background: #252a39;
+                                                Text { text: "Pause"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea { clicked => { root.pause-download-requested(row.id); } }
+                                            }
+                                            if row.status == "Queued" || row.status == "Paused" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" || row.status == "Pausing" : Rectangle {
                                                 width: 54px;
                                                 height: 24px;
                                                 border-radius: 6px;

@@ -182,7 +182,26 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Marks a waiting job canceled only if its worker has not claimed it yet.
+    /// Pauses a waiting job only if its worker has not claimed it yet.
+    pub async fn pause_queued_download(&self, id: &str, updated_at: i64) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Paused', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Queued'",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Marks a waiting or already-paused job canceled without racing an active worker.
     pub async fn cancel_queued_download(&self, id: &str, updated_at: i64) -> Result<bool> {
         let store = self.clone();
         let id = id.to_owned();
@@ -191,7 +210,7 @@ impl Store {
                 let affected = connection.execute(
                     "UPDATE downloads
                      SET status = 'Canceled', error = NULL, updated_at = :updated
-                     WHERE id = :id AND status = 'Queued'",
+                     WHERE id = :id AND status IN ('Queued', 'Paused')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
@@ -229,7 +248,7 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Requests cancellation for a job whose yt-dlp worker is already active.
+    /// Requests cancellation for a worker that has claimed the job or is stopping for pause.
     pub async fn request_active_cancel(&self, id: &str, updated_at: i64) -> Result<bool> {
         let store = self.clone();
         let id = id.to_owned();
@@ -238,6 +257,25 @@ impl Store {
                 let affected = connection.execute(
                     "UPDATE downloads
                      SET status = 'Canceling', updated_at = :updated
+                     WHERE id = :id AND status IN ('Analyzing', 'Downloading', 'Post-processing', 'Pausing')",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Requests a pause for a worker that has already claimed the queue record.
+    pub async fn request_active_pause(&self, id: &str, updated_at: i64) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Pausing', updated_at = :updated
                      WHERE id = :id AND status IN ('Analyzing', 'Downloading', 'Post-processing')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
@@ -267,7 +305,26 @@ impl Store {
         .context("join database read")?
     }
 
-    /// Persists an active phase change only while cancellation has not been requested.
+    pub async fn is_pausing(&self, id: &str) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let pausing = connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM downloads WHERE id = :id AND status = 'Pausing'
+                     )",
+                    named_params! { ":id": id },
+                    |row| row.get(0),
+                )?;
+                Ok(pausing)
+            })
+        })
+        .await
+        .context("join database read")?
+    }
+
+    /// Persists an active phase change only while no pause or cancellation has been requested.
     pub async fn update_active_download(&self, record: DownloadRecord) -> Result<bool> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -303,7 +360,7 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Persists progress without allowing an old progress snapshot to undo cancellation.
+    /// Persists progress only while the job remains active and has no pending stop request.
     pub async fn update_download_progress(&self, record: DownloadRecord) -> Result<bool> {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
@@ -337,7 +394,7 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Persists a completed or failed outcome only while cancellation has not won the race.
+    /// Persists a completed or failed outcome only while no pause or cancellation has won.
     pub async fn finish_download(&self, record: DownloadRecord) -> Result<bool> {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
@@ -376,8 +433,8 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Records a failed process-tree cancellation without replacing a newer terminal state.
-    pub async fn fail_canceling_download(&self, record: DownloadRecord) -> Result<bool> {
+    /// Records a failed pause/cancel process stop without replacing a newer terminal state.
+    pub async fn fail_stopping_download(&self, record: DownloadRecord) -> Result<bool> {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
         let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
@@ -391,7 +448,7 @@ impl Store {
                          total_bytes = :total, speed_bytes_per_second = :speed,
                          eta_seconds = :eta, output_path = :output, error = :error,
                          updated_at = :updated
-                     WHERE id = :id AND status = 'Canceling'",
+                     WHERE id = :id AND status IN ('Canceling', 'Pausing')",
                     named_params! {
                         ":id": record.id,
                         ":title": record.title,
@@ -403,6 +460,39 @@ impl Store {
                         ":eta": eta_seconds,
                         ":output": record.output_path,
                         ":error": record.error,
+                        ":updated": record.updated_at,
+                    },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Completes an active pause after the yt-dlp process tree has stopped.
+    pub async fn finish_paused_download(&self, record: DownloadRecord) -> Result<bool> {
+        let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
+        let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET title = :title, source = :source, status = 'Paused',
+                         progress = :progress, downloaded_bytes = :downloaded,
+                         total_bytes = :total, speed_bytes_per_second = NULL,
+                         eta_seconds = NULL, output_path = :output, error = NULL,
+                         updated_at = :updated
+                     WHERE id = :id AND status = 'Pausing'",
+                    named_params! {
+                        ":id": record.id,
+                        ":title": record.title,
+                        ":source": record.source,
+                        ":progress": record.progress,
+                        ":downloaded": downloaded_bytes,
+                        ":total": total_bytes,
+                        ":output": record.output_path,
                         ":updated": record.updated_at,
                     },
                 )?;
@@ -450,7 +540,7 @@ impl Store {
         .context("join database write")?
     }
 
-    /// Atomically moves a failed or interrupted record back to the queue and returns its state.
+    /// Atomically moves a failed, interrupted, or canceled record back to the queue.
     /// The conditional update prevents a stale or duplicate UI action from starting a second retry.
     pub async fn retry_download(
         &self,
@@ -465,6 +555,33 @@ impl Store {
                     "UPDATE downloads
                      SET status = 'Queued', error = NULL, updated_at = :updated
                      WHERE id = :id AND status IN ('Failed', 'Interrupted', 'Canceled')",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                if affected == 0 {
+                    return Ok(None);
+                }
+
+                load_download_by_id(connection, &id)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Resumes a paused job by returning it to the queue while retaining its partial progress.
+    pub async fn resume_download(
+        &self,
+        id: &str,
+        updated_at: i64,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Paused'",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 if affected == 0 {
@@ -951,6 +1068,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_pause_blocks_claim_and_resume_preserves_download_choices_and_partial_state() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        queued.download_mode = crate::model::DownloadMode::AudioOnly;
+        queued.audio_format = crate::model::AudioFormat::Mp3;
+        queued.audio_quality = crate::model::AudioQuality::K192;
+        queued.progress = 48.0;
+        queued.downloaded_bytes = Some(480);
+        queued.total_bytes = Some(1_000);
+        queued.playlist_index = Some(4);
+        store.save_download(queued).await.unwrap();
+
+        assert!(store.pause_queued_download("queued", 20).await.unwrap());
+        assert!(!store.pause_queued_download("queued", 21).await.unwrap());
+        assert!(store.claim_queued_download("queued", 21).await.unwrap().is_none());
+
+        let paused = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(paused.status, "Paused");
+        assert_eq!(paused.progress, 48.0);
+        assert_eq!(paused.downloaded_bytes, Some(480));
+        assert_eq!(paused.audio_format, crate::model::AudioFormat::Mp3);
+        assert_eq!(paused.audio_quality, crate::model::AudioQuality::K192);
+        assert_eq!(paused.playlist_index, Some(4));
+
+        let resumed = store.resume_download("queued", 22).await.unwrap().unwrap();
+        assert_eq!(resumed.status, "Queued");
+        assert_eq!(resumed.progress, 48.0);
+        assert_eq!(resumed.downloaded_bytes, Some(480));
+        assert_eq!(resumed.download_mode, crate::model::DownloadMode::AudioOnly);
+        assert_eq!(resumed.audio_format, crate::model::AudioFormat::Mp3);
+        assert_eq!(resumed.audio_quality, crate::model::AudioQuality::K192);
+        assert_eq!(resumed.playlist_index, Some(4));
+        assert!(store.resume_download("queued", 23).await.unwrap().is_none());
+        assert_eq!(
+            store.claim_queued_download("queued", 24).await.unwrap().unwrap().status,
+            "Analyzing"
+        );
+
+        let paused_for_cancel = DownloadRecord::queued(
+            "paused-for-cancel".to_owned(),
+            "https://example.test/other-media".to_owned(),
+            11,
+        );
+        store.save_download(paused_for_cancel).await.unwrap();
+        assert!(store.pause_queued_download("paused-for-cancel", 25).await.unwrap());
+        assert!(store.cancel_queued_download("paused-for-cancel", 26).await.unwrap());
+        let canceled = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "paused-for-cancel")
+            .unwrap();
+        assert_eq!(canceled.status, "Canceled");
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_queued_pause_and_worker_claim_have_one_winner() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let (paused, claimed) = tokio::join!(
+            store.pause_queued_download("queued", 20),
+            store.claim_queued_download("queued", 21),
+        );
+        let paused = paused.unwrap();
+        let claimed = claimed.unwrap();
+        assert_ne!(paused, claimed.is_some());
+
+        let persisted = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(persisted.status, if paused { "Paused" } else { "Analyzing" });
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_pause_blocks_stale_writes_and_cancel_can_supersede_pausing() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        active.status = "Downloading".to_owned();
+        active.progress = 30.0;
+        active.downloaded_bytes = Some(300);
+        active.total_bytes = Some(1_000);
+        store.save_download(active.clone()).await.unwrap();
+
+        assert!(store.request_active_pause("active", 20).await.unwrap());
+        assert!(store.is_pausing("active").await.unwrap());
+        let mut stale = active.clone();
+        stale.status = "Post-processing".to_owned();
+        stale.progress = 60.0;
+        stale.downloaded_bytes = Some(600);
+        assert!(!store.update_download_progress(stale.clone()).await.unwrap());
+        assert!(!store.finish_download(stale.clone()).await.unwrap());
+
+        assert!(store.request_active_cancel("active", 21).await.unwrap());
+        assert!(!store.finish_paused_download(stale.clone()).await.unwrap());
+        let mut canceled = active;
+        canceled.status = "Canceled".to_owned();
+        canceled.error = Some("Canceled by user; partial files were kept.".to_owned());
+        assert!(store.finish_canceled_download(canceled.clone()).await.unwrap());
+        assert!(!store.finish_paused_download(canceled).await.unwrap());
+        let canceled = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(canceled.status, "Canceled");
+        assert_eq!(canceled.progress, 30.0);
+        assert_eq!(canceled.downloaded_bytes, Some(300));
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_active_pause_and_terminal_write_have_one_persisted_winner() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        active.status = "Downloading".to_owned();
+        store.save_download(active.clone()).await.unwrap();
+
+        let mut completed = active;
+        completed.status = "Completed".to_owned();
+        completed.progress = 100.0;
+        let (pause_requested, terminal_saved) = tokio::join!(
+            store.request_active_pause("active", 20),
+            store.finish_download(completed),
+        );
+        let pause_requested = pause_requested.unwrap();
+        let terminal_saved = terminal_saved.unwrap();
+        assert_ne!(pause_requested, terminal_saved);
+
+        let persisted = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(persisted.status, if pause_requested { "Pausing" } else { "Completed" });
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_pause_finishes_as_paused_and_can_resume_without_losing_progress() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        active.status = "Downloading".to_owned();
+        active.progress = 62.5;
+        active.downloaded_bytes = Some(625);
+        active.total_bytes = Some(1_000);
+        active.speed_bytes_per_second = Some(200.0);
+        active.eta_seconds = Some(2);
+        store.save_download(active.clone()).await.unwrap();
+
+        assert!(store.request_active_pause("active", 20).await.unwrap());
+        active.status = "Paused".to_owned();
+        active.updated_at = 21;
+        assert!(store.finish_paused_download(active).await.unwrap());
+        let resumed = store.resume_download("active", 22).await.unwrap().unwrap();
+        assert_eq!(resumed.status, "Queued");
+        assert_eq!(resumed.progress, 62.5);
+        assert_eq!(resumed.downloaded_bytes, Some(625));
+        assert_eq!(resumed.total_bytes, Some(1_000));
+        assert_eq!(resumed.speed_bytes_per_second, None);
+        assert_eq!(resumed.eta_seconds, None);
+        assert!(!store.request_active_pause("active", 23).await.unwrap());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn active_cancel_and_terminal_write_have_one_persisted_winner() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
         let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
@@ -979,7 +1284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_process_tree_cancellation_only_finishes_a_canceling_row() {
+    async fn failed_process_tree_stop_only_finishes_a_stopping_row() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
         let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
         let mut active = DownloadRecord::queued(
@@ -994,14 +1299,37 @@ mod tests {
         active.status = "Failed".to_owned();
         active.error = Some("process-tree termination could not be confirmed".to_owned());
         active.updated_at = 21;
-        assert!(store.fail_canceling_download(active.clone()).await.unwrap());
-        assert!(!store.fail_canceling_download(active).await.unwrap());
+        assert!(store.fail_stopping_download(active.clone()).await.unwrap());
+        assert!(!store.fail_stopping_download(active).await.unwrap());
         let persisted = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(persisted.status, "Failed");
         assert_eq!(
             persisted.error.as_deref(),
             Some("process-tree termination could not be confirmed")
         );
+
+        let mut pausing = DownloadRecord::queued(
+            "pausing".to_owned(),
+            "https://example.test/other-media".to_owned(),
+            11,
+        );
+        pausing.status = "Downloading".to_owned();
+        store.save_download(pausing.clone()).await.unwrap();
+        assert!(store.request_active_pause("pausing", 22).await.unwrap());
+        pausing.status = "Failed".to_owned();
+        pausing.error = Some("process-tree pause could not be confirmed".to_owned());
+        pausing.updated_at = 23;
+        assert!(store.fail_stopping_download(pausing.clone()).await.unwrap());
+        assert!(!store.fail_stopping_download(pausing).await.unwrap());
+        let pausing = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "pausing")
+            .unwrap();
+        assert_eq!(pausing.status, "Failed");
+        assert_eq!(pausing.error.as_deref(), Some("process-tree pause could not be confirmed"));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

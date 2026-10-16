@@ -21,6 +21,23 @@ const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DownloadOptions {
+    mode: DownloadMode,
+    audio_format: AudioFormat,
+    audio_quality: AudioQuality,
+}
+
+impl DownloadOptions {
+    pub(crate) fn new(
+        mode: DownloadMode,
+        audio_format: AudioFormat,
+        audio_quality: AudioQuality,
+    ) -> Self {
+        Self { mode, audio_format, audio_quality }
+    }
+}
+
 #[derive(Clone)]
 pub struct DownloadEngine {
     dependencies: DependencyPaths,
@@ -56,7 +73,16 @@ pub struct DownloadResult {
 #[derive(Debug)]
 pub enum EngineOutcome<T> {
     Completed(T),
+    Paused,
     Canceled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum JobSignal {
+    #[default]
+    Continue,
+    Pause,
+    Cancel,
 }
 
 impl DownloadEngine {
@@ -73,10 +99,11 @@ impl DownloadEngine {
         url: &str,
         playlist_index: Option<i64>,
     ) -> Result<MediaMetadata> {
-        let (_cancel_sender, mut cancel) = watch::channel(false);
-        match self.inspect_with_playlist_index_cancellable(url, playlist_index, &mut cancel).await?
+        let (_signal_sender, mut signal) = watch::channel(JobSignal::Continue);
+        match self.inspect_with_playlist_index_cancellable(url, playlist_index, &mut signal).await?
         {
             EngineOutcome::Completed(metadata) => Ok(metadata),
+            EngineOutcome::Paused => bail!("metadata inspection was paused"),
             EngineOutcome::Canceled => bail!("metadata inspection was canceled"),
         }
     }
@@ -85,10 +112,10 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
-        cancel: &mut watch::Receiver<bool>,
+        signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
-        if cancellation_requested(cancel) {
-            return Ok(EngineOutcome::Canceled);
+        if signal_requested(signal) != JobSignal::Continue {
+            return Ok(outcome_for_signal(signal_requested(signal)));
         }
         self.dependencies.require_for_download()?;
         let mut command = self.inspect_command(url, playlist_index)?;
@@ -98,12 +125,12 @@ impl DownloadEngine {
         let stderr = child.stderr.take().context("open yt-dlp metadata stderr")?;
         let stdout_task = tokio::spawn(read_all(stdout));
         let stderr_task = tokio::spawn(read_all(stderr));
-        let (status, canceled) = tokio::select! {
+        let (status, stop_signal) = tokio::select! {
             biased;
-            status = child.wait() => (status.context("wait for yt-dlp metadata")?, false),
-            _ = wait_for_cancellation(cancel) => {
+            status = child.wait() => (status.context("wait for yt-dlp metadata")?, JobSignal::Continue),
+            stop_signal = wait_for_signal(signal) => {
                 match terminate_process_tree(&mut child).await {
-                    Ok(status) => (status, true),
+                    Ok(status) => (status, stop_signal),
                     Err(error) => {
                         stdout_task.abort();
                         stderr_task.abort();
@@ -119,8 +146,8 @@ impl DownloadEngine {
             stdout: stdout_task.await.context("join yt-dlp metadata stdout reader")??,
             stderr: stderr_task.await.context("join yt-dlp metadata stderr reader")??,
         };
-        if canceled && !output.status.success() {
-            return Ok(EngineOutcome::Canceled);
+        if stop_signal != JobSignal::Continue && !output.status.success() {
+            return Ok(outcome_for_signal(stop_signal));
         }
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -153,21 +180,18 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
-        download_mode: DownloadMode,
-        audio_format: AudioFormat,
-        audio_quality: AudioQuality,
-        cancel: &mut watch::Receiver<bool>,
+        options: DownloadOptions,
+        signal: &mut watch::Receiver<JobSignal>,
         mut on_progress: F,
     ) -> Result<EngineOutcome<DownloadResult>>
     where
         F: FnMut(ProgressUpdate) + Send,
     {
-        if cancellation_requested(cancel) {
-            return Ok(EngineOutcome::Canceled);
+        if signal_requested(signal) != JobSignal::Continue {
+            return Ok(outcome_for_signal(signal_requested(signal)));
         }
         self.dependencies.require_for_download()?;
-        let mut command =
-            self.download_command(url, playlist_index, download_mode, audio_format, audio_quality)?;
+        let mut command = self.download_command(url, playlist_index, options)?;
         tokio::fs::create_dir_all(&self.output_directory)
             .await
             .with_context(|| format!("create {}", self.output_directory.display()))?;
@@ -185,12 +209,12 @@ impl DownloadEngine {
 
         let mut output_path = None;
         let mut lines = BufReader::new(stdout).lines();
-        let mut cancellation_triggered = false;
+        let mut stop_signal = JobSignal::Continue;
         loop {
             tokio::select! {
                 biased;
-                _ = wait_for_cancellation(cancel) => {
-                    cancellation_triggered = true;
+                requested = wait_for_signal(signal) => {
+                    stop_signal = requested;
                     if let Err(error) = terminate_process_tree(&mut child).await {
                         stderr_task.abort();
                         let _ = stderr_task.await;
@@ -206,13 +230,13 @@ impl DownloadEngine {
                 }
             }
         }
-        let status = if cancellation_triggered {
+        let status = if stop_signal != JobSignal::Continue {
             child.wait().await.context("wait for yt-dlp")?
         } else {
             tokio::select! {
                 biased;
-                _ = wait_for_cancellation(cancel) => {
-                    cancellation_triggered = true;
+                requested = wait_for_signal(signal) => {
+                    stop_signal = requested;
                     match terminate_process_tree(&mut child).await {
                         Ok(status) => status,
                         Err(error) => {
@@ -225,14 +249,14 @@ impl DownloadEngine {
                 status = child.wait() => status.context("wait for yt-dlp")?,
             }
         };
-        if cancellation_triggered {
+        if stop_signal != JobSignal::Continue {
             while let Some(line) = lines.next_line().await.context("read yt-dlp output")? {
                 process_download_line(&line, &mut output_path, &mut on_progress);
             }
         }
         let stderr = stderr_task.await.unwrap_or_default();
-        if cancellation_triggered && !status.success() {
-            return Ok(EngineOutcome::Canceled);
+        if stop_signal != JobSignal::Continue && !status.success() {
+            return Ok(outcome_for_signal(stop_signal));
         }
         if !status.success() {
             warn!(code = ?status.code(), "yt-dlp download failed");
@@ -263,9 +287,7 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
-        download_mode: DownloadMode,
-        audio_format: AudioFormat,
-        audio_quality: AudioQuality,
+        options: DownloadOptions,
     ) -> Result<Command> {
         let mut command = self.base_command();
         command
@@ -285,13 +307,13 @@ impl DownloadEngine {
             .arg("--output")
             .arg(OUTPUT_TEMPLATE)
             .arg("--format");
-        match download_mode {
+        match options.mode {
             DownloadMode::Video => {
                 command.arg("bv*+ba/b");
             }
             DownloadMode::AudioOnly => {
                 command.arg("bestaudio");
-                if let Some(format) = audio_format.yt_dlp_name() {
+                if let Some(format) = options.audio_format.yt_dlp_name() {
                     let missing = match (
                         self.dependencies.ffmpeg.is_file(),
                         self.dependencies.ffprobe.is_file(),
@@ -304,12 +326,12 @@ impl DownloadEngine {
                     if let Some(missing) = missing {
                         bail!(
                             "Converting audio to {} requires the bundled FFmpeg and FFprobe tools; {missing}.",
-                            audio_format.label()
+                            options.audio_format.label()
                         );
                     }
                     command.arg("--extract-audio").arg("--audio-format").arg(format);
-                    if audio_format.supports_quality_setting() {
-                        command.arg("--audio-quality").arg(audio_quality.yt_dlp_argument());
+                    if options.audio_format.supports_quality_setting() {
+                        command.arg("--audio-quality").arg(options.audio_quality.yt_dlp_argument());
                     }
                 }
             }
@@ -357,16 +379,25 @@ where
     Ok(bytes)
 }
 
-fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
-    *cancel.borrow()
+fn signal_requested(signal: &watch::Receiver<JobSignal>) -> JobSignal {
+    *signal.borrow()
 }
 
-async fn wait_for_cancellation(cancel: &mut watch::Receiver<bool>) {
+fn outcome_for_signal<T>(signal: JobSignal) -> EngineOutcome<T> {
+    match signal {
+        JobSignal::Pause => EngineOutcome::Paused,
+        JobSignal::Cancel => EngineOutcome::Canceled,
+        JobSignal::Continue => unreachable!("continue is not a stop request"),
+    }
+}
+
+async fn wait_for_signal(signal: &mut watch::Receiver<JobSignal>) -> JobSignal {
     loop {
-        if cancellation_requested(cancel) {
-            return;
+        let requested = signal_requested(signal);
+        if requested != JobSignal::Continue {
+            return requested;
         }
-        if cancel.changed().await.is_err() {
+        if signal.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     }
@@ -538,6 +569,12 @@ mod tests {
     }
 
     #[test]
+    fn stop_signals_produce_distinct_paused_and_canceled_outcomes() {
+        assert!(matches!(outcome_for_signal::<()>(JobSignal::Pause), EngineOutcome::Paused));
+        assert!(matches!(outcome_for_signal::<()>(JobSignal::Cancel), EngineOutcome::Canceled));
+    }
+
+    #[test]
     fn missing_deno_does_not_block_non_youtube_extractors() {
         let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -609,19 +646,14 @@ mod tests {
         };
         let engine = DownloadEngine::new(dependencies, output_directory.clone());
         let arguments = engine
-            .download_command(
-                "https://example.test/watch/123",
-                None,
-                DownloadMode::Video,
-                AudioFormat::Original,
-                AudioQuality::Best,
-            )
+            .download_command("https://example.test/watch/123", None, DownloadOptions::default())
             .unwrap()
             .as_std()
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(!arguments.iter().any(|argument| argument == "--playlist-items"));
+        assert!(arguments.iter().any(|argument| argument == "--continue"));
 
         let output_flag = arguments.iter().position(|argument| argument == "--output").unwrap();
         assert_eq!(arguments.get(output_flag + 1).map(String::as_str), Some(OUTPUT_TEMPLATE));
@@ -670,9 +702,7 @@ mod tests {
                 .download_command(
                     "https://example.test/playlist",
                     Some(7),
-                    DownloadMode::Video,
-                    AudioFormat::Original,
-                    AudioQuality::Best,
+                    DownloadOptions::default(),
                 )
                 .unwrap(),
         );
@@ -687,9 +717,7 @@ mod tests {
                 .download_command(
                     "https://example.test/list",
                     Some(-2),
-                    DownloadMode::Video,
-                    AudioFormat::Original,
-                    AudioQuality::Best,
+                    DownloadOptions::default(),
                 )
                 .is_err()
         );
@@ -714,7 +742,11 @@ mod tests {
         let engine = DownloadEngine::new(dependencies, root.clone());
         let args = |mode, format, quality| {
             engine
-                .download_command("https://example.test/audio", None, mode, format, quality)
+                .download_command(
+                    "https://example.test/audio",
+                    None,
+                    DownloadOptions::new(mode, format, quality),
+                )
                 .unwrap()
                 .as_std()
                 .get_args()
@@ -786,9 +818,7 @@ mod tests {
                 .download_command(
                     "https://example.test/audio",
                     None,
-                    DownloadMode::AudioOnly,
-                    AudioFormat::Mp3,
-                    quality,
+                    DownloadOptions::new(DownloadMode::AudioOnly, AudioFormat::Mp3, quality),
                 )
                 .unwrap()
                 .as_std()
@@ -820,18 +850,18 @@ mod tests {
                 .download_command(
                     "https://example.test/audio",
                     None,
-                    DownloadMode::AudioOnly,
-                    AudioFormat::Original,
-                    AudioQuality::Best,
+                    DownloadOptions::new(
+                        DownloadMode::AudioOnly,
+                        AudioFormat::Original,
+                        AudioQuality::Best,
+                    ),
                 )
                 .is_ok()
         );
         let error = match engine.download_command(
             "https://example.test/audio",
             None,
-            DownloadMode::AudioOnly,
-            AudioFormat::Mp3,
-            AudioQuality::Best,
+            DownloadOptions::new(DownloadMode::AudioOnly, AudioFormat::Mp3, AudioQuality::Best),
         ) {
             Ok(_) => panic!("conversion should reject missing bundled FFmpeg tools"),
             Err(error) => error,

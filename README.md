@@ -2,7 +2,7 @@
 
 Yt Save is a native Rust desktop media downloader for Windows 10 and 11. It coordinates the official [yt-dlp](https://github.com/yt-dlp/yt-dlp) executable, so supported sites are determined by yt-dlp's extractors rather than a YouTube-only URL allowlist. YouTube's full format support is handled by the separately bundled Deno runtime and yt-dlp's bundled `yt-dlp-ejs` component.
 
-The repository is in active development. This build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist preview and per-entry selection are available; sync subscriptions, reliable pause/resume, tray operation, clipboard assistance, library/history browsing, and installed-app verification remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
+The repository is in active development. This build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist preview, per-entry selection, and per-job pause/resume are available; sync subscriptions, tray operation, clipboard assistance, library/history browsing, and installed-app verification remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ## Screenshots
 
@@ -22,6 +22,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
 - Lets users cancel queued or active yt-dlp jobs, keeps partial files, and retry failed, interrupted, or canceled downloads.
 - On Windows, active cancellation invokes `taskkill.exe` with separate `/PID`, PID, `/T`, and `/F` arguments to stop the yt-dlp process tree. If tree termination cannot be confirmed, the job is marked Failed rather than falsely reported as Canceled.
+- Lets users pause queued or active jobs and resume paused jobs. Active pause stops yt-dlp and its Windows process tree, preserves partial files, and resumes through yt-dlp's `--continue` option.
 - Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
 - Lets users open completed files with the operating system's registered media handler.
 - Stores output in the user's Downloads folder under `Yt Save`.
@@ -79,8 +80,9 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker. Selected playlist entries run in playlist-index order, and startup recovery uses the index to resolve selected entries with tied creation timestamps. Queued and active items can be canceled; active cancellation, pause/resume, and reorder still need Windows runtime validation. Failed and canceled items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- The queue is single-worker. Selected playlist entries run in playlist-index order, and startup recovery uses the index to resolve selected entries with tied creation timestamps. Queued and active items can be paused or canceled. Paused items can be resumed; failed, interrupted, and canceled items can be retried. Pause/resume and cancellation still need Windows runtime validation. Reordering is not implemented. Completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
 - Active cancellation uses Windows `taskkill.exe /T /F` to stop the yt-dlp process tree, then reaps the yt-dlp process. If `taskkill.exe` is unavailable, denied, or times out, the app attempts to stop yt-dlp directly and records Failed because it cannot confirm that descendants stopped. If the app exits while a row is Canceling, startup recovery changes it to Failed, retains partial-file progress, and asks the user to check that no media process is still using the files before retrying.
+- Active pause uses the same process-tree stop path and records Paused only after yt-dlp has stopped. If the app exits while a row is Pausing, startup recovery marks it Failed with partial-file progress retained and asks the user to check for a lingering process before retrying. Rows already Paused remain paused after restart.
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist preview is capped at 50 entries. Entries without a valid positive playlist index cannot be selected. Sync subscriptions are not implemented.
 - Existing SQLite databases gain a nullable playlist index plus defaulted download mode, audio format, and audio quality columns on startup; selected queue items retain their original playlist URL and index for retry and recovery.

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::{
     DownloadRowData, MainWindow, PlaylistEntryRowData,
     dependencies::DependencyPaths,
-    engine::{DownloadEngine, EngineOutcome, ProgressUpdate},
+    engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
         AudioFormat, AudioQuality, DownloadMode, DownloadRecord, MediaMetadata, PlaylistEntry,
         format_bytes, format_duration,
@@ -34,12 +34,12 @@ enum UiEvent {
     Metadata { request_id: u64, source_url: String, metadata: MediaMetadata },
 }
 
-type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<bool>>>>>;
+type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<JobSignal>>>>>;
 
 struct ActiveJobRegistration {
     id: String,
     jobs: ActiveJobs,
-    sender: Arc<watch::Sender<bool>>,
+    sender: Arc<watch::Sender<JobSignal>>,
 }
 
 impl Drop for ActiveJobRegistration {
@@ -519,6 +519,96 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let resume_store = store.clone();
+    let resume_engine = engine.clone();
+    let resume_events = events_tx.clone();
+    let resume_slots = queue_slots.clone();
+    let resume_active_jobs = active_jobs.clone();
+    let resume_handle = handle.clone();
+    window.on_resume_download_requested(move |id| {
+        let id = id.to_string();
+        let store = resume_store.clone();
+        let engine = resume_engine.clone();
+        let events = resume_events.clone();
+        let slots = resume_slots.clone();
+        let active_jobs = resume_active_jobs.clone();
+        resume_handle.spawn(async move {
+            match store.resume_download(&id, now()).await {
+                Ok(Some(record)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "Resumed. yt-dlp will continue a compatible partial file.".to_owned(),
+                    ));
+                    run_download_job(record, store, engine, events, slots, active_jobs).await;
+                }
+                Ok(None) => {
+                    let _ = events
+                        .send(UiEvent::Status("Only paused downloads can be resumed.".to_owned()));
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "resume paused download");
+                    let _ =
+                        events.send(UiEvent::Status(format!("Could not resume download: {error}")));
+                }
+            }
+        });
+    });
+
+    let pause_store = store.clone();
+    let pause_events = events_tx.clone();
+    let pause_handle = handle.clone();
+    let pause_active_jobs = active_jobs.clone();
+    window.on_pause_download_requested(move |id| {
+        let id = id.to_string();
+        let store = pause_store.clone();
+        let events = pause_events.clone();
+        let active_jobs = pause_active_jobs.clone();
+        pause_handle.spawn(async move {
+            match store.pause_queued_download(&id, now()).await {
+                Ok(true) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status("Paused the queued item.".to_owned()));
+                }
+                Ok(false) => {
+                    let control = active_jobs.lock().ok().and_then(|jobs| jobs.get(&id).cloned());
+                    let Some(control) = control else {
+                        let _ = events.send(UiEvent::Refresh);
+                        let _ = events.send(UiEvent::Status(
+                            "This item is no longer queued or active.".to_owned(),
+                        ));
+                        return;
+                    };
+                    match store.request_active_pause(&id, now()).await {
+                        Ok(true) => {
+                            control.send_replace(JobSignal::Pause);
+                            let _ = events.send(UiEvent::Refresh);
+                            let _ = events.send(UiEvent::Status(
+                                "Pausing the active item and keeping partial files.".to_owned(),
+                            ));
+                        }
+                        Ok(false) => {
+                            let _ = events.send(UiEvent::Refresh);
+                            let _ = events.send(UiEvent::Status(
+                                "This item has already stopped or is being changed.".to_owned(),
+                            ));
+                        }
+                        Err(error) => {
+                            error!(%error, job_id = %id, "request active download pause");
+                            let _ = events.send(UiEvent::Status(format!(
+                                "Could not pause that download: {error}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "pause queued download");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not pause that download: {error}")));
+                }
+            }
+        });
+    });
+
     let folder = paths.downloads.clone();
     let folder_events = events_tx.clone();
     window.on_open_download_folder(move || {
@@ -614,7 +704,7 @@ pub fn run() -> Result<()> {
                     };
                     match store.request_active_cancel(&id, now()).await {
                         Ok(true) => {
-                            cancel_sender.send_replace(true);
+                            cancel_sender.send_replace(JobSignal::Cancel);
                             let _ = events.send(UiEvent::Refresh);
                             let _ = events.send(UiEvent::Status(
                                 "Stopping the active download; partial files will be kept."
@@ -666,11 +756,12 @@ pub fn run() -> Result<()> {
 async fn recover_pending(store: &Store) -> Result<Vec<DownloadRecord>> {
     let mut pending = Vec::new();
     for mut record in store.list_downloads().await? {
-        if record.status == "Canceling" {
+        if matches!(record.status.as_str(), "Canceling" | "Pausing") {
+            let operation = if record.status == "Pausing" { "pause" } else { "cancellation" };
             record.status = "Failed".to_owned();
-            record.error = Some(
-                "The app closed before it could confirm process-tree cancellation. Partial files were kept; check that no media process is still using them before retrying.".to_owned(),
-            );
+            record.error = Some(format!(
+                "The app closed before it could confirm process-tree {operation}. Partial files were kept; check that no media process is still using them before retrying."
+            ));
             record.updated_at = now();
             store.save_download(record.clone()).await?;
             continue;
@@ -704,11 +795,11 @@ async fn run_download_job(
     let Ok(_slot) = slots.acquire_owned().await else {
         return;
     };
-    let (cancel_sender, mut cancel_receiver) = watch::channel(false);
-    let cancel_sender = Arc::new(cancel_sender);
+    let (signal_sender, mut signal_receiver) = watch::channel(JobSignal::Continue);
+    let signal_sender = Arc::new(signal_sender);
     match active_jobs.lock() {
         Ok(mut jobs) => {
-            jobs.insert(pending.id.clone(), cancel_sender.clone());
+            jobs.insert(pending.id.clone(), signal_sender.clone());
         }
         Err(_) => {
             let _ = events.send(UiEvent::Status(
@@ -718,7 +809,7 @@ async fn run_download_job(
         }
     }
     let _registration =
-        ActiveJobRegistration { id: pending.id.clone(), jobs: active_jobs, sender: cancel_sender };
+        ActiveJobRegistration { id: pending.id.clone(), jobs: active_jobs, sender: signal_sender };
 
     let mut active = match store.claim_queued_download(&pending.id, now()).await {
         Ok(Some(record)) => record,
@@ -738,13 +829,13 @@ async fn run_download_job(
         .inspect_with_playlist_index_cancellable(
             &active.url,
             active.playlist_index,
-            &mut cancel_receiver,
+            &mut signal_receiver,
         )
         .await
     {
         Ok(EngineOutcome::Completed(metadata)) => {
-            if *cancel_receiver.borrow() {
-                finish_canceled_job(active, store, events).await;
+            if *signal_receiver.borrow() != JobSignal::Continue {
+                finish_requested_stop(active, store, events).await;
                 return;
             }
             active.title = metadata.title;
@@ -756,6 +847,13 @@ async fn run_download_job(
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = events.send(UiEvent::Refresh);
+                    let pausing = match store.is_pausing(&active.id).await {
+                        Ok(pausing) => pausing,
+                        Err(error) => {
+                            error!(%error, job_id = %active.id, "check pause after rejected phase update");
+                            false
+                        }
+                    };
                     let canceling = match store.is_canceling(&active.id).await {
                         Ok(canceling) => canceling,
                         Err(error) => {
@@ -763,8 +861,8 @@ async fn run_download_job(
                             false
                         }
                     };
-                    if *cancel_receiver.borrow() || canceling {
-                        finish_canceled_job(active, store, events).await;
+                    if *signal_receiver.borrow() != JobSignal::Continue || pausing || canceling {
+                        finish_requested_stop(active, store, events).await;
                     }
                     return;
                 }
@@ -774,8 +872,8 @@ async fn run_download_job(
             }
             let _ = events.send(UiEvent::Refresh);
         }
-        Ok(EngineOutcome::Canceled) => {
-            finish_canceled_job(active, store, events).await;
+        Ok(EngineOutcome::Paused | EngineOutcome::Canceled) => {
+            finish_requested_stop(active, store, events).await;
             return;
         }
         Err(error) => {
@@ -835,54 +933,52 @@ async fn run_download_job(
         .download_with_playlist_index_cancellable(
             &active.url,
             active.playlist_index,
-            active.download_mode,
-            active.audio_format,
-            active.audio_quality,
-            &mut cancel_receiver,
+            DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality),
+            &mut signal_receiver,
             move |progress| {
                 let _ = progress_tx.send(progress);
             },
         )
         .await;
     let mut final_record = progress_task.await.unwrap_or_else(|_| active.clone());
-    let (downloaded_successfully, mut canceled, mut status_message) = match download_result {
+    let (downloaded_successfully, canceled, paused, status_message) = match download_result {
         Ok(EngineOutcome::Completed(result)) => {
             final_record.status = "Completed".to_owned();
             final_record.progress = 100.0;
             final_record.output_path = result.output_path;
             final_record.error = None;
-            (true, false, "Download complete.".to_owned())
+            (true, false, false, "Download complete.".to_owned())
+        }
+        Ok(EngineOutcome::Paused) => {
+            final_record.status = "Paused".to_owned();
+            final_record.error = None;
+            (false, false, true, "Paused the active download. Partial files were kept.".to_owned())
         }
         Ok(EngineOutcome::Canceled) => {
             final_record.status = "Canceled".to_owned();
             final_record.error = Some("Canceled by user; partial files were kept.".to_owned());
-            (false, true, "Canceled the active download. Partial files were kept.".to_owned())
+            (
+                false,
+                true,
+                false,
+                "Canceled the active download. Partial files were kept.".to_owned(),
+            )
         }
         Err(error) => {
             final_record.status = "Failed".to_owned();
             final_record.error = Some(error.to_string());
-            (false, false, error.to_string())
+            (false, false, false, error.to_string())
         }
     };
     final_record.updated_at = now();
     let persisted = if canceled {
-        store.finish_canceled_download(final_record).await
+        store.finish_canceled_download(final_record.clone()).await
+    } else if paused {
+        store.finish_paused_download(final_record.clone()).await
     } else if downloaded_successfully {
-        match store.finish_download(final_record.clone()).await {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                final_record.status = "Canceled".to_owned();
-                final_record.error =
-                    Some("Canceled by user; the process had already finished.".to_owned());
-                canceled = true;
-                status_message =
-                    "Canceled the active download. Any completed media file was kept.".to_owned();
-                store.finish_canceled_download(final_record).await
-            }
-            Err(error) => Err(error),
-        }
+        store.finish_download(final_record.clone()).await
     } else {
-        finish_failed_job(final_record, &store).await
+        finish_failed_job(final_record.clone(), &store).await
     };
     match persisted {
         Ok(true) => {
@@ -890,6 +986,10 @@ async fn run_download_job(
             let _ = events.send(UiEvent::Status(status_message));
         }
         Ok(false) => {
+            if canceled || downloaded_successfully || paused {
+                finish_requested_stop(final_record, store, events).await;
+                return;
+            }
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status(
                 "The queue item changed before its final state could be saved.".to_owned(),
@@ -910,13 +1010,91 @@ async fn run_download_job(
 }
 
 async fn finish_failed_job(record: DownloadRecord, store: &Store) -> Result<bool> {
-    if store.fail_canceling_download(record.clone()).await? {
+    if store.fail_stopping_download(record.clone()).await? {
         return Ok(true);
     }
     if store.finish_download(record.clone()).await? {
         return Ok(true);
     }
-    store.fail_canceling_download(record).await
+    store.fail_stopping_download(record).await
+}
+
+async fn finish_requested_stop(
+    record: DownloadRecord,
+    store: Store,
+    events: mpsc::UnboundedSender<UiEvent>,
+) {
+    let canceling = match store.is_canceling(&record.id).await {
+        Ok(canceling) => canceling,
+        Err(error) => {
+            error!(%error, job_id = %record.id, "check cancellation before stopping queue item");
+            false
+        }
+    };
+    if canceling {
+        finish_canceled_job(record, store, events).await;
+        return;
+    }
+
+    let pausing = match store.is_pausing(&record.id).await {
+        Ok(pausing) => pausing,
+        Err(error) => {
+            error!(%error, job_id = %record.id, "check pause before stopping queue item");
+            false
+        }
+    };
+    if pausing {
+        finish_paused_job(record, store, events).await;
+        return;
+    }
+
+    let _ = events.send(UiEvent::Refresh);
+    let _ = events.send(UiEvent::Status(
+        "The queue item changed before its pause or cancellation could be saved.".to_owned(),
+    ));
+}
+
+async fn finish_paused_job(
+    mut record: DownloadRecord,
+    store: Store,
+    events: mpsc::UnboundedSender<UiEvent>,
+) {
+    record.status = "Paused".to_owned();
+    record.error = None;
+    record.speed_bytes_per_second = None;
+    record.eta_seconds = None;
+    record.updated_at = now();
+    match store.finish_paused_download(record.clone()).await {
+        Ok(true) => {
+            let _ = events.send(UiEvent::Refresh);
+            let _ = events.send(UiEvent::Status(
+                "Paused the active download. Partial files were kept.".to_owned(),
+            ));
+        }
+        Ok(false) => {
+            let canceling = match store.is_canceling(&record.id).await {
+                Ok(canceling) => canceling,
+                Err(error) => {
+                    error!(%error, job_id = %record.id, "check cancellation after rejected pause transition");
+                    false
+                }
+            };
+            if canceling {
+                finish_canceled_job(record, store, events).await;
+            } else {
+                let _ = events.send(UiEvent::Refresh);
+                let _ = events.send(UiEvent::Status(
+                    "The queue item changed before the paused state could be saved.".to_owned(),
+                ));
+            }
+        }
+        Err(error) => {
+            error!(%error, job_id = %record.id, "persist paused download state");
+            let _ = events.send(UiEvent::Status(
+                "The process stopped, but the app could not save the paused state.".to_owned(),
+            ));
+        }
+    }
 }
 
 async fn finish_canceled_job(
@@ -1227,11 +1405,28 @@ mod tests {
         canceling.progress = 22.0;
         canceling.downloaded_bytes = Some(22);
         canceling.total_bytes = Some(100);
+        let mut pausing = DownloadRecord::queued(
+            "pausing".to_owned(),
+            "https://example.test/pausing".to_owned(),
+            41,
+        );
+        pausing.status = "Pausing".to_owned();
+        pausing.downloaded_bytes = Some(15);
+        let mut paused = DownloadRecord::queued(
+            "paused".to_owned(),
+            "https://example.test/paused".to_owned(),
+            42,
+        );
+        paused.status = "Paused".to_owned();
+        paused.progress = 51.0;
+        paused.downloaded_bytes = Some(510);
         store.save_download(queued.clone()).await.unwrap();
         store.save_download(active.clone()).await.unwrap();
         store.save_download(later_playlist_item).await.unwrap();
         store.save_download(earlier_playlist_item).await.unwrap();
         store.save_download(canceling).await.unwrap();
+        store.save_download(pausing).await.unwrap();
+        store.save_download(paused).await.unwrap();
 
         let pending = recover_pending(&store).await.unwrap();
         assert_eq!(pending.len(), 4);
@@ -1256,6 +1451,15 @@ mod tests {
             recovered_canceling.error.as_deref().unwrap().contains("process-tree cancellation")
         );
         assert!(!pending.iter().any(|record| record.id == "canceling"));
+        let recovered_pausing = rows.iter().find(|record| record.id == "pausing").unwrap();
+        assert_eq!(recovered_pausing.status, "Failed");
+        assert_eq!(recovered_pausing.downloaded_bytes, Some(15));
+        assert!(recovered_pausing.error.as_deref().unwrap().contains("process-tree pause"));
+        let recovered_paused = rows.iter().find(|record| record.id == "paused").unwrap();
+        assert_eq!(recovered_paused.status, "Paused");
+        assert_eq!(recovered_paused.progress, 51.0);
+        assert_eq!(recovered_paused.downloaded_bytes, Some(510));
+        assert!(!pending.iter().any(|record| record.id == "paused"));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

@@ -202,19 +202,16 @@ mod windows_impl {
             let sequence = unsafe { GetClipboardSequenceNumber() };
             let events = THREAD_STATE.with(|state| {
                 let mut state = state.borrow_mut();
-                let Some(state) = state.as_mut() else {
-                    return None;
-                };
+                let state = state.as_mut()?;
                 state.sequences.should_process(sequence).then(|| state.events.clone())
             });
 
-            if let Some(events) = events {
-                if let Some(candidate) = unsafe { read_clipboard_text(window) }
+            if let Some(events) = events
+                && let Some(candidate) = unsafe { read_clipboard_text(window) }
                     .as_deref()
                     .and_then(parse_single_http_url)
-                {
-                    let _ = events.send(candidate);
-                }
+            {
+                let _ = events.send(candidate);
             }
             return 0;
         }
@@ -290,11 +287,7 @@ mod windows_impl {
         }
 
         let parsed = Url::parse(candidate).ok()?;
-        let authority = candidate
-            .split_once("://")?
-            .1
-            .split(|character| matches!(character, '/' | '?' | '#'))
-            .next()?;
+        let authority = candidate.split_once("://")?.1.split(['/', '?', '#']).next()?;
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.host_str().is_none()
             || authority.contains('@')

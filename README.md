@@ -56,6 +56,8 @@ The dependency fetcher reads [dependencies.json](dependencies.json), downloads f
 
 ## Installers
 
+Ready-to-install Windows builds are published on the [GitHub Releases page](https://github.com/kalabhaftu/yt-save/releases). Each release includes an MSI, an Inno Setup EXE, and a SHA-256 manifest.
+
 Package the application with both source definitions:
 
 - MSI: [packaging/wix/YtSave.wxs](packaging/wix/YtSave.wxs)
@@ -94,7 +96,7 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.
 - Website support depends on the upstream yt-dlp extractor and each site's current behavior; no app can promise every URL will work.
 - Resolution presets use the heights yt-dlp reports. Actual resolution depends on formats available from the site; a requested cap can fail when the extractor reports no eligible format. Audio-only jobs ignore the video quality choice.
-- The v0.1.3 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
+- The v0.1.9 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, Deno path validation, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
 
 ## License
 

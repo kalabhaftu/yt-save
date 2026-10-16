@@ -8,7 +8,7 @@ When `GH_TOKEN` or `GITHUB_TOKEN` is available, the fetcher authenticates reques
 | --- | --- | --- | --- |
 | yt-dlp | 2026.08.19 `yt-dlp.exe` | [yt-dlp release](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19) | `66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a` |
 | Deno | 2.9.7 Windows x64 ZIP | [Deno release](https://github.com/denoland/deno/releases/tag/v2.9.7) | `a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238` |
-| FFmpeg + FFprobe | 8.1 BtbN LGPL shared ZIP | [BtbN build release](https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest) | `66bfa3595d633afadf22be4ff5385cbdae8998006e61755e01333491e595b178` |
+| FFmpeg + FFprobe | 8.1 BtbN LGPL shared ZIP | [BtbN build release](https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest) | `d670c3cd76f529d6a4e0de3a6f4732868ad02ddb8f52cfb0428c90aaa08abdee` |
 
 ## YouTube JavaScript support
 

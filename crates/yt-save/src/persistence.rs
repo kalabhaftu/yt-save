@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, named_params, types::Type};
 
-use crate::model::{AudioFormat, AudioQuality, DownloadMode, DownloadRecord, VideoQuality};
+use crate::model::{
+    AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, VideoQuality,
+};
 
 #[derive(Clone)]
 pub struct Store {
@@ -156,6 +158,63 @@ impl Store {
         })
         .await
         .context("join settings write")??;
+        Ok(())
+    }
+
+    /// Loads the New download form defaults, ignoring unknown persisted values independently.
+    pub async fn load_download_presets(&self) -> Result<DownloadPresets> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mode = setting_value(connection, "new_download_mode")?;
+                let audio_format = setting_value(connection, "new_download_audio_format")?;
+                let audio_quality = setting_value(connection, "new_download_audio_quality")?;
+                let video_quality = setting_value(connection, "new_download_video_quality")?;
+                Ok(DownloadPresets::from_database_values(
+                    mode.as_deref(),
+                    audio_format.as_deref(),
+                    audio_quality.as_deref(),
+                    video_quality.as_deref(),
+                ))
+            })
+        })
+        .await
+        .context("join preset read")?
+    }
+
+    /// Updates New download defaults atomically; queue rows and retries are untouched.
+    pub async fn set_download_presets(
+        &self,
+        presets: DownloadPresets,
+        updated_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let [(_, mode), (_, audio_format), (_, audio_quality), (_, video_quality)] =
+                    presets.database_values();
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES
+                        ('new_download_mode', :mode, :updated),
+                        ('new_download_audio_format', :audio_format, :updated),
+                        ('new_download_audio_quality', :audio_quality, :updated),
+                        ('new_download_video_quality', :video_quality, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! {
+                        ":mode": mode,
+                        ":audio_format": audio_format,
+                        ":audio_quality": audio_quality,
+                        ":video_quality": video_quality,
+                        ":updated": updated_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join preset write")??;
         Ok(())
     }
 
@@ -678,6 +737,17 @@ impl Store {
     }
 }
 
+fn setting_value(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = :key",
+            named_params! { ":key": key },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<DownloadRecord>> {
     let mut statement = connection.prepare(
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
@@ -868,6 +938,120 @@ mod tests {
         let retried = reopened.retry_download("video-retry", 20).await.unwrap().unwrap();
         assert_eq!(retried.download_mode, DownloadMode::Video);
         assert_eq!(retried.video_quality, VideoQuality::P1440);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_presets_round_trip_and_unknown_settings_fall_back_independently() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_download_presets().await.unwrap(), DownloadPresets::default());
+        let presets = DownloadPresets {
+            mode: DownloadMode::AudioOnly,
+            audio_format: AudioFormat::Flac,
+            audio_quality: AudioQuality::K192,
+            video_quality: VideoQuality::P1440,
+        };
+        store.set_download_presets(presets, 10).await.unwrap();
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(reopened.load_download_presets().await.unwrap(), presets);
+        reopened
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'unknown' WHERE key = 'new_download_audio_quality'",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE app_settings SET value = '8k' WHERE key = 'new_download_video_quality'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let recovered = reopened.load_download_presets().await.unwrap();
+        assert_eq!(recovered.mode, DownloadMode::AudioOnly);
+        assert_eq!(recovered.audio_format, AudioFormat::Flac);
+        assert_eq!(recovered.audio_quality, AudioQuality::Best);
+        assert_eq!(recovered.video_quality, VideoQuality::Best);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changing_form_presets_does_not_rewrite_existing_jobs_retries_or_resumes() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        let job_presets = DownloadPresets {
+            mode: DownloadMode::AudioOnly,
+            audio_format: AudioFormat::Opus,
+            audio_quality: AudioQuality::K128,
+            video_quality: VideoQuality::P480,
+        };
+        let mut job = DownloadRecord::queued(
+            "older-job".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        job.status = "Failed".to_owned();
+        job.download_mode = job_presets.mode;
+        job.audio_format = job_presets.audio_format;
+        job.audio_quality = job_presets.audio_quality;
+        job.video_quality = job_presets.video_quality;
+        store.save_download(job).await.unwrap();
+        let resume_presets = DownloadPresets {
+            mode: DownloadMode::AudioOnly,
+            audio_format: AudioFormat::M4a,
+            audio_quality: AudioQuality::K192,
+            video_quality: VideoQuality::P720,
+        };
+        let mut paused_job = DownloadRecord::queued(
+            "paused-job".to_owned(),
+            "https://example.test/paused".to_owned(),
+            11,
+        );
+        paused_job.status = "Paused".to_owned();
+        paused_job.download_mode = resume_presets.mode;
+        paused_job.audio_format = resume_presets.audio_format;
+        paused_job.audio_quality = resume_presets.audio_quality;
+        paused_job.video_quality = resume_presets.video_quality;
+        store.save_download(paused_job).await.unwrap();
+
+        let current_form = DownloadPresets {
+            mode: DownloadMode::Video,
+            audio_format: AudioFormat::Aac,
+            audio_quality: AudioQuality::K320,
+            video_quality: VideoQuality::P2160,
+        };
+        store.set_download_presets(current_form, 20).await.unwrap();
+        let retried = store.retry_download("older-job", 30).await.unwrap().unwrap();
+        assert_eq!(retried.download_mode, job_presets.mode);
+        assert_eq!(retried.audio_format, job_presets.audio_format);
+        assert_eq!(retried.audio_quality, job_presets.audio_quality);
+        assert_eq!(retried.video_quality, job_presets.video_quality);
+        let resumed = store.resume_download("paused-job", 31).await.unwrap().unwrap();
+        assert_eq!(resumed.download_mode, resume_presets.mode);
+        assert_eq!(resumed.audio_format, resume_presets.audio_format);
+        assert_eq!(resumed.audio_quality, resume_presets.audio_quality);
+        assert_eq!(resumed.video_quality, resume_presets.video_quality);
+        assert_eq!(store.load_download_presets().await.unwrap(), current_form);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(reopened.load_download_presets().await.unwrap(), current_form);
+        let saved_jobs = reopened.list_downloads().await.unwrap();
+        let saved_job = saved_jobs.iter().find(|job| job.id == "older-job").unwrap();
+        assert_eq!(saved_job.download_mode, job_presets.mode);
+        assert_eq!(saved_job.audio_format, job_presets.audio_format);
+        assert_eq!(saved_job.audio_quality, job_presets.audio_quality);
+        assert_eq!(saved_job.video_quality, job_presets.video_quality);
+        let saved_paused_job = saved_jobs.iter().find(|job| job.id == "paused-job").unwrap();
+        assert_eq!(saved_paused_job.download_mode, resume_presets.mode);
+        assert_eq!(saved_paused_job.audio_format, resume_presets.audio_format);
+        assert_eq!(saved_paused_job.audio_quality, resume_presets.audio_quality);
+        assert_eq!(saved_paused_job.video_quality, resume_presets.video_quality);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

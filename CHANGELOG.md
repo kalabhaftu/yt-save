@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.11 — Persistent New download presets
+
+- Restore the Video/Audio only mode, video quality, audio format, and audio bitrate controls from SQLite `app_settings` at startup.
+- Save these form defaults only after a new single item is successfully queued, or after at least one selected playlist item is saved. Existing, retried, resumed, and recovered jobs keep their per-job choices and never rewrite the form defaults.
+- Validate each saved setting against its supported typed values and fall back independently to the existing defaults when a value is absent or invalid.
+- Add focused model, SQLite, retry, reopen, and startup-recovery coverage. Windows UI acceptance remains pending.
+
 ## 0.1.10 — Persistent download destination
 
 - Add a saved default download folder and a native Windows folder picker. Each new queue item snapshots the chosen folder; changing the default leaves queued and retryable jobs on their original destination.

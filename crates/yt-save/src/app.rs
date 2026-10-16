@@ -20,8 +20,8 @@ use crate::{
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
-        AudioFormat, AudioQuality, DownloadMode, DownloadRecord, MediaMetadata, PlaylistEntry,
-        VideoQuality, format_bytes, format_duration,
+        AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata,
+        PlaylistEntry, VideoQuality, format_bytes, format_duration,
     },
     persistence::Store,
 };
@@ -130,12 +130,17 @@ pub fn run() -> Result<()> {
     let download_directory_text = download_directory.to_string_lossy().into_owned();
     runtime
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
+    let download_presets = runtime.block_on(store.load_download_presets())?;
     let engine = DownloadEngine::new(dependencies.clone(), download_directory.clone());
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
     window.set_product_name(env!("YT_SAVE_PRODUCT_NAME").into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
+    window.set_audio_only(download_presets.mode == DownloadMode::AudioOnly);
+    window.set_audio_format(download_presets.audio_format.as_database_value().into());
+    window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
+    window.set_video_quality(download_presets.video_quality.label().into());
     let saved_rows =
         runtime.block_on(store.list_downloads())?.iter().map(row_view).collect::<Vec<_>>();
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
@@ -346,14 +351,16 @@ pub fn run() -> Result<()> {
             })
             .unwrap_or_default();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
-        record.download_mode =
-            if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
-        record.audio_format =
-            AudioFormat::from_database_value(&selected_format).unwrap_or_default();
-        record.audio_quality =
-            AudioQuality::from_database_value(&selected_quality).unwrap_or_default();
-        record.video_quality =
-            VideoQuality::from_ui_label(&selected_video_quality).unwrap_or_default();
+        let download_presets = DownloadPresets::from_ui_values(
+            audio_only,
+            &selected_format,
+            &selected_quality,
+            &selected_video_quality,
+        );
+        record.download_mode = download_presets.mode;
+        record.audio_format = download_presets.audio_format;
+        record.audio_quality = download_presets.audio_quality;
+        record.video_quality = download_presets.video_quality;
         let store = queue_store.clone();
         let engine = queue_engine.clone();
         let events = queue_events.clone();
@@ -384,8 +391,14 @@ pub fn run() -> Result<()> {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
                 return;
             }
+            let preset_status = match store.set_download_presets(download_presets, now()).await {
+                Ok(()) => "Added to the download queue.".to_owned(),
+                Err(error) => format!(
+                    "Added to the queue, but could not save the New download presets: {error}"
+                ),
+            };
             let _ = events.send(UiEvent::Refresh);
-            let _ = events.send(UiEvent::Status("Added to the download queue.".to_owned()));
+            let _ = events.send(UiEvent::Status(preset_status));
             run_download_job(record, store, engine, events, slots, active_jobs).await;
         });
     });
@@ -466,12 +479,12 @@ pub fn run() -> Result<()> {
                 )
             })
             .unwrap_or_default();
-        let download_mode = if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
-        let audio_format = AudioFormat::from_database_value(&selected_format).unwrap_or_default();
-        let audio_quality =
-            AudioQuality::from_database_value(&selected_quality).unwrap_or_default();
-        let video_quality =
-            VideoQuality::from_ui_label(&selected_video_quality).unwrap_or_default();
+        let download_presets = DownloadPresets::from_ui_values(
+            audio_only,
+            &selected_format,
+            &selected_quality,
+            &selected_video_quality,
+        );
         let _ = selected_queue_events.send(UiEvent::Status(format!(
             "Adding {} selected playlist entries to the queue…",
             selected_entries.len()
@@ -514,10 +527,10 @@ pub fn run() -> Result<()> {
                 record.title = title;
                 record.source = selection.source.clone();
                 record.playlist_index = Some(playlist_index);
-                record.download_mode = download_mode;
-                record.audio_format = audio_format;
-                record.audio_quality = audio_quality;
-                record.video_quality = video_quality;
+                record.download_mode = download_presets.mode;
+                record.audio_format = download_presets.audio_format;
+                record.audio_quality = download_presets.audio_quality;
+                record.video_quality = download_presets.video_quality;
                 record.download_directory = destination.clone();
                 match store.save_download(record.clone()).await {
                     Ok(()) => saved.push(record),
@@ -538,8 +551,9 @@ pub fn run() -> Result<()> {
                 }
                 return;
             }
+            let preset_save_error = store.set_download_presets(download_presets, now()).await.err();
             let _ = events.send(UiEvent::Refresh);
-            let status = if let Some(error) = save_error {
+            let mut status = if let Some(error) = save_error {
                 format!(
                     "Queued {} of {selected_count} selected playlist entries. {error}",
                     saved.len()
@@ -550,6 +564,9 @@ pub fn run() -> Result<()> {
                     saved.len()
                 )
             };
+            if let Some(error) = preset_save_error {
+                status.push_str(&format!(" New download presets could not be saved: {error}"));
+            }
             let _ = events.send(UiEvent::Status(status));
             for record in saved {
                 run_download_job(
@@ -1611,6 +1628,13 @@ mod tests {
     async fn startup_requeues_saved_and_interrupted_downloads() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
         let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let saved_presets = DownloadPresets {
+            mode: DownloadMode::AudioOnly,
+            audio_format: AudioFormat::Flac,
+            audio_quality: AudioQuality::K320,
+            video_quality: VideoQuality::P1440,
+        };
+        store.set_download_presets(saved_presets, 1).await.unwrap();
         let queued = DownloadRecord::queued(
             "queued".to_owned(),
             "https://example.test/queued".to_owned(),
@@ -1675,6 +1699,7 @@ mod tests {
         store.save_download(paused).await.unwrap();
 
         let pending = recover_pending(&store).await.unwrap();
+        assert_eq!(store.load_download_presets().await.unwrap(), saved_presets);
         assert_eq!(pending.len(), 4);
         assert!(pending.iter().all(|record| record.status == "Queued"));
         assert_eq!(

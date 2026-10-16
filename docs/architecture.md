@@ -21,6 +21,7 @@ The project selects Slint's GPL-3.0-or-later open-source license and therefore l
 - **Media processing:** bundled FFmpeg and FFprobe are passed to yt-dlp through `--ffmpeg-location`.
 - **Persistence:** SQLite with WAL mode for durable queue state and settings.
 - **Output location:** a user-selected default folder is stored in `app_settings`; every queued item stores its own resolved folder so a later preference change cannot redirect queued, paused, interrupted, or retried work. Playlist-title subfolders are created inside that per-job destination.
+- **New download presets:** mode, video quality, audio format, and audio bitrate are stored as typed string values in `app_settings`, independently from each job's persisted selections. The app loads them at startup and updates them only after a new queue insertion succeeds (for a playlist batch, at least one item must save); retry, resume, and recovery paths do not write these defaults.
 - **Windows packaging:** WiX Toolset 5.0.2 for MSI and Inno Setup 6 for EXE installers.
 
 ## First vertical slice

@@ -231,6 +231,60 @@ impl VideoQuality {
     }
 }
 
+/// Defaults shown in the New download form. Per-job choices remain persisted on each queue row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownloadPresets {
+    pub mode: DownloadMode,
+    pub audio_format: AudioFormat,
+    pub audio_quality: AudioQuality,
+    pub video_quality: VideoQuality,
+}
+
+impl DownloadPresets {
+    pub fn from_database_values(
+        mode: Option<&str>,
+        audio_format: Option<&str>,
+        audio_quality: Option<&str>,
+        video_quality: Option<&str>,
+    ) -> Self {
+        Self {
+            mode: mode.and_then(DownloadMode::from_database_value).unwrap_or_default(),
+            audio_format: audio_format
+                .and_then(AudioFormat::from_database_value)
+                .unwrap_or_default(),
+            audio_quality: audio_quality
+                .and_then(AudioQuality::from_database_value)
+                .unwrap_or_default(),
+            video_quality: video_quality
+                .and_then(VideoQuality::from_database_value)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn from_ui_values(
+        audio_only: bool,
+        audio_format: &str,
+        audio_quality: &str,
+        video_quality: &str,
+    ) -> Self {
+        Self {
+            mode: if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video },
+            audio_format: AudioFormat::from_database_value(audio_format).unwrap_or_default(),
+            audio_quality: AudioQuality::from_database_value(audio_quality).unwrap_or_default(),
+            video_quality: VideoQuality::from_ui_label(video_quality).unwrap_or_default(),
+        }
+    }
+
+    pub fn database_values(self) -> [(&'static str, &'static str); 4] {
+        [
+            ("new_download_mode", self.mode.as_database_value()),
+            ("new_download_audio_format", self.audio_format.as_database_value()),
+            ("new_download_audio_quality", self.audio_quality.as_database_value()),
+            ("new_download_video_quality", self.video_quality.as_database_value()),
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaMetadata {
     pub id: String,
@@ -542,5 +596,53 @@ mod tests {
             assert_eq!(quality.yt_dlp_format(), format);
         }
         assert_eq!(VideoQuality::from_database_value("8k"), None);
+    }
+
+    #[test]
+    fn new_download_presets_parse_valid_values_and_fall_back_per_setting() {
+        let saved = DownloadPresets::from_database_values(
+            Some("audio"),
+            Some("flac"),
+            Some("192k"),
+            Some("1440p"),
+        );
+        assert_eq!(saved.mode, DownloadMode::AudioOnly);
+        assert_eq!(saved.audio_format, AudioFormat::Flac);
+        assert_eq!(saved.audio_quality, AudioQuality::K192);
+        assert_eq!(saved.video_quality, VideoQuality::P1440);
+
+        let recovered = DownloadPresets::from_database_values(
+            Some("invalid-mode"),
+            Some("mp3"),
+            Some("invalid-bitrate"),
+            Some("720p"),
+        );
+        assert_eq!(recovered.mode, DownloadMode::Video);
+        assert_eq!(recovered.audio_format, AudioFormat::Mp3);
+        assert_eq!(recovered.audio_quality, AudioQuality::Best);
+        assert_eq!(recovered.video_quality, VideoQuality::P720);
+        assert_eq!(DownloadPresets::default(), recovered_default_presets());
+    }
+
+    #[test]
+    fn new_download_presets_accept_ui_video_labels_and_stable_audio_values() {
+        let presets = DownloadPresets::from_ui_values(false, "opus", "320k", "2160p / 4K");
+        assert_eq!(presets.mode, DownloadMode::Video);
+        assert_eq!(presets.audio_format, AudioFormat::Opus);
+        assert_eq!(presets.audio_quality, AudioQuality::K320);
+        assert_eq!(presets.video_quality, VideoQuality::P2160);
+        assert_eq!(
+            presets.database_values(),
+            [
+                ("new_download_mode", "video"),
+                ("new_download_audio_format", "opus"),
+                ("new_download_audio_quality", "320k"),
+                ("new_download_video_quality", "2160p"),
+            ]
+        );
+    }
+
+    fn recovered_default_presets() -> DownloadPresets {
+        DownloadPresets::from_database_values(None, None, None, None)
     }
 }

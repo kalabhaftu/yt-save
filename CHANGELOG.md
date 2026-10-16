@@ -1,10 +1,17 @@
 # Changelog
 
+## 0.1.10 — Persistent download destination
+
+- Add a saved default download folder and a native Windows folder picker. Each new queue item snapshots the chosen folder; changing the default leaves queued and retryable jobs on their original destination.
+- Add a backward-compatible SQLite migration for destination snapshots and preserve playlist-title subfolders under the selected folder. Queue destinations must resolve to an existing directory.
+- Add focused settings, legacy-row migration, retry/reopen persistence, path validation, and yt-dlp argument coverage. Windows picker and installed-app verification remain pending.
+
 ## 0.1.9 — Video quality presets
 
 - Add per-job Best, 2160p/4K, 1440p, 1080p, 720p, 480p, 360p, and Lowest video quality choices.
 - Use yt-dlp height-capped format selectors with a combined-format fallback under the same cap; preserve the choice through database migration, retry, pause/resume, and startup recovery. Audio-only jobs keep their existing behavior.
 - Add model, command, migration, persistence, retry, and recovery coverage. Windows UI and site-specific format acceptance remain pending.
+- Pass Windows CI and dependency security audit; release MSI and Inno Setup packages installed, launched the app and bundled tools, and uninstalled successfully.
 
 ## 0.1.8 — Audio output and queue controls
 

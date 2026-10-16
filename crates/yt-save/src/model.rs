@@ -321,6 +321,8 @@ pub struct DownloadRecord {
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
     pub video_quality: VideoQuality,
+    /// Destination directory captured when this queue item was added.
+    pub download_directory: String,
     pub title: String,
     pub source: String,
     pub status: String,
@@ -346,6 +348,7 @@ impl DownloadRecord {
             audio_format: AudioFormat::Original,
             audio_quality: AudioQuality::Best,
             video_quality: VideoQuality::Best,
+            download_directory: String::new(),
             title: "Waiting for media details".to_owned(),
             source: String::new(),
             status: "Queued".to_owned(),

@@ -104,7 +104,6 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("create download directory {}", paths.downloads.display()))?;
     let store = Store::open(paths.database.clone())?;
     let dependencies = DependencyPaths::discover()?;
-    let engine = DownloadEngine::new(dependencies.clone(), paths.downloads.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -112,10 +111,31 @@ pub fn run() -> Result<()> {
         .thread_name("yt-save-worker")
         .build()
         .context("create background runtime")?;
+    let fallback_directory = validate_download_directory(&paths.downloads)?;
+    let configured_directory =
+        runtime.block_on(store.get_or_initialize_download_directory(
+            fallback_directory.to_string_lossy().into_owned(),
+        ))?;
+    let download_directory = match validate_download_directory(Path::new(&configured_directory)) {
+        Ok(directory) => directory,
+        Err(error) => {
+            error!(%error, "saved download destination is unavailable; restoring the default folder");
+            runtime.block_on(store.set_default_download_directory(
+                fallback_directory.to_string_lossy().into_owned(),
+                now(),
+            ))?;
+            fallback_directory
+        }
+    };
+    let download_directory_text = download_directory.to_string_lossy().into_owned();
+    runtime
+        .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
+    let engine = DownloadEngine::new(dependencies.clone(), download_directory.clone());
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
     window.set_product_name(env!("YT_SAVE_PRODUCT_NAME").into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
+    window.set_download_directory(download_directory_text.into());
     let saved_rows =
         runtime.block_on(store.list_downloads())?.iter().map(row_view).collect::<Vec<_>>();
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
@@ -307,18 +327,24 @@ pub fn run() -> Result<()> {
                 return;
             }
         };
-        let (audio_only, selected_format, selected_quality, selected_video_quality) =
-            enqueue_window
-                .upgrade()
-                .map(|window| {
-                    (
-                        window.get_audio_only(),
-                        window.get_audio_format().to_string(),
-                        window.get_audio_quality().to_string(),
-                        window.get_video_quality().to_string(),
-                    )
-                })
-                .unwrap_or_default();
+        let (
+            audio_only,
+            selected_format,
+            selected_quality,
+            selected_video_quality,
+            selected_directory,
+        ) = enqueue_window
+            .upgrade()
+            .map(|window| {
+                (
+                    window.get_audio_only(),
+                    window.get_audio_format().to_string(),
+                    window.get_audio_quality().to_string(),
+                    window.get_video_quality().to_string(),
+                    window.get_download_directory().to_string(),
+                )
+            })
+            .unwrap_or_default();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
         record.download_mode =
             if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
@@ -334,6 +360,26 @@ pub fn run() -> Result<()> {
         let slots = enqueue_slots.clone();
         let active_jobs = enqueue_active_jobs.clone();
         queue_handle.spawn(async move {
+            let destination = match tokio::task::spawn_blocking(move || {
+                validate_download_directory(Path::new(&selected_directory))
+            })
+            .await
+            {
+                Ok(Ok(path)) => path,
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not use the selected save folder: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not validate the selected save folder: {error}"
+                    )));
+                    return;
+                }
+            };
+            record.download_directory = destination.to_string_lossy().into_owned();
             if let Err(error) = store.save_download(record.clone()).await {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
                 return;
@@ -402,18 +448,24 @@ pub fn run() -> Result<()> {
             ));
             return;
         }
-        let (audio_only, selected_format, selected_quality, selected_video_quality) =
-            selected_queue_window
-                .upgrade()
-                .map(|window| {
-                    (
-                        window.get_audio_only(),
-                        window.get_audio_format().to_string(),
-                        window.get_audio_quality().to_string(),
-                        window.get_video_quality().to_string(),
-                    )
-                })
-                .unwrap_or_default();
+        let (
+            audio_only,
+            selected_format,
+            selected_quality,
+            selected_video_quality,
+            selected_directory,
+        ) = selected_queue_window
+            .upgrade()
+            .map(|window| {
+                (
+                    window.get_audio_only(),
+                    window.get_audio_format().to_string(),
+                    window.get_audio_quality().to_string(),
+                    window.get_video_quality().to_string(),
+                    window.get_download_directory().to_string(),
+                )
+            })
+            .unwrap_or_default();
         let download_mode = if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
         let audio_format = AudioFormat::from_database_value(&selected_format).unwrap_or_default();
         let audio_quality =
@@ -430,6 +482,26 @@ pub fn run() -> Result<()> {
         let slots = selected_queue_slots.clone();
         let active_jobs = selected_active_jobs.clone();
         selected_queue_handle.spawn(async move {
+            let destination = match tokio::task::spawn_blocking(move || {
+                validate_download_directory(Path::new(&selected_directory))
+            })
+            .await
+            {
+                Ok(Ok(path)) => path,
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not use the selected save folder: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not validate the selected save folder: {error}"
+                    )));
+                    return;
+                }
+            };
+            let destination = destination.to_string_lossy().into_owned();
             let mut saved = Vec::new();
             let mut save_error = None;
             let selected_count = selected_entries.len();
@@ -446,6 +518,7 @@ pub fn run() -> Result<()> {
                 record.audio_format = audio_format;
                 record.audio_quality = audio_quality;
                 record.video_quality = video_quality;
+                record.download_directory = destination.clone();
                 match store.save_download(record.clone()).await {
                     Ok(()) => saved.push(record),
                     Err(error) => {
@@ -618,13 +691,86 @@ pub fn run() -> Result<()> {
         });
     });
 
-    let folder = paths.downloads.clone();
     let folder_events = events_tx.clone();
+    let folder_window = window.as_weak();
+    let folder_handle = handle.clone();
     window.on_open_download_folder(move || {
-        if let Err(error) = open_folder(&folder) {
-            let _ = folder_events
-                .send(UiEvent::Status(format!("Could not open download folder: {error}")));
-        }
+        let Some(window) = folder_window.upgrade() else { return };
+        let folder = PathBuf::from(window.get_download_directory().as_str());
+        let events = folder_events.clone();
+        folder_handle.spawn_blocking(move || {
+            if let Err(error) = open_folder(&folder) {
+                let _ = events
+                    .send(UiEvent::Status(format!("Could not open download folder: {error}")));
+            }
+        });
+    });
+
+    let choose_store = store.clone();
+    let choose_events = events_tx.clone();
+    let choose_window = window.as_weak();
+    let choose_handle = handle.clone();
+    window.on_choose_download_directory_requested(move || {
+        let store = choose_store.clone();
+        let events = choose_events.clone();
+        let weak_window = choose_window.clone();
+        let handle = choose_handle.clone();
+        let _ = events.send(UiEvent::Status("Choose an existing save folder…".to_owned()));
+        handle.spawn(async move {
+            let selected = match tokio::task::spawn_blocking(pick_download_directory).await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => {
+                    let _ = events.send(UiEvent::Status("Folder selection canceled.".to_owned()));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not open the folder picker: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "The folder picker did not complete: {error}"
+                    )));
+                    return;
+                }
+            };
+            let selected =
+                match tokio::task::spawn_blocking(move || validate_download_directory(&selected))
+                    .await
+                {
+                    Ok(Ok(path)) => path,
+                    Ok(Err(error)) => {
+                        let _ = events
+                            .send(UiEvent::Status(format!("Choose an accessible folder: {error}")));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Could not validate the selected folder: {error}"
+                        )));
+                        return;
+                    }
+                };
+            let directory = selected.to_string_lossy().into_owned();
+            if let Err(error) = store.set_default_download_directory(directory.clone(), now()).await
+            {
+                let _ = events
+                    .send(UiEvent::Status(format!("Could not save the default folder: {error}")));
+                return;
+            }
+            let weak = weak_window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_download_directory(directory.into());
+                }
+            });
+            let _ = events.send(UiEvent::Status(
+                "Default save folder updated. Existing queue items keep their saved folder."
+                    .to_owned(),
+            ));
+        });
     });
 
     let clear_store = store.clone();
@@ -943,7 +1089,8 @@ async fn run_download_job(
             &active.url,
             active.playlist_index,
             DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
-                .with_video_quality(active.video_quality),
+                .with_video_quality(active.video_quality)
+                .with_output_directory(PathBuf::from(&active.download_directory)),
             &mut signal_receiver,
             move |progress| {
                 let _ = progress_tx.send(progress);
@@ -1186,6 +1333,74 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn validate_download_directory(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        anyhow::bail!("choose an absolute save-folder path");
+    }
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("read save folder {}", path.display()))?;
+    if !metadata.is_dir() {
+        anyhow::bail!("{} is not a folder", path.display());
+    }
+    std::fs::canonicalize(path).with_context(|| format!("resolve save folder {}", path.display()))
+}
+
+#[cfg(windows)]
+fn pick_download_directory() -> Result<Option<PathBuf>> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::{
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
+        UI::Shell::{
+            BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, SHBrowseForFolderW,
+            SHGetPathFromIDListW,
+        },
+    };
+
+    struct ComApartment;
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    let initialized = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+    if initialized < 0 {
+        anyhow::bail!("initialize the Windows folder picker (HRESULT {initialized:#x})");
+    }
+    let _apartment = ComApartment;
+    let title: Vec<u16> =
+        "Choose the default download folder".encode_utf16().chain(Some(0)).collect();
+    let mut display_name = [0u16; 260];
+    let info = BROWSEINFOW {
+        hwndOwner: std::ptr::null_mut(),
+        pidlRoot: std::ptr::null_mut(),
+        pszDisplayName: display_name.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..Default::default()
+    };
+    let item = unsafe { SHBrowseForFolderW(&info) };
+    if item.is_null() {
+        return Ok(None);
+    }
+    let mut selected_path = [0u16; 260];
+    let resolved = unsafe { SHGetPathFromIDListW(item, selected_path.as_mut_ptr()) } != 0;
+    unsafe { CoTaskMemFree(item.cast()) };
+    if !resolved {
+        anyhow::bail!("Windows could not resolve the selected folder path");
+    }
+    let length = selected_path.iter().position(|unit| *unit == 0).unwrap_or(selected_path.len());
+    if length == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(OsString::from_wide(&selected_path[..length]))))
+}
+
+#[cfg(not(windows))]
+fn pick_download_directory() -> Result<Option<PathBuf>> {
+    anyhow::bail!("the native folder picker is available in Windows builds")
+}
+
 fn open_folder(path: &PathBuf) -> Result<()> {
     let mut command = if cfg!(windows) {
         let mut command = Command::new("explorer.exe");
@@ -1276,6 +1491,25 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_destination_must_be_an_existing_directory_and_is_canonicalized() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let selected = temp_dir.join("selected");
+        std::fs::create_dir_all(&selected).unwrap();
+        let file = temp_dir.join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(
+            validate_download_directory(&selected).unwrap(),
+            selected.canonicalize().unwrap()
+        );
+        assert!(validate_download_directory(&file).is_err());
+        assert!(validate_download_directory(&temp_dir.join("missing")).is_err());
+        assert!(validate_download_directory(Path::new("")).is_err());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
 
     #[test]
     fn row_view_shows_terminal_error_before_saved_progress() {
@@ -1393,6 +1627,7 @@ mod tests {
         active.audio_format = AudioFormat::Opus;
         active.audio_quality = AudioQuality::K192;
         active.video_quality = VideoQuality::P720;
+        active.download_directory = "C:\\Media\\Archive".to_owned();
         active.downloaded_bytes = Some(75);
         active.total_bytes = Some(100);
         let mut later_playlist_item = DownloadRecord::queued(
@@ -1455,6 +1690,7 @@ mod tests {
         assert_eq!(recovered_active.audio_format, AudioFormat::Opus);
         assert_eq!(recovered_active.audio_quality, AudioQuality::K192);
         assert_eq!(recovered_active.video_quality, VideoQuality::P720);
+        assert_eq!(recovered_active.download_directory, "C:\\Media\\Archive");
         let recovered_canceling = rows.iter().find(|record| record.id == "canceling").unwrap();
         assert_eq!(recovered_canceling.status, "Failed");
         assert_eq!(recovered_canceling.progress, 22.0);

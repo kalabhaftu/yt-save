@@ -20,10 +20,11 @@ The project selects Slint's GPL-3.0-or-later open-source license and therefore l
 - **YouTube JavaScript:** Deno is an explicitly located, pinned runtime when available. The official yt-dlp executable bundles `yt-dlp-ejs`; yt-dlp can still process other supported sites without Deno.
 - **Media processing:** bundled FFmpeg and FFprobe are passed to yt-dlp through `--ffmpeg-location`.
 - **Persistence:** SQLite with WAL mode for durable queue state and settings.
+- **Output location:** a user-selected default folder is stored in `app_settings`; every queued item stores its own resolved folder so a later preference change cannot redirect queued, paused, interrupted, or retried work. Playlist-title subfolders are created inside that per-job destination.
 - **Windows packaging:** WiX Toolset 5.0.2 for MSI and Inno Setup 6 for EXE installers.
 
 ## First vertical slice
 
-The implemented flow accepts any HTTP(S) URL, stores it as a queue record, obtains metadata with yt-dlp JSON output, runs a download, parses machine-readable progress, and stores completion or failure. The app does not maintain a site allowlist. yt-dlp decides whether a URL has a usable extractor.
+The implemented flow accepts any HTTP(S) URL, stores it as a queue record, obtains metadata with yt-dlp JSON output, runs a download, parses machine-readable progress, and stores completion or failure. The app does not maintain a site allowlist. yt-dlp decides whether a URL has a usable extractor. Download destinations are checked as existing directories and canonicalized before a queue item is persisted.
 
 Pause, resume, retries, playlist item selection, process lifetime jobs, tray integration, and complete crash recovery remain open items. See the feature matrix; a configured button or installer file is not evidence that the feature works.

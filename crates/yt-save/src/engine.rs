@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
 };
 
@@ -21,12 +21,13 @@ const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DownloadOptions {
     mode: DownloadMode,
     audio_format: AudioFormat,
     audio_quality: AudioQuality,
     video_quality: VideoQuality,
+    output_directory: Option<PathBuf>,
 }
 
 impl DownloadOptions {
@@ -35,11 +36,22 @@ impl DownloadOptions {
         audio_format: AudioFormat,
         audio_quality: AudioQuality,
     ) -> Self {
-        Self { mode, audio_format, audio_quality, video_quality: VideoQuality::Best }
+        Self {
+            mode,
+            audio_format,
+            audio_quality,
+            video_quality: VideoQuality::Best,
+            output_directory: None,
+        }
     }
 
     pub(crate) fn with_video_quality(mut self, video_quality: VideoQuality) -> Self {
         self.video_quality = video_quality;
+        self
+    }
+
+    pub(crate) fn with_output_directory(mut self, output_directory: PathBuf) -> Self {
+        self.output_directory = Some(output_directory);
         self
     }
 }
@@ -198,10 +210,6 @@ impl DownloadEngine {
         }
         self.dependencies.require_for_download()?;
         let mut command = self.download_command(url, playlist_index, options)?;
-        tokio::fs::create_dir_all(&self.output_directory)
-            .await
-            .with_context(|| format!("create {}", self.output_directory.display()))?;
-
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
         let stdout = child.stdout.take().context("open yt-dlp stdout")?;
@@ -295,6 +303,9 @@ impl DownloadEngine {
         playlist_index: Option<i64>,
         options: DownloadOptions,
     ) -> Result<Command> {
+        let output_directory =
+            options.output_directory.as_deref().unwrap_or(&self.output_directory);
+        validate_output_directory(output_directory)?;
         let mut command = self.base_command();
         command
             .arg("--no-warnings")
@@ -309,7 +320,7 @@ impl DownloadEngine {
             .arg("--print")
             .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"))
             .arg("--paths")
-            .arg(format!("home:{}", self.output_directory.display()))
+            .arg(format!("home:{}", output_directory.display()))
             .arg("--output")
             .arg(OUTPUT_TEMPLATE)
             .arg("--format");
@@ -359,6 +370,18 @@ impl DownloadEngine {
         command.arg("--dump-single-json").arg(url);
         Ok(command)
     }
+}
+
+fn validate_output_directory(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("download destination must be an absolute path: {}", path.display());
+    }
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("download destination is unavailable: {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("download destination is not a folder: {}", path.display());
+    }
+    Ok(())
 }
 
 fn process_download_line<F>(line: &str, output_path: &mut Option<String>, on_progress: &mut F)
@@ -651,6 +674,7 @@ mod tests {
             ffprobe: root.join("ffprobe.exe"),
         };
         let engine = DownloadEngine::new(dependencies, output_directory.clone());
+        std::fs::create_dir_all(&output_directory).unwrap();
         let arguments = engine
             .download_command("https://example.test/watch/123", None, DownloadOptions::default())
             .unwrap()
@@ -669,6 +693,54 @@ mod tests {
             Some(format!("home:{}", output_directory.display()).as_str())
         );
         assert_eq!(arguments.last().map(String::as_str), Some("https://example.test/watch/123"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn download_command_uses_per_job_destination_and_rejects_missing_folders() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let default_directory = root.join("default");
+        let selected_directory = root.join("selected");
+        std::fs::create_dir_all(&default_directory).unwrap();
+        std::fs::create_dir_all(&selected_directory).unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, default_directory.clone());
+        let args = engine
+            .download_command(
+                "https://example.test/watch/123",
+                None,
+                DownloadOptions::default().with_output_directory(selected_directory.clone()),
+            )
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let paths_flag = args.iter().position(|argument| argument == "--paths").unwrap();
+        assert_eq!(
+            args.get(paths_flag + 1).map(String::as_str),
+            Some(format!("home:{}", selected_directory.display()).as_str())
+        );
+
+        let missing_directory = root.join("missing");
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/watch/123",
+                    None,
+                    DownloadOptions::default().with_output_directory(missing_directory),
+                )
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

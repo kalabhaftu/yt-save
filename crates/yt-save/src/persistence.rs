@@ -41,7 +41,8 @@ impl Store {
                     download_mode TEXT NOT NULL DEFAULT 'video',
                     audio_format TEXT NOT NULL DEFAULT 'original',
                     audio_quality TEXT NOT NULL DEFAULT 'best',
-                    video_quality TEXT NOT NULL DEFAULT 'best'
+                    video_quality TEXT NOT NULL DEFAULT 'best',
+                    download_directory TEXT NOT NULL DEFAULT ''
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -68,6 +69,7 @@ impl Store {
                 ("audio_format", "TEXT NOT NULL DEFAULT 'original'"),
                 ("audio_quality", "TEXT NOT NULL DEFAULT 'best'"),
                 ("video_quality", "TEXT NOT NULL DEFAULT 'best'"),
+                ("download_directory", "TEXT NOT NULL DEFAULT ''"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -92,6 +94,71 @@ impl Store {
             .context("join database read")?
     }
 
+    /// Loads the saved destination, creating it from `fallback` for older installations.
+    /// Queue rows created before destination snapshots existed are assigned this initial path.
+    pub async fn get_or_initialize_download_directory(&self, fallback: String) -> Result<String> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT OR IGNORE INTO app_settings (key, value, updated_at)
+                     VALUES ('download_directory', :fallback, :updated)",
+                    named_params! { ":fallback": fallback, ":updated": chrono::Utc::now().timestamp() },
+                )?;
+                let configured: String = connection.query_row(
+                    "SELECT value FROM app_settings WHERE key = 'download_directory'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(configured)
+            })
+        })
+        .await
+        .context("join settings read")?
+    }
+
+    /// Assigns a stable destination to queue rows created before destination snapshots existed.
+    pub async fn backfill_legacy_download_directories(&self, directory: String) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "UPDATE downloads SET download_directory = :directory
+                     WHERE download_directory = ''",
+                    named_params! { ":directory": directory },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join legacy queue migration")??;
+        Ok(())
+    }
+
+    /// Changes only the default for future queue items; saved jobs keep their destination.
+    pub async fn set_default_download_directory(
+        &self,
+        directory: String,
+        updated_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('download_directory', :directory, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":directory": directory, ":updated": updated_at },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join settings write")??;
+        Ok(())
+    }
+
     pub async fn save_download(&self, record: DownloadRecord) -> Result<()> {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
@@ -104,12 +171,13 @@ impl Store {
                         id, url, title, source, status, progress, downloaded_bytes,
                         total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                         error, created_at, updated_at, playlist_index,
-                        download_mode, audio_format, audio_quality, video_quality
+                        download_mode, audio_format, audio_quality, video_quality,
+                        download_directory
                     ) VALUES (
                         :id, :url, :title, :source, :status, :progress, :downloaded,
                         :total, :speed, :eta, :output, :error, :created, :updated,
                         :playlist_index, :download_mode, :audio_format, :audio_quality,
-                        :video_quality
+                        :video_quality, :download_directory
                     ) ON CONFLICT(id) DO UPDATE SET
                         url=excluded.url, title=excluded.title, source=excluded.source,
                         status=excluded.status, progress=excluded.progress,
@@ -122,7 +190,8 @@ impl Store {
                         download_mode=excluded.download_mode,
                         audio_format=excluded.audio_format,
                         audio_quality=excluded.audio_quality,
-                        video_quality=excluded.video_quality",
+                        video_quality=excluded.video_quality,
+                        download_directory=excluded.download_directory",
                     named_params! {
                         ":id": record.id,
                         ":url": record.url,
@@ -143,6 +212,7 @@ impl Store {
                         ":audio_format": record.audio_format.as_database_value(),
                         ":audio_quality": record.audio_quality.as_database_value(),
                         ":video_quality": record.video_quality.as_database_value(),
+                        ":download_directory": record.download_directory,
                     },
                 )?;
                 Ok(())
@@ -613,7 +683,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
-                download_mode, audio_format, audio_quality, video_quality, rowid
+                download_mode, audio_format, audio_quality, video_quality, rowid,
+                download_directory
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -638,6 +709,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 audio_format: audio_format_from_row(row, 16)?,
                 audio_quality: audio_quality_from_row(row, 17)?,
                 video_quality: video_quality_from_row(row, 18)?,
+                download_directory: row.get(20)?,
                 queue_order: row.get(19)?,
             })
         })
@@ -659,7 +731,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
-                download_mode, audio_format, audio_quality, video_quality, rowid
+                download_mode, audio_format, audio_quality, video_quality, rowid,
+                download_directory
          FROM downloads ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -683,6 +756,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             audio_format: audio_format_from_row(row, 16)?,
             audio_quality: audio_quality_from_row(row, 17)?,
             video_quality: video_quality_from_row(row, 18)?,
+            download_directory: row.get(20)?,
             queue_order: row.get(19)?,
         })
     })?;
@@ -798,6 +872,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_destination_changes_only_future_jobs_and_job_path_survives_retry_and_reopen() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        let first_default = temp_dir.join("first").to_string_lossy().into_owned();
+        let selected_default =
+            store.get_or_initialize_download_directory(first_default.clone()).await.unwrap();
+        assert_eq!(selected_default, first_default);
+
+        let mut queued = DownloadRecord::queued(
+            "snapshotted-job".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        queued.download_directory = selected_default.clone();
+        store.save_download(queued.clone()).await.unwrap();
+
+        let second_default = temp_dir.join("second").to_string_lossy().into_owned();
+        store.set_default_download_directory(second_default.clone(), 20).await.unwrap();
+        assert_eq!(
+            store
+                .get_or_initialize_download_directory("ignored-fallback".to_owned())
+                .await
+                .unwrap(),
+            second_default
+        );
+        let still_queued = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(still_queued.download_directory, first_default);
+
+        queued.status = "Failed".to_owned();
+        store.save_download(queued).await.unwrap();
+        let retried = store.retry_download("snapshotted-job", 30).await.unwrap().unwrap();
+        assert_eq!(retried.download_directory, first_default);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(
+            reopened
+                .get_or_initialize_download_directory("ignored-fallback".to_owned())
+                .await
+                .unwrap(),
+            second_default
+        );
+        assert_eq!(reopened.list_downloads().await.unwrap()[0].download_directory, first_default);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn alac_and_vorbis_choices_round_trip_through_sqlite() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
         let db_path = temp_dir.join("state.sqlite");
@@ -867,6 +989,12 @@ mod tests {
         }
 
         let store = Store::open(db_path.clone()).unwrap();
+        let legacy_default = temp_dir.join("Downloads").to_string_lossy().into_owned();
+        assert_eq!(
+            store.get_or_initialize_download_directory(legacy_default.clone()).await.unwrap(),
+            legacy_default
+        );
+        store.backfill_legacy_download_directories(legacy_default.clone()).await.unwrap();
         let legacy = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(legacy.id, "legacy-job");
         assert_eq!(legacy.playlist_index, None);
@@ -874,6 +1002,7 @@ mod tests {
         assert_eq!(legacy.audio_format, AudioFormat::Original);
         assert_eq!(legacy.audio_quality, AudioQuality::Best);
         assert_eq!(legacy.video_quality, VideoQuality::Best);
+        assert_eq!(legacy.download_directory, legacy_default);
 
         let mut selected = DownloadRecord::queued(
             "selected-job".to_owned(),
@@ -885,6 +1014,7 @@ mod tests {
         selected.audio_format = AudioFormat::M4a;
         selected.audio_quality = AudioQuality::K192;
         selected.video_quality = VideoQuality::P720;
+        selected.download_directory = temp_dir.join("Selected").to_string_lossy().into_owned();
         store.save_download(selected).await.unwrap();
         drop(store);
 
@@ -902,6 +1032,10 @@ mod tests {
         assert_eq!(selected.audio_format, AudioFormat::M4a);
         assert_eq!(selected.audio_quality, AudioQuality::K192);
         assert_eq!(selected.video_quality, VideoQuality::P720);
+        assert_eq!(
+            selected.download_directory,
+            temp_dir.join("Selected").to_string_lossy().into_owned()
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -1168,6 +1302,7 @@ mod tests {
         queued.audio_format = crate::model::AudioFormat::Mp3;
         queued.audio_quality = crate::model::AudioQuality::K192;
         queued.video_quality = crate::model::VideoQuality::P480;
+        queued.download_directory = "C:\\Media\\QueueSnapshot".to_owned();
         queued.progress = 48.0;
         queued.downloaded_bytes = Some(480);
         queued.total_bytes = Some(1_000);
@@ -1185,6 +1320,7 @@ mod tests {
         assert_eq!(paused.audio_format, crate::model::AudioFormat::Mp3);
         assert_eq!(paused.audio_quality, crate::model::AudioQuality::K192);
         assert_eq!(paused.video_quality, crate::model::VideoQuality::P480);
+        assert_eq!(paused.download_directory, "C:\\Media\\QueueSnapshot");
         assert_eq!(paused.playlist_index, Some(4));
 
         let resumed = store.resume_download("queued", 22).await.unwrap().unwrap();
@@ -1195,6 +1331,7 @@ mod tests {
         assert_eq!(resumed.audio_format, crate::model::AudioFormat::Mp3);
         assert_eq!(resumed.audio_quality, crate::model::AudioQuality::K192);
         assert_eq!(resumed.video_quality, crate::model::VideoQuality::P480);
+        assert_eq!(resumed.download_directory, "C:\\Media\\QueueSnapshot");
         assert_eq!(resumed.playlist_index, Some(4));
         assert!(store.resume_download("queued", 23).await.unwrap().is_none());
         assert_eq!(

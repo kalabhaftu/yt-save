@@ -51,7 +51,7 @@ component ActionButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     in property <string> product-name: "Yt Save";
-    in property <string> app-version: "0.1.9";
+    in property <string> app-version: "0.1.10";
     title: root.product-name;
     preferred-width: 1180px;
     preferred-height: 800px;
@@ -64,6 +64,7 @@ export component MainWindow inherits Window {
     in-out property <string> audio-format: "original";
     in-out property <string> audio-quality: "best";
     in-out property <string> video-quality: "Best";
+    in-out property <string> download-directory: "";
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
@@ -80,6 +81,7 @@ export component MainWindow inherits Window {
     callback playlist-entry-toggle-requested(int);
     callback enqueue-selected-playlist-entries-requested();
     callback open-download-folder();
+    callback choose-download-directory-requested();
     callback clear-completed-requested();
     callback cancel-download-requested(string);
     callback pause-download-requested(string);
@@ -218,11 +220,22 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         spacing: 12px;
                         VerticalLayout {
+                            horizontal-stretch: 1;
+                            min-width: 0px;
                             spacing: 4px;
                             Text { text: "Downloads"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
-                            Text { text: "Save media from sites supported by yt-dlp."; color: #8c94aa; font-size: 13px; }
+                            Text {
+                                text: "Save to " + root.download-directory;
+                                color: #8c94aa;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
                         }
-                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton {
+                            label: "Choose folder";
+                            button-min-width: 126px;
+                            clicked => { root.choose-download-directory-requested(); }
+                        }
                         ActionButton {
                             label: "Open folder";
                             clicked => { root.open-download-folder(); }

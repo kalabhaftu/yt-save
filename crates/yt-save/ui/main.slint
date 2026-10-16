@@ -1,4 +1,4 @@
-import { ListView } from "std-widgets.slint";
+import { ComboBox, ListView } from "std-widgets.slint";
 
 struct DownloadRowData {
     id: string,
@@ -51,7 +51,7 @@ component ActionButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     in property <string> product-name: "Yt Save";
-    in property <string> app-version: "0.1.0";
+    in property <string> app-version: "0.1.9";
     title: root.product-name;
     preferred-width: 1180px;
     preferred-height: 800px;
@@ -63,6 +63,7 @@ export component MainWindow inherits Window {
     in-out property <bool> audio-only: false;
     in-out property <string> audio-format: "original";
     in-out property <string> audio-quality: "best";
+    in-out property <string> video-quality: "Best";
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
@@ -208,11 +209,11 @@ export component MainWindow inherits Window {
             Rectangle {
                 background: #0c0e15;
                 VerticalLayout {
-                    padding-top: 30px;
-                    padding-bottom: 30px;
+                    padding-top: 20px;
+                    padding-bottom: 20px;
                     padding-left: 36px;
                     padding-right: 36px;
-                    spacing: 20px;
+                    spacing: 16px;
 
                     HorizontalLayout {
                         spacing: 12px;
@@ -229,7 +230,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 306px;
+                        height: 350px;
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -303,6 +304,24 @@ export component MainWindow inherits Window {
                                     button-height: 30px;
                                     button-min-width: 102px;
                                     clicked => { root.audio-only = true; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 34px;
+                                spacing: 8px;
+                                Text {
+                                    text: "Video quality";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ComboBox {
+                                    model: ["Best", "2160p / 4K", "1440p", "1080p", "720p", "480p", "360p", "Lowest"];
+                                    current-value <=> root.video-quality;
+                                    enabled: !root.audio-only;
+                                    height: 34px;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
@@ -448,7 +467,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 height: 12px;
-                                text: root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-only && root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                text: !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
                                 color: #747d96;
                                 font-size: 10px;
                                 overflow: elide;

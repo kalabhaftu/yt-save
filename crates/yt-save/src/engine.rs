@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::{
     dependencies::DependencyPaths,
-    model::{AudioFormat, AudioQuality, DownloadMode, MediaMetadata},
+    model::{AudioFormat, AudioQuality, DownloadMode, MediaMetadata, VideoQuality},
 };
 
 const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
@@ -26,6 +26,7 @@ pub(crate) struct DownloadOptions {
     mode: DownloadMode,
     audio_format: AudioFormat,
     audio_quality: AudioQuality,
+    video_quality: VideoQuality,
 }
 
 impl DownloadOptions {
@@ -34,7 +35,12 @@ impl DownloadOptions {
         audio_format: AudioFormat,
         audio_quality: AudioQuality,
     ) -> Self {
-        Self { mode, audio_format, audio_quality }
+        Self { mode, audio_format, audio_quality, video_quality: VideoQuality::Best }
+    }
+
+    pub(crate) fn with_video_quality(mut self, video_quality: VideoQuality) -> Self {
+        self.video_quality = video_quality;
+        self
     }
 }
 
@@ -309,7 +315,7 @@ impl DownloadEngine {
             .arg("--format");
         match options.mode {
             DownloadMode::Video => {
-                command.arg("bv*+ba/b");
+                command.arg(options.video_quality.yt_dlp_format());
             }
             DownloadMode::AudioOnly => {
                 command.arg("bestaudio");
@@ -789,6 +795,62 @@ mod tests {
         assert_eq!(video.get(video_format + 1).map(String::as_str), Some("bv*+ba/b"));
         assert!(!video.iter().any(|arg| arg == "--extract-audio"));
         assert!(!video.iter().any(|arg| arg == "--audio-quality"));
+
+        let audio_ignores_video_quality = engine
+            .download_command(
+                "https://example.test/audio",
+                None,
+                DownloadOptions::new(
+                    DownloadMode::AudioOnly,
+                    AudioFormat::Original,
+                    AudioQuality::Best,
+                )
+                .with_video_quality(VideoQuality::P2160),
+            )
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let audio_format_flag =
+            audio_ignores_video_quality.iter().position(|arg| arg == "--format").unwrap();
+        assert_eq!(
+            audio_ignores_video_quality.get(audio_format_flag + 1).map(String::as_str),
+            Some("bestaudio")
+        );
+
+        for quality in [
+            VideoQuality::Best,
+            VideoQuality::P2160,
+            VideoQuality::P1440,
+            VideoQuality::P1080,
+            VideoQuality::P720,
+            VideoQuality::P480,
+            VideoQuality::P360,
+            VideoQuality::Lowest,
+        ] {
+            let arguments = engine
+                .download_command(
+                    "https://example.test/video",
+                    None,
+                    DownloadOptions::new(
+                        DownloadMode::Video,
+                        AudioFormat::Original,
+                        AudioQuality::Best,
+                    )
+                    .with_video_quality(quality),
+                )
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let format_flag = arguments.iter().position(|arg| arg == "--format").unwrap();
+            assert_eq!(
+                arguments.get(format_flag + 1).map(String::as_str),
+                Some(quality.yt_dlp_format())
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

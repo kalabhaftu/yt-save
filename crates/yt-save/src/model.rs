@@ -149,6 +149,88 @@ impl AudioQuality {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoQuality {
+    #[default]
+    Best,
+    P2160,
+    P1440,
+    P1080,
+    P720,
+    P480,
+    P360,
+    Lowest,
+}
+
+impl VideoQuality {
+    pub fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Best => "best",
+            Self::P2160 => "2160p",
+            Self::P1440 => "1440p",
+            Self::P1080 => "1080p",
+            Self::P720 => "720p",
+            Self::P480 => "480p",
+            Self::P360 => "360p",
+            Self::Lowest => "lowest",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "best" => Some(Self::Best),
+            "2160p" => Some(Self::P2160),
+            "1440p" => Some(Self::P1440),
+            "1080p" => Some(Self::P1080),
+            "720p" => Some(Self::P720),
+            "480p" => Some(Self::P480),
+            "360p" => Some(Self::P360),
+            "lowest" => Some(Self::Lowest),
+            _ => None,
+        }
+    }
+
+    pub fn from_ui_label(value: &str) -> Option<Self> {
+        match value {
+            "Best" => Some(Self::Best),
+            "2160p / 4K" => Some(Self::P2160),
+            "1440p" => Some(Self::P1440),
+            "1080p" => Some(Self::P1080),
+            "720p" => Some(Self::P720),
+            "480p" => Some(Self::P480),
+            "360p" => Some(Self::P360),
+            "Lowest" => Some(Self::Lowest),
+            _ => None,
+        }
+    }
+
+    pub fn yt_dlp_format(self) -> &'static str {
+        match self {
+            Self::Best => "bv*+ba/b",
+            Self::P2160 => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+            Self::P1440 => "bestvideo[height<=1440]+bestaudio/best[height<=1440]",
+            Self::P1080 => "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            Self::P720 => "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            Self::P480 => "bestvideo[height<=480]+bestaudio/best[height<=480]",
+            Self::P360 => "bestvideo[height<=360]+bestaudio/best[height<=360]",
+            Self::Lowest => "worstvideo+worstaudio/worst",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Best => "Best",
+            Self::P2160 => "2160p / 4K",
+            Self::P1440 => "1440p",
+            Self::P1080 => "1080p",
+            Self::P720 => "720p",
+            Self::P480 => "480p",
+            Self::P360 => "360p",
+            Self::Lowest => "Lowest",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaMetadata {
     pub id: String,
@@ -238,6 +320,7 @@ pub struct DownloadRecord {
     pub download_mode: DownloadMode,
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
+    pub video_quality: VideoQuality,
     pub title: String,
     pub source: String,
     pub status: String,
@@ -262,6 +345,7 @@ impl DownloadRecord {
             download_mode: DownloadMode::Video,
             audio_format: AudioFormat::Original,
             audio_quality: AudioQuality::Best,
+            video_quality: VideoQuality::Best,
             title: "Waiting for media details".to_owned(),
             source: String::new(),
             status: "Queued".to_owned(),
@@ -435,5 +519,25 @@ mod tests {
             assert_eq!(quality.yt_dlp_argument(), argument);
         }
         assert_eq!(AudioQuality::from_database_value("256k"), None);
+    }
+
+    #[test]
+    fn video_quality_has_stable_persistence_and_format_constraints() {
+        for (quality, stored, format) in [
+            (VideoQuality::Best, "best", "bv*+ba/b"),
+            (VideoQuality::P2160, "2160p", "bestvideo[height<=2160]+bestaudio/best[height<=2160]"),
+            (VideoQuality::P1440, "1440p", "bestvideo[height<=1440]+bestaudio/best[height<=1440]"),
+            (VideoQuality::P1080, "1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
+            (VideoQuality::P720, "720p", "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+            (VideoQuality::P480, "480p", "bestvideo[height<=480]+bestaudio/best[height<=480]"),
+            (VideoQuality::P360, "360p", "bestvideo[height<=360]+bestaudio/best[height<=360]"),
+            (VideoQuality::Lowest, "lowest", "worstvideo+worstaudio/worst"),
+        ] {
+            assert_eq!(VideoQuality::from_database_value(stored), Some(quality));
+            assert_eq!(VideoQuality::from_ui_label(quality.label()), Some(quality));
+            assert_eq!(quality.as_database_value(), stored);
+            assert_eq!(quality.yt_dlp_format(), format);
+        }
+        assert_eq!(VideoQuality::from_database_value("8k"), None);
     }
 }

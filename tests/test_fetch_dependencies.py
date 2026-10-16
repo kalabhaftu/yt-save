@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from urllib.request import HTTPRedirectHandler
 from unittest.mock import patch
 
 from scripts.fetch_dependencies import extract_component, fetch, safe_name
@@ -61,7 +62,7 @@ class DependencyFetcherTests(unittest.TestCase):
             with patch(
                 "scripts.fetch_dependencies.urllib.request.urlopen",
                 return_value=FakeResponse(content),
-            ) as open_url:
+            ) as open_url, patch.dict("os.environ", {"GH_TOKEN": "test-token"}):
                 fetch(
                     "https://api.github.com/repos/vendor/project/releases/assets/123",
                     target,
@@ -70,7 +71,37 @@ class DependencyFetcherTests(unittest.TestCase):
                 )
             request = open_url.call_args.args[0]
             self.assertEqual(request.get_header("Accept"), "application/octet-stream")
+            self.assertEqual(request.unredirected_hdrs.get("Authorization"), "Bearer test-token")
+            redirected = HTTPRedirectHandler().redirect_request(
+                request,
+                FakeResponse(b""),
+                302,
+                "Found",
+                {},
+                "https://release-assets.githubusercontent.com/asset.zip",
+            )
+            self.assertIsNotNone(redirected)
+            self.assertNotIn("Authorization", redirected.headers)
+            self.assertNotIn("Authorization", redirected.unredirected_hdrs)
             self.assertEqual(target.read_bytes(), content)
+
+    def test_release_download_url_does_not_receive_github_api_token(self) -> None:
+        content = b"direct release bytes"
+        expected = hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "asset.exe"
+            with patch(
+                "scripts.fetch_dependencies.urllib.request.urlopen",
+                return_value=FakeResponse(content),
+            ) as open_url, patch.dict("os.environ", {"GH_TOKEN": "test-token"}):
+                fetch(
+                    "https://github.com/vendor/project/releases/download/v1/asset.exe",
+                    target,
+                    expected,
+                )
+            request = open_url.call_args.args[0]
+            self.assertNotIn("Authorization", request.unredirected_hdrs)
+            self.assertIsNone(request.get_header("Authorization"))
 
     def test_extracts_only_the_expected_deno_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

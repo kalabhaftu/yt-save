@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9 — Video quality presets
+
+- Add per-job Best, 2160p/4K, 1440p, 1080p, 720p, 480p, 360p, and Lowest video quality choices.
+- Use yt-dlp height-capped format selectors with a combined-format fallback under the same cap; preserve the choice through database migration, retry, pause/resume, and startup recovery. Audio-only jobs keep their existing behavior.
+- Add model, command, migration, persistence, retry, and recovery coverage. Windows UI and site-specific format acceptance remain pending.
+
 ## 0.1.8 — Audio output and queue controls
 
 - Add per-item Video or Audio only selection and Original, MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV output choices, plus persisted Best/320/192/128 kbps quality settings for applicable conversions.

@@ -18,6 +18,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Previews up to the first 50 playlist entries. Entries are selectable only when yt-dlp returns a positive playlist index; selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Offers Video and Audio only queue choices. Audio can keep its best available source stream in Original format or convert to MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV. Lossy conversions offer Best quality or target 320, 192, and 128 kbps settings and use the bundled FFmpeg tools.
+- Offers per-job video quality presets: Best, 2160p/4K, 1440p, 1080p, 720p, 480p, 360p, or Lowest. Resolution presets cap yt-dlp's selected video height and fall back to the best combined format at or below that cap when separate video/audio streams are unavailable.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
 - Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
 - Lets users cancel queued or active yt-dlp jobs, keeps partial files, and retry failed, interrupted, or canceled downloads.
@@ -85,12 +86,13 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 - Active pause uses the same process-tree stop path and records Paused only after yt-dlp has stopped. If the app exits while a row is Pausing, startup recovery marks it Failed with partial-file progress retained and asks the user to check for a lingering process before retrying. Rows already Paused remain paused after restart.
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist preview is capped at 50 entries. Entries without a valid positive playlist index cannot be selected. Sync subscriptions are not implemented.
-- Existing SQLite databases gain a nullable playlist index plus defaulted download mode, audio format, and audio quality columns on startup; selected queue items retain their original playlist URL and index for retry and recovery.
-- There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle settings screen yet. Audio output settings are available per queue item.
+- Existing SQLite databases gain a nullable playlist index plus defaulted download mode, audio format, audio quality, and video quality columns on startup; selected queue items retain their original playlist URL, index, and quality choices for retry and recovery.
+- There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle settings screen yet. Video quality and audio output are selected when jobs are queued and saved with each item.
 - Audio conversion requires the bundled FFmpeg and FFprobe executables. Original audio downloads use yt-dlp's best audio-only source format without an FFmpeg conversion step.
 - ALAC, FLAC, and WAV output cannot restore quality already lost in a lossy source. Bitrate selection applies to lossy conversions, including Vorbis, and is disabled for Original, ALAC, FLAC, and WAV.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.
 - Website support depends on the upstream yt-dlp extractor and each site's current behavior; no app can promise every URL will work.
+- Resolution presets use the heights yt-dlp reports. Actual resolution depends on formats available from the site; a requested cap can fail when the extractor reports no eligible format. Audio-only jobs ignore the video quality choice.
 - The v0.1.3 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
 
 ## License

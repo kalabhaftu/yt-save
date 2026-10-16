@@ -2,6 +2,8 @@
 
 `dependencies.json` is the source of truth for the x64 Windows binary set. `scripts/fetch_dependencies.py` downloads the declared release assets over HTTPS, verifies the full archive SHA-256 before extraction, and copies only the runtime files required by the app. It rejects unapproved download hosts and unsafe ZIP paths. The large binaries remain outside Git. The FFmpeg entry pins the GitHub asset ID because BtbN's `latest` URL is mutable.
 
+When `GH_TOKEN` or `GITHUB_TOKEN` is available, the fetcher authenticates requests to GitHub's release-asset API to avoid anonymous API rate limits. The release workflow passes its repository token only during package creation. The authorization header is marked unredirected, so urllib drops it when GitHub sends the download to its signed asset host. Local builds can set either token variable when the public API is rate limited; SHA-256 verification remains mandatory.
+
 | Component | Pinned artifact | Upstream | SHA-256 |
 | --- | --- | --- | --- |
 | yt-dlp | 2026.08.19 `yt-dlp.exe` | [yt-dlp release](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19) | `66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a` |

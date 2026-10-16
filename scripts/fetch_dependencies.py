@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 import urllib.request
@@ -31,6 +32,13 @@ def fetch(url: str, destination: Path, expected_hash: str, accept: str | None = 
     if accept:
         headers["Accept"] = accept
     request = urllib.request.Request(url, headers=headers)
+    if parsed_url.hostname == "api.github.com":
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            # Unredirected headers authenticate the pinned API asset request but
+            # urllib deliberately drops them when following GitHub's signed asset
+            # redirect to a different host.
+            request.add_unredirected_header("Authorization", f"Bearer {token}")
     digest = hashlib.sha256()
     try:
         with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:

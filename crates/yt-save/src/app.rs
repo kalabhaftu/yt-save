@@ -21,7 +21,7 @@ use crate::{
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
         AudioFormat, AudioQuality, DownloadMode, DownloadRecord, MediaMetadata, PlaylistEntry,
-        format_bytes, format_duration,
+        VideoQuality, format_bytes, format_duration,
     },
     persistence::Store,
 };
@@ -307,16 +307,18 @@ pub fn run() -> Result<()> {
                 return;
             }
         };
-        let (audio_only, selected_format, selected_quality) = enqueue_window
-            .upgrade()
-            .map(|window| {
-                (
-                    window.get_audio_only(),
-                    window.get_audio_format().to_string(),
-                    window.get_audio_quality().to_string(),
-                )
-            })
-            .unwrap_or_default();
+        let (audio_only, selected_format, selected_quality, selected_video_quality) =
+            enqueue_window
+                .upgrade()
+                .map(|window| {
+                    (
+                        window.get_audio_only(),
+                        window.get_audio_format().to_string(),
+                        window.get_audio_quality().to_string(),
+                        window.get_video_quality().to_string(),
+                    )
+                })
+                .unwrap_or_default();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
         record.download_mode =
             if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
@@ -324,6 +326,8 @@ pub fn run() -> Result<()> {
             AudioFormat::from_database_value(&selected_format).unwrap_or_default();
         record.audio_quality =
             AudioQuality::from_database_value(&selected_quality).unwrap_or_default();
+        record.video_quality =
+            VideoQuality::from_ui_label(&selected_video_quality).unwrap_or_default();
         let store = queue_store.clone();
         let engine = queue_engine.clone();
         let events = queue_events.clone();
@@ -398,20 +402,24 @@ pub fn run() -> Result<()> {
             ));
             return;
         }
-        let (audio_only, selected_format, selected_quality) = selected_queue_window
-            .upgrade()
-            .map(|window| {
-                (
-                    window.get_audio_only(),
-                    window.get_audio_format().to_string(),
-                    window.get_audio_quality().to_string(),
-                )
-            })
-            .unwrap_or_default();
+        let (audio_only, selected_format, selected_quality, selected_video_quality) =
+            selected_queue_window
+                .upgrade()
+                .map(|window| {
+                    (
+                        window.get_audio_only(),
+                        window.get_audio_format().to_string(),
+                        window.get_audio_quality().to_string(),
+                        window.get_video_quality().to_string(),
+                    )
+                })
+                .unwrap_or_default();
         let download_mode = if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video };
         let audio_format = AudioFormat::from_database_value(&selected_format).unwrap_or_default();
         let audio_quality =
             AudioQuality::from_database_value(&selected_quality).unwrap_or_default();
+        let video_quality =
+            VideoQuality::from_ui_label(&selected_video_quality).unwrap_or_default();
         let _ = selected_queue_events.send(UiEvent::Status(format!(
             "Adding {} selected playlist entries to the queue…",
             selected_entries.len()
@@ -437,6 +445,7 @@ pub fn run() -> Result<()> {
                 record.download_mode = download_mode;
                 record.audio_format = audio_format;
                 record.audio_quality = audio_quality;
+                record.video_quality = video_quality;
                 match store.save_download(record.clone()).await {
                     Ok(()) => saved.push(record),
                     Err(error) => {
@@ -933,7 +942,8 @@ async fn run_download_job(
         .download_with_playlist_index_cancellable(
             &active.url,
             active.playlist_index,
-            DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality),
+            DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
+                .with_video_quality(active.video_quality),
             &mut signal_receiver,
             move |progress| {
                 let _ = progress_tx.send(progress);
@@ -1154,7 +1164,7 @@ fn row_view(record: &DownloadRecord) -> DownloadRowData {
         _ => record.url.clone(),
     };
     let selection = match record.download_mode {
-        DownloadMode::Video => "Video".to_owned(),
+        DownloadMode::Video => format!("Video · {}", record.video_quality.label()),
         DownloadMode::AudioOnly if record.audio_format.supports_quality_setting() => {
             format!("Audio · {} · {}", record.audio_format.label(), record.audio_quality.label())
         }
@@ -1382,6 +1392,7 @@ mod tests {
         active.download_mode = DownloadMode::AudioOnly;
         active.audio_format = AudioFormat::Opus;
         active.audio_quality = AudioQuality::K192;
+        active.video_quality = VideoQuality::P720;
         active.downloaded_bytes = Some(75);
         active.total_bytes = Some(100);
         let mut later_playlist_item = DownloadRecord::queued(
@@ -1443,6 +1454,7 @@ mod tests {
         assert_eq!(recovered_active.download_mode, DownloadMode::AudioOnly);
         assert_eq!(recovered_active.audio_format, AudioFormat::Opus);
         assert_eq!(recovered_active.audio_quality, AudioQuality::K192);
+        assert_eq!(recovered_active.video_quality, VideoQuality::P720);
         let recovered_canceling = rows.iter().find(|record| record.id == "canceling").unwrap();
         assert_eq!(recovered_canceling.status, "Failed");
         assert_eq!(recovered_canceling.progress, 22.0);

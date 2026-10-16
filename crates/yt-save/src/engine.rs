@@ -12,6 +12,7 @@ use crate::{dependencies::DependencyPaths, model::MediaMetadata};
 
 const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
+const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 
 #[derive(Clone)]
 pub struct DownloadEngine {
@@ -81,27 +82,7 @@ impl DownloadEngine {
             .await
             .with_context(|| format!("create {}", self.output_directory.display()))?;
 
-        let mut command = self.base_command();
-        command
-            .arg("--no-warnings")
-            .arg("--continue")
-            .arg("--newline")
-            .arg("--no-color")
-            .arg("--progress")
-            .arg("--progress-template")
-            .arg(format!(
-                "download:{PROGRESS_PREFIX}%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
-            ))
-            .arg("--print")
-            .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"))
-            .arg("--paths")
-            .arg(format!("home:{}", self.output_directory.display()))
-            .arg("--output")
-            .arg("%(title)s [%(id)s].%(ext)s")
-            .arg("--format")
-            .arg("bv*+ba/b")
-            .arg(url);
-
+        let mut command = self.download_command(url);
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
         let stdout = child.stdout.take().context("open yt-dlp stdout")?;
@@ -150,6 +131,30 @@ impl DownloadEngine {
         }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
+        command
+    }
+
+    fn download_command(&self, url: &str) -> Command {
+        let mut command = self.base_command();
+        command
+            .arg("--no-warnings")
+            .arg("--continue")
+            .arg("--newline")
+            .arg("--no-color")
+            .arg("--progress")
+            .arg("--progress-template")
+            .arg(format!(
+                "download:{PROGRESS_PREFIX}%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
+            ))
+            .arg("--print")
+            .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"))
+            .arg("--paths")
+            .arg(format!("home:{}", self.output_directory.display()))
+            .arg("--output")
+            .arg(OUTPUT_TEMPLATE)
+            .arg("--format")
+            .arg("bv*+ba/b")
+            .arg(url);
         command
     }
 }
@@ -278,6 +283,39 @@ mod tests {
         let expected_runtime = format!("deno:{}", deno.display());
         assert_eq!(arguments.get(1).map(String::as_str), Some(expected_runtime.as_str()));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn download_command_uses_playlist_folder_fallback_and_configured_output_path() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let output_directory = root.join("downloads");
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, output_directory.clone());
+        let arguments = engine
+            .download_command("https://example.test/watch/123")
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let output_flag = arguments.iter().position(|argument| argument == "--output").unwrap();
+        assert_eq!(arguments.get(output_flag + 1).map(String::as_str), Some(OUTPUT_TEMPLATE));
+        let paths_flag = arguments.iter().position(|argument| argument == "--paths").unwrap();
+        assert_eq!(
+            arguments.get(paths_flag + 1).map(String::as_str),
+            Some(format!("home:{}", output_directory.display()).as_str())
+        );
+        assert_eq!(arguments.last().map(String::as_str), Some("https://example.test/watch/123"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

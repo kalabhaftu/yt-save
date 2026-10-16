@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Row, named_params, types::Type};
+use rusqlite::{Connection, OptionalExtension, Row, named_params, types::Type};
 
 use crate::model::DownloadRecord;
 
@@ -140,6 +140,53 @@ impl Store {
         .context("join database write")?
     }
 
+    /// Marks a waiting job canceled only if its worker has not claimed it yet.
+    pub async fn cancel_queued_download(&self, id: &str, updated_at: i64) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Canceled', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Queued'",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Claims a waiting job for its worker. Cancellation and claiming race through
+    /// conditional updates, so only one transition out of `Queued` can succeed.
+    pub async fn claim_queued_download(
+        &self,
+        id: &str,
+        updated_at: i64,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Analyzing', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Queued'",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                if affected == 0 {
+                    return Ok(None);
+                }
+
+                load_download_by_id(connection, &id)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
     /// Atomically moves a failed or interrupted record back to the queue and returns its state.
     /// The conditional update prevents a stale or duplicate UI action from starting a second retry.
     pub async fn retry_download(
@@ -161,31 +208,7 @@ impl Store {
                     return Ok(None);
                 }
 
-                let mut statement = connection.prepare(
-                    "SELECT id, url, title, source, status, progress, downloaded_bytes,
-                            total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                            error, created_at, updated_at
-                     FROM downloads WHERE id = :id",
-                )?;
-                let record = statement.query_row(named_params! { ":id": id }, |row| {
-                    Ok(DownloadRecord {
-                        id: row.get(0)?,
-                        url: row.get(1)?,
-                        title: row.get(2)?,
-                        source: row.get(3)?,
-                        status: row.get(4)?,
-                        progress: row.get(5)?,
-                        downloaded_bytes: optional_u64(row, 6)?,
-                        total_bytes: optional_u64(row, 7)?,
-                        speed_bytes_per_second: row.get(8)?,
-                        eta_seconds: optional_u64(row, 9)?,
-                        output_path: row.get(10)?,
-                        error: row.get(11)?,
-                        created_at: row.get(12)?,
-                        updated_at: row.get(13)?,
-                    })
-                })?;
-                Ok(Some(record))
+                load_download_by_id(connection, &id)
             })
         })
         .await
@@ -198,6 +221,36 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         operation(&connection)
     }
+}
+
+fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<DownloadRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, url, title, source, status, progress, downloaded_bytes,
+                total_bytes, speed_bytes_per_second, eta_seconds, output_path,
+                error, created_at, updated_at
+         FROM downloads WHERE id = :id",
+    )?;
+    let record = statement
+        .query_row(named_params! { ":id": id }, |row| {
+            Ok(DownloadRecord {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                title: row.get(2)?,
+                source: row.get(3)?,
+                status: row.get(4)?,
+                progress: row.get(5)?,
+                downloaded_bytes: optional_u64(row, 6)?,
+                total_bytes: optional_u64(row, 7)?,
+                speed_bytes_per_second: row.get(8)?,
+                eta_seconds: optional_u64(row, 9)?,
+                output_path: row.get(10)?,
+                error: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })
+        .optional()?;
+    Ok(record)
 }
 
 fn sqlite_integer(value: Option<u64>, field: &str) -> Result<Option<i64>> {
@@ -415,6 +468,94 @@ mod tests {
         assert!(store.retry_download("failed", 21).await.unwrap().is_none());
         assert!(store.retry_download("queued", 22).await.unwrap().is_none());
 
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_wins_over_a_waiting_worker_claim() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        store.save_download(queued).await.unwrap();
+
+        assert!(store.cancel_queued_download("queued", 20).await.unwrap());
+        assert!(!store.cancel_queued_download("queued", 21).await.unwrap());
+        assert!(store.claim_queued_download("queued", 21).await.unwrap().is_none());
+
+        let canceled = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(canceled.status, "Canceled");
+        assert_eq!(canceled.updated_at, 20);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_and_worker_claim_have_one_winner() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let (canceled, claimed) = tokio::join!(
+            store.cancel_queued_download("queued", 20),
+            store.claim_queued_download("queued", 21),
+        );
+        let canceled = canceled.unwrap();
+        let claimed = claimed.unwrap();
+        assert_ne!(canceled, claimed.is_some());
+
+        let persisted = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(persisted.status, if canceled { "Canceled" } else { "Analyzing" });
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_claim_wins_over_cancel_and_returns_the_claimed_record() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let claimed = store.claim_queued_download("queued", 20).await.unwrap().unwrap();
+        assert_eq!(claimed.status, "Analyzing");
+        assert_eq!(claimed.updated_at, 20);
+        assert!(!store.cancel_queued_download("queued", 21).await.unwrap());
+        assert!(store.claim_queued_download("queued", 22).await.unwrap().is_none());
+
+        let persisted = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(persisted.status, "Analyzing");
+        assert_eq!(persisted.updated_at, 20);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_and_claim_are_noops_for_missing_or_nonqueued_records() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        completed.status = "Completed".to_owned();
+        store.save_download(completed).await.unwrap();
+
+        assert!(!store.cancel_queued_download("missing", 20).await.unwrap());
+        assert!(store.claim_queued_download("missing", 20).await.unwrap().is_none());
+        assert!(!store.cancel_queued_download("completed", 21).await.unwrap());
+        assert!(store.claim_queued_download("completed", 21).await.unwrap().is_none());
+        assert_eq!(store.list_downloads().await.unwrap()[0].status, "Completed");
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

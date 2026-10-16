@@ -17,6 +17,8 @@ Real application screenshots will be added after the first Windows UI validation
 - Reads media metadata and available format counts through yt-dlp JSON output.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
+- Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
+- Lets users cancel a queued item before it starts and retry failed or interrupted downloads.
 - Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
 - Lets users open completed files with the operating system's registered media handler.
 - Stores output in the user's Downloads folder under `Yt Save`.
@@ -74,13 +76,13 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker and currently has no interactive pause, cancellation, or reordering controls. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- The queue is single-worker. Queued items can be canceled before they start; active downloads cannot yet be canceled, paused, resumed, or reordered. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
-- Playlist URLs are handed to yt-dlp as one job; playlist preview, entry selection, dedicated playlist folders, and sync subscriptions are not implemented.
+- Playlist URLs are handed to yt-dlp as one job and playlist entries are automatically saved in a playlist-title subfolder. Playlist preview, entry selection, and sync subscriptions are not implemented.
 - There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle/conversion settings screen yet.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.
 - Website support depends on the upstream yt-dlp extractor and each site's current behavior; no app can promise every URL will work.
-- MSI and Inno Setup source is present, but installers are not marked verified until a Windows install/start/uninstall pass has been performed.
+- The v0.1.3 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
 
 ## License
 

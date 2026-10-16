@@ -55,6 +55,7 @@ export component MainWindow inherits Window {
     callback enqueue-requested(string);
     callback open-download-folder();
     callback clear-completed-requested();
+    callback cancel-download-requested(string);
     callback remove-download-requested(string);
     callback retry-download-requested(string);
     callback open-output-requested(string);
@@ -342,6 +343,14 @@ export component MainWindow inherits Window {
                                                 background: #252a39;
                                                 Text { text: "Retry"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.retry-download-requested(row.id); } }
+                                            }
+                                            if row.status == "Queued" : Rectangle {
+                                                width: 54px;
+                                                height: 24px;
+                                                border-radius: 6px;
+                                                background: #252a39;
+                                                Text { text: "Cancel"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea { clicked => { root.cancel-download-requested(row.id); } }
                                             }
                                             if row.status == "Completed" || row.status == "Failed" || row.status == "Canceled" || row.status == "Interrupted" : Rectangle {
                                                 width: 54px;

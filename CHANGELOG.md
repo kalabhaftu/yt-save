@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 — Playlist folders and queued cancellation
+
+- Save playlist entries in a playlist-title subfolder while keeping single-item downloads in the configured output directory.
+- Add a queued-only Cancel action. SQLite arbitrates cancellation against worker start, and canceled waiters exit before launching yt-dlp.
+- Verified the output-template paths using the bundled yt-dlp with local info-JSON fixtures; actual playlist download verification remains pending.
+- Record successful v0.1.3 MSI and Inno Setup install, launch, bundled-tool, and uninstall smoke checks in GitHub Actions.
+
 ## 0.1.3 — Dependency preflight and installer smoke tests
 
 - Added asynchronous startup checks that launch yt-dlp, Deno, FFmpeg, and FFprobe and report their version or failure. A failed Deno check warns that JavaScript-based formats may be incomplete; it does not gate other yt-dlp jobs.

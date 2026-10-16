@@ -291,6 +291,37 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let cancel_store = store.clone();
+    let cancel_events = events_tx.clone();
+    let cancel_handle = handle.clone();
+    window.on_cancel_download_requested(move |id| {
+        let id = id.to_string();
+        let store = cancel_store.clone();
+        let events = cancel_events.clone();
+        cancel_handle.spawn(async move {
+            match store.cancel_queued_download(&id, now()).await {
+                Ok(true) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "Canceled the queued item before it started.".to_owned(),
+                    ));
+                }
+                Ok(false) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "This item has already started or is no longer queued.".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "cancel queued download");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not cancel that queued item: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let output_events = events_tx.clone();
     let output_handle = handle.clone();
     window.on_open_output_requested(move |output_path| {
@@ -332,7 +363,7 @@ async fn recover_pending(store: &Store) -> Result<Vec<DownloadRecord>> {
 }
 
 async fn run_download_job(
-    mut active: DownloadRecord,
+    pending: DownloadRecord,
     store: Store,
     engine: DownloadEngine,
     events: mpsc::UnboundedSender<UiEvent>,
@@ -341,12 +372,18 @@ async fn run_download_job(
     let Ok(_slot) = slots.acquire_owned().await else {
         return;
     };
-    active.status = "Analyzing".to_owned();
-    active.updated_at = now();
-    if let Err(error) = store.save_download(active.clone()).await {
-        error!(%error, job_id = %active.id, "persist analyzing state");
-        return;
-    }
+    let mut active = match store.claim_queued_download(&pending.id, now()).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            let _ = events.send(UiEvent::Refresh);
+            return;
+        }
+        Err(error) => {
+            error!(%error, job_id = %pending.id, "claim queued download");
+            let _ = events.send(UiEvent::Status(format!("Could not start queued item: {error}")));
+            return;
+        }
+    };
     let _ = events.send(UiEvent::Refresh);
 
     match engine.inspect(&active.url).await {

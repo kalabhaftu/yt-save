@@ -38,6 +38,17 @@ enum UiEvent {
 
 type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<JobSignal>>>>>;
 
+struct TrayContext {
+    store: Store,
+    handle: tokio::runtime::Handle,
+    events: mpsc::UnboundedSender<UiEvent>,
+    active_jobs: ActiveJobs,
+    engine: DownloadEngine,
+    slots: Arc<Semaphore>,
+    preferences: Arc<Mutex<TrayPreferences>>,
+    shutdown_started: Arc<AtomicBool>,
+}
+
 struct ActiveJobRegistration {
     id: String,
     jobs: ActiveJobs,
@@ -1111,14 +1122,16 @@ pub fn run() -> Result<()> {
     configure_tray(
         &window,
         &tray,
-        store.clone(),
-        handle.clone(),
-        events_tx.clone(),
-        active_jobs.clone(),
-        engine.clone(),
-        queue_slots.clone(),
-        tray_preferences_state.clone(),
-        shutdown_started,
+        TrayContext {
+            store: store.clone(),
+            handle: handle.clone(),
+            events: events_tx.clone(),
+            active_jobs: active_jobs.clone(),
+            engine: engine.clone(),
+            slots: queue_slots.clone(),
+            preferences: tray_preferences_state.clone(),
+            shutdown_started,
+        },
     );
 
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
@@ -1169,18 +1182,17 @@ fn stop_clipboard_monitor(
     Ok(())
 }
 
-fn configure_tray(
-    window: &MainWindow,
-    tray: &AppTray,
-    store: Store,
-    handle: tokio::runtime::Handle,
-    events: mpsc::UnboundedSender<UiEvent>,
-    active_jobs: ActiveJobs,
-    engine: DownloadEngine,
-    slots: Arc<Semaphore>,
-    preferences: Arc<Mutex<TrayPreferences>>,
-    shutdown_started: Arc<AtomicBool>,
-) {
+fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
+    let TrayContext {
+        store,
+        handle,
+        events,
+        active_jobs,
+        engine,
+        slots,
+        preferences,
+        shutdown_started,
+    } = context;
     let open_window = window.as_weak();
     tray.on_open_requested(move || {
         if let Some(window) = open_window.upgrade() {

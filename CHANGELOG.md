@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 — Resolve transitive XML parser advisories
+
+- Updated the Slint Linux accessibility dependency chain to `zbus_xml 5.2.1`, removing vulnerable `quick-xml 0.38.4` from the lockfile; only fixed `quick-xml 0.41.0` remains.
+- Resolves [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194) and [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195) reported by the lockfile-wide dependency audit.
+
 ## 0.1.4 — Playlist folders and queued cancellation
 
 - Save playlist entries in a playlist-title subfolder while keeping single-item downloads in the configured output directory.

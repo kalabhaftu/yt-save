@@ -1,7 +1,10 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,10 +16,10 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    DownloadRowData, MainWindow,
+    DownloadRowData, MainWindow, PlaylistEntryRowData,
     dependencies::DependencyPaths,
     engine::{DownloadEngine, ProgressUpdate},
-    model::{DownloadRecord, MediaMetadata, format_bytes, format_duration},
+    model::{DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes, format_duration},
     persistence::Store,
 };
 
@@ -24,7 +27,54 @@ enum UiEvent {
     Refresh,
     Status(String),
     DependencyStatus(String),
-    Metadata(MediaMetadata),
+    ClearPreview { request_id: u64 },
+    Metadata { request_id: u64, source_url: String, metadata: MediaMetadata },
+}
+
+#[derive(Clone)]
+struct PlaylistSelectionState {
+    source_url: String,
+    source: String,
+    entries: Vec<PlaylistEntry>,
+    selected: Vec<bool>,
+}
+
+impl PlaylistSelectionState {
+    fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|selected| **selected).count()
+    }
+
+    fn selectable_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.playlist_index.is_some()).count()
+    }
+}
+
+fn playlist_entry_rows(selection: &PlaylistSelectionState) -> Vec<PlaylistEntryRowData> {
+    selection
+        .entries
+        .iter()
+        .zip(selection.selected.iter())
+        .enumerate()
+        .map(|(row_index, (entry, selected))| PlaylistEntryRowData {
+            row_index: i32::try_from(row_index).unwrap_or(i32::MAX),
+            ordinal: SharedString::from(
+                entry.playlist_index.map_or_else(|| "—".to_owned(), |index| index.to_string()),
+            ),
+            title: SharedString::from(entry.title.as_str()),
+            selectable: entry.playlist_index.is_some(),
+            selected: *selected,
+        })
+        .collect()
+}
+
+fn selection_summary(selected_count: usize, selectable_count: usize) -> SharedString {
+    if selectable_count == 0 {
+        SharedString::from("No entries have a valid playlist index for selection.")
+    } else {
+        SharedString::from(format!(
+            "Selected {selected_count} of {selectable_count} selectable entries."
+        ))
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -50,9 +100,12 @@ pub fn run() -> Result<()> {
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
     let weak_window = window.as_weak();
     let event_store = store.clone();
+    let event_playlist_selection = playlist_selection.clone();
     runtime.spawn(async move {
+        let mut latest_analysis_id = 0;
         while let Some(event) = events_rx.recv().await {
             match event {
                 UiEvent::Refresh => match event_store.list_downloads().await {
@@ -83,14 +136,35 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
-                UiEvent::Metadata(metadata) => {
+                UiEvent::ClearPreview { request_id } => {
+                    latest_analysis_id = request_id;
+                    if let Ok(mut state) = event_playlist_selection.lock() {
+                        *state = None;
+                    }
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_analyzed_title(SharedString::default());
+                            window.set_analyzed_details(SharedString::default());
+                            window.set_analyzed_is_playlist(false);
+                            window.set_playlist_entries(ModelRc::new(VecModel::from(Vec::new())));
+                            window.set_selected_playlist_count(0);
+                            window.set_selectable_playlist_count(0);
+                            window.set_playlist_selection_summary(SharedString::default());
+                        }
+                    });
+                }
+                UiEvent::Metadata { request_id, source_url, metadata } => {
+                    if request_id != latest_analysis_id {
+                        continue;
+                    }
                     let format_summary = if metadata.is_playlist {
                         String::new()
                     } else {
                         format!(" · {} formats", metadata.format_count)
                     };
                     let playlist_summary = metadata.playlist_count.map_or(String::new(), |count| {
-                        format!(" · up to {count} playlist entries inspected")
+                        format!(" · {count} entries in preview; preview capped at 50")
                     });
                     let details = format!(
                         "{} · {}{}{}",
@@ -101,10 +175,37 @@ pub fn run() -> Result<()> {
                     );
                     let weak = weak_window.clone();
                     let title = metadata.title;
+                    let is_playlist = metadata.is_playlist;
+                    let preview_state = if is_playlist {
+                        let entries = metadata.playlist_entries;
+                        Some(PlaylistSelectionState {
+                            source_url,
+                            source: metadata.source,
+                            selected: vec![false; entries.len()],
+                            entries,
+                        })
+                    } else {
+                        None
+                    };
+                    let preview_rows =
+                        preview_state.as_ref().map(playlist_entry_rows).unwrap_or_default();
+                    let selectable_count =
+                        preview_state.as_ref().map_or(0, PlaylistSelectionState::selectable_count);
+                    if let Ok(mut state) = event_playlist_selection.lock() {
+                        *state = preview_state;
+                    }
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
                             window.set_analyzed_title(title.into());
                             window.set_analyzed_details(details.into());
+                            window.set_analyzed_is_playlist(is_playlist);
+                            window.set_playlist_entries(ModelRc::new(VecModel::from(preview_rows)));
+                            window.set_selected_playlist_count(0);
+                            window.set_selectable_playlist_count(selectable_count as i32);
+                            window.set_playlist_selection_summary(selection_summary(
+                                0,
+                                selectable_count,
+                            ));
                         }
                     });
                 }
@@ -128,7 +229,11 @@ pub fn run() -> Result<()> {
     let analyze_events = events_tx.clone();
     let analyze_engine = engine.clone();
     let analyze_handle = handle.clone();
+    let analysis_generation = Arc::new(AtomicU64::new(0));
+    let analyze_generation = analysis_generation.clone();
     window.on_analyze_requested(move |submitted_url| {
+        let request_id = analyze_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = analyze_events.send(UiEvent::ClearPreview { request_id });
         let url = match validate_url(&submitted_url) {
             Ok(url) => url,
             Err(message) => {
@@ -143,7 +248,8 @@ pub fn run() -> Result<()> {
             match engine.inspect(&url).await {
                 Ok(metadata) => {
                     let _ = events.send(UiEvent::Status("Media details loaded.".to_owned()));
-                    let _ = events.send(UiEvent::Metadata(metadata));
+                    let _ =
+                        events.send(UiEvent::Metadata { request_id, source_url: url, metadata });
                 }
                 Err(error) => {
                     let _ = events.send(UiEvent::Status(error.to_string()));
@@ -189,6 +295,128 @@ pub fn run() -> Result<()> {
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status("Added to the download queue.".to_owned()));
             run_download_job(record, store, engine, events, slots).await;
+        });
+    });
+
+    let toggle_selection = playlist_selection.clone();
+    let toggle_window = window.as_weak();
+    window.on_playlist_entry_toggle_requested(move |row_index| {
+        let Ok(row_index) = usize::try_from(row_index) else { return };
+        let Ok(mut selection) = toggle_selection.lock() else { return };
+        let Some(selection) = selection.as_mut() else { return };
+        if selection.entries.get(row_index).is_none_or(|entry| entry.playlist_index.is_none()) {
+            return;
+        }
+        let Some(selected) = selection.selected.get_mut(row_index) else { return };
+        *selected = !*selected;
+        let rows = playlist_entry_rows(selection);
+        let selected_count = selection.selected_count();
+        let selectable_count = selection.selectable_count();
+        if let Some(window) = toggle_window.upgrade() {
+            window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
+            window.set_selected_playlist_count(selected_count as i32);
+            window.set_selectable_playlist_count(selectable_count as i32);
+            window.set_playlist_selection_summary(selection_summary(
+                selected_count,
+                selectable_count,
+            ));
+        }
+    });
+
+    let selected_queue_store = store.clone();
+    let selected_queue_engine = engine.clone();
+    let selected_queue_events = events_tx.clone();
+    let selected_queue_handle = handle.clone();
+    let selected_queue_slots = queue_slots.clone();
+    let selected_playlist = playlist_selection.clone();
+    window.on_enqueue_selected_playlist_entries_requested(move || {
+        let selection = selected_playlist.lock().ok().and_then(|state| state.clone());
+        let Some(selection) = selection else {
+            let _ = selected_queue_events
+                .send(UiEvent::Status("Analyze a playlist before selecting entries.".to_owned()));
+            return;
+        };
+        let mut selected_entries = selection
+            .entries
+            .iter()
+            .zip(selection.selected.iter())
+            .filter_map(|(entry, selected)| {
+                (*selected)
+                    .then_some(entry.playlist_index)
+                    .flatten()
+                    .map(|index| (entry.title.clone(), index))
+            })
+            .collect::<Vec<_>>();
+        selected_entries.sort_by_key(|(_, playlist_index)| *playlist_index);
+        if selected_entries.is_empty() {
+            let _ = selected_queue_events.send(UiEvent::Status(
+                "Select one or more entries with a valid playlist index.".to_owned(),
+            ));
+            return;
+        }
+        let _ = selected_queue_events.send(UiEvent::Status(format!(
+            "Adding {} selected playlist entries to the queue…",
+            selected_entries.len()
+        )));
+        let store = selected_queue_store.clone();
+        let engine = selected_queue_engine.clone();
+        let events = selected_queue_events.clone();
+        let slots = selected_queue_slots.clone();
+        selected_queue_handle.spawn(async move {
+            let mut saved = Vec::new();
+            let mut save_error = None;
+            let selected_count = selected_entries.len();
+            for (title, playlist_index) in selected_entries {
+                let mut record = DownloadRecord::queued(
+                    Uuid::new_v4().to_string(),
+                    selection.source_url.clone(),
+                    now(),
+                );
+                record.title = title;
+                record.source = selection.source.clone();
+                record.playlist_index = Some(playlist_index);
+                match store.save_download(record.clone()).await {
+                    Ok(()) => saved.push(record),
+                    Err(error) => {
+                        error!(%error, playlist_index, "persist selected playlist item");
+                        save_error =
+                            Some(format!("Saving playlist item {playlist_index} failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            if saved.is_empty() {
+                let _ = events.send(UiEvent::Refresh);
+                if let Some(error) = save_error {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save any selected playlist entries. {error}"
+                    )));
+                }
+                return;
+            }
+            let _ = events.send(UiEvent::Refresh);
+            let status = if let Some(error) = save_error {
+                format!(
+                    "Queued {} of {selected_count} selected playlist entries. {error}",
+                    saved.len()
+                )
+            } else {
+                format!(
+                    "Queued {} selected playlist entries. Each item will download separately.",
+                    saved.len()
+                )
+            };
+            let _ = events.send(UiEvent::Status(status));
+            for record in saved {
+                run_download_job(
+                    record,
+                    store.clone(),
+                    engine.clone(),
+                    events.clone(),
+                    slots.clone(),
+                )
+                .await;
+            }
         });
     });
 
@@ -358,7 +586,7 @@ async fn recover_pending(store: &Store) -> Result<Vec<DownloadRecord>> {
             pending.push(record);
         }
     }
-    pending.sort_by_key(|record| (record.created_at, record.id.clone()));
+    pending.sort_by_key(|record| record.queue_order);
     Ok(pending)
 }
 
@@ -386,7 +614,7 @@ async fn run_download_job(
     };
     let _ = events.send(UiEvent::Refresh);
 
-    match engine.inspect(&active.url).await {
+    match engine.inspect_with_playlist_index(&active.url, active.playlist_index).await {
         Ok(metadata) => {
             active.title = metadata.title;
             active.source = metadata.source;
@@ -443,7 +671,7 @@ async fn run_download_job(
     });
 
     let download_result = engine
-        .download(&active.url, move |progress| {
+        .download_with_playlist_index(&active.url, active.playlist_index, move |progress| {
             let _ = progress_tx.send(progress);
         })
         .await;
@@ -678,22 +906,38 @@ mod tests {
             20,
         );
         active.status = "Downloading".to_owned();
+        active.playlist_index = Some(3);
         active.downloaded_bytes = Some(75);
         active.total_bytes = Some(100);
+        let mut later_playlist_item = DownloadRecord::queued(
+            "selected-later".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            30,
+        );
+        later_playlist_item.playlist_index = Some(9);
+        let mut earlier_playlist_item = DownloadRecord::queued(
+            "selected-earlier".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            30,
+        );
+        earlier_playlist_item.playlist_index = Some(2);
         store.save_download(queued.clone()).await.unwrap();
         store.save_download(active.clone()).await.unwrap();
+        store.save_download(later_playlist_item).await.unwrap();
+        store.save_download(earlier_playlist_item).await.unwrap();
 
         let pending = recover_pending(&store).await.unwrap();
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 4);
         assert!(pending.iter().all(|record| record.status == "Queued"));
         assert_eq!(
             pending.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
-            ["queued", "active"]
+            ["queued", "active", "selected-later", "selected-earlier"]
         );
         let rows = store.list_downloads().await.unwrap();
         let recovered_active = rows.iter().find(|record| record.id == "active").unwrap();
         assert_eq!(recovered_active.status, "Queued");
         assert_eq!(recovered_active.downloaded_bytes, Some(75));
+        assert_eq!(recovered_active.playlist_index, Some(3));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

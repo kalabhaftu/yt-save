@@ -11,19 +11,51 @@ pub struct MediaMetadata {
     pub format_count: usize,
     pub is_playlist: bool,
     pub playlist_count: Option<usize>,
+    #[serde(default)]
+    pub playlist_entries: Vec<PlaylistEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaylistEntry {
+    pub playlist_index: Option<i64>,
+    pub title: String,
 }
 
 impl MediaMetadata {
-    pub fn from_yt_dlp_json(value: &serde_json::Value, submitted_url: &str) -> Self {
+    pub fn from_yt_dlp_json_for_playlist_item(
+        value: &serde_json::Value,
+        submitted_url: &str,
+        selected_playlist_index: Option<i64>,
+    ) -> Self {
         let entries = value.get("entries").and_then(serde_json::Value::as_array);
-        let first_entry = entries.and_then(|items| items.first()).unwrap_or(value);
+        let selected_entry = selected_playlist_index.and_then(|selected_index| {
+            entries.and_then(|items| {
+                items.iter().find(|entry| playlist_index(entry) == Some(selected_index))
+            })
+        });
+        let first_entry =
+            selected_entry.or_else(|| entries.and_then(|items| items.first())).unwrap_or(value);
         let is_playlist = entries.is_some();
+        let playlist_entries = entries.map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .filter(|entry| entry.is_object())
+                .map(|entry| PlaylistEntry {
+                    playlist_index: playlist_index(entry),
+                    title: text(entry, "title")
+                        .unwrap_or_else(|| "Untitled playlist item".to_owned()),
+                })
+                .collect()
+        });
+        let title = if selected_playlist_index.is_some() {
+            text(first_entry, "title").or_else(|| text(value, "title"))
+        } else {
+            text(value, "title").or_else(|| text(first_entry, "title"))
+        };
 
         Self {
             id: text(first_entry, "id").unwrap_or_default(),
-            title: text(value, "title")
-                .or_else(|| text(first_entry, "title"))
-                .unwrap_or_else(|| "Untitled media".to_owned()),
+            title: title.unwrap_or_else(|| "Untitled media".to_owned()),
             webpage_url: text(first_entry, "webpage_url")
                 .or_else(|| text(value, "webpage_url"))
                 .unwrap_or_else(|| submitted_url.to_owned()),
@@ -38,14 +70,22 @@ impl MediaMetadata {
                 .map_or(0, Vec::len),
             is_playlist,
             playlist_count: entries.map(Vec::len),
+            playlist_entries,
         }
     }
+}
+
+fn playlist_index(value: &serde_json::Value) -> Option<i64> {
+    value.get("playlist_index").and_then(serde_json::Value::as_i64).filter(|index| *index > 0)
 }
 
 #[derive(Clone, Debug)]
 pub struct DownloadRecord {
     pub id: String,
     pub url: String,
+    /// SQLite rowid assigned when this queue item was first inserted.
+    pub queue_order: i64,
+    pub playlist_index: Option<i64>,
     pub title: String,
     pub source: String,
     pub status: String,
@@ -65,6 +105,8 @@ impl DownloadRecord {
         Self {
             id,
             url,
+            queue_order: 0,
+            playlist_index: None,
             title: "Waiting for media details".to_owned(),
             source: String::new(),
             status: "Queued".to_owned(),
@@ -124,7 +166,11 @@ mod tests {
             r#"{"id":"x1","title":"A clip","webpage_url":"https://example.test/x1","extractor_key":"Example","duration":61,"formats":[{},{}]}"#,
         )
         .unwrap();
-        let parsed = MediaMetadata::from_yt_dlp_json(&single, "https://example.test/x1");
+        let parsed = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &single,
+            "https://example.test/x1",
+            None,
+        );
         assert_eq!(parsed.title, "A clip");
         assert_eq!(parsed.source, "Example");
         assert_eq!(parsed.format_count, 2);
@@ -134,10 +180,54 @@ mod tests {
             r#"{"title":"Playlist","entries":[{"id":"x1","title":"First"},{"id":"x2","title":"Second"}]}"#,
         )
         .unwrap();
-        let parsed = MediaMetadata::from_yt_dlp_json(&playlist, "https://example.test/list");
+        let parsed = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &playlist,
+            "https://example.test/list",
+            None,
+        );
         assert!(parsed.is_playlist);
         assert_eq!(parsed.playlist_count, Some(2));
         assert_eq!(parsed.title, "Playlist");
+        assert_eq!(parsed.playlist_entries.len(), 2);
+        assert_eq!(parsed.playlist_entries[0].playlist_index, None);
+    }
+
+    #[test]
+    fn playlist_entries_are_selectable_only_with_positive_integer_indexes() {
+        let playlist: serde_json::Value = serde_json::from_str(
+            r#"{"title":"Playlist","entries":[{"title":"First","playlist_index":1},{"title":"Zero","playlist_index":0},{"title":"String","playlist_index":"3"},{"title":"Missing"},null,{"title":"Sixth","playlist_index":6}]}"#,
+        )
+        .unwrap();
+
+        let parsed = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &playlist,
+            "https://example.test/list",
+            None,
+        );
+
+        assert_eq!(parsed.playlist_count, Some(6));
+        assert_eq!(parsed.playlist_entries.len(), 5);
+        assert_eq!(parsed.playlist_entries[0].playlist_index, Some(1));
+        assert_eq!(parsed.playlist_entries[1].playlist_index, None);
+        assert_eq!(parsed.playlist_entries[2].playlist_index, None);
+        assert_eq!(parsed.playlist_entries[3].playlist_index, None);
+        assert_eq!(parsed.playlist_entries[4].playlist_index, Some(6));
+    }
+
+    #[test]
+    fn selected_playlist_item_uses_its_title_instead_of_the_playlist_title() {
+        let playlist: serde_json::Value = serde_json::from_str(
+            r#"{"title":"Playlist","entries":[{"title":"Second item","playlist_index":2}]}"#,
+        )
+        .unwrap();
+
+        let parsed = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &playlist,
+            "https://example.test/list",
+            Some(2),
+        );
+
+        assert_eq!(parsed.title, "Second item");
     }
 
     #[test]

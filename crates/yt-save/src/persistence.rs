@@ -36,7 +36,8 @@ impl Store {
                     output_path TEXT,
                     error TEXT,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    playlist_index INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -46,6 +47,18 @@ impl Store {
                     updated_at INTEGER NOT NULL
                  );",
             )?;
+            let has_playlist_index = {
+                let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == "playlist_index")
+            };
+            if !has_playlist_index {
+                connection
+                    .execute_batch("ALTER TABLE downloads ADD COLUMN playlist_index INTEGER;")?;
+            }
             Ok(())
         })?;
         Ok(store)
@@ -69,10 +82,11 @@ impl Store {
                     "INSERT INTO downloads (
                         id, url, title, source, status, progress, downloaded_bytes,
                         total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                        error, created_at, updated_at
+                        error, created_at, updated_at, playlist_index
                     ) VALUES (
                         :id, :url, :title, :source, :status, :progress, :downloaded,
-                        :total, :speed, :eta, :output, :error, :created, :updated
+                        :total, :speed, :eta, :output, :error, :created, :updated,
+                        :playlist_index
                     ) ON CONFLICT(id) DO UPDATE SET
                         url=excluded.url, title=excluded.title, source=excluded.source,
                         status=excluded.status, progress=excluded.progress,
@@ -80,7 +94,8 @@ impl Store {
                         total_bytes=excluded.total_bytes,
                         speed_bytes_per_second=excluded.speed_bytes_per_second,
                         eta_seconds=excluded.eta_seconds, output_path=excluded.output_path,
-                        error=excluded.error, updated_at=excluded.updated_at",
+                        error=excluded.error, updated_at=excluded.updated_at,
+                        playlist_index=excluded.playlist_index",
                     named_params! {
                         ":id": record.id,
                         ":url": record.url,
@@ -96,6 +111,7 @@ impl Store {
                         ":error": record.error,
                         ":created": record.created_at,
                         ":updated": record.updated_at,
+                        ":playlist_index": record.playlist_index,
                     },
                 )?;
                 Ok(())
@@ -227,7 +243,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
     let mut statement = connection.prepare(
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                error, created_at, updated_at
+                error, created_at, updated_at, playlist_index, rowid
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -247,6 +263,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 error: row.get(11)?,
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
+                playlist_index: row.get(14)?,
+                queue_order: row.get(15)?,
             })
         })
         .optional()?;
@@ -266,8 +284,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
     let mut statement = connection.prepare(
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                error, created_at, updated_at
-         FROM downloads ORDER BY created_at DESC",
+                error, created_at, updated_at, playlist_index, rowid
+         FROM downloads ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(DownloadRecord {
@@ -285,6 +303,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             error: row.get(11)?,
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
+            playlist_index: row.get(14)?,
+            queue_order: row.get(15)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -318,6 +338,7 @@ mod tests {
         let store = Store::open(db_path.clone()).unwrap();
         let mut record =
             DownloadRecord::queued("job-1".to_owned(), "https://example.test/media".to_owned(), 10);
+        record.playlist_index = Some(4);
         record.downloaded_bytes = Some(345);
         record.total_bytes = Some(1_000);
         record.eta_seconds = Some(12);
@@ -332,6 +353,70 @@ mod tests {
         assert_eq!(rows[0].downloaded_bytes, Some(345));
         assert_eq!(rows[0].total_bytes, Some(1_000));
         assert_eq!(rows[0].eta_seconds, Some(12));
+        assert_eq!(rows[0].playlist_index, Some(4));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn adds_playlist_index_to_legacy_database_and_preserves_selected_item() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("legacy.sqlite3");
+        {
+            let connection = Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE downloads (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        url TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        progress REAL NOT NULL DEFAULT 0,
+                        downloaded_bytes INTEGER,
+                        total_bytes INTEGER,
+                        speed_bytes_per_second REAL,
+                        eta_seconds INTEGER,
+                        output_path TEXT,
+                        error TEXT,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    INSERT INTO downloads (
+                        id, url, title, source, status, progress,
+                        created_at, updated_at
+                    ) VALUES (
+                        'legacy-job', 'https://example.test/list', 'Old row', 'Example',
+                        'Completed', 100, 10, 20
+                    );",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(db_path.clone()).unwrap();
+        let legacy = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(legacy.id, "legacy-job");
+        assert_eq!(legacy.playlist_index, None);
+
+        let mut selected = DownloadRecord::queued(
+            "selected-job".to_owned(),
+            "https://example.test/list".to_owned(),
+            30,
+        );
+        selected.playlist_index = Some(7);
+        store.save_download(selected).await.unwrap();
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        let selected = reopened
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "selected-job")
+            .unwrap();
+        assert_eq!(selected.url, "https://example.test/list");
+        assert_eq!(selected.playlist_index, Some(7));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -449,6 +534,7 @@ mod tests {
         failed.downloaded_bytes = Some(345);
         failed.total_bytes = Some(1_000);
         failed.error = Some("temporary network error".to_owned());
+        failed.playlist_index = Some(5);
         store.save_download(failed).await.unwrap();
 
         let queued = DownloadRecord::queued(
@@ -465,6 +551,7 @@ mod tests {
         assert_eq!(retried.downloaded_bytes, Some(345));
         assert_eq!(retried.total_bytes, Some(1_000));
         assert_eq!(retried.updated_at, 20);
+        assert_eq!(retried.playlist_index, Some(5));
         assert!(store.retry_download("failed", 21).await.unwrap().is_none());
         assert!(store.retry_download("queued", 22).await.unwrap().is_none());
 

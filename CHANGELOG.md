@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 — Select playlist entries
+
+- Preview up to 50 playlist entries and queue selected entries as separate downloads.
+- Preserve each selected entry's original playlist URL and index through SQLite migration, retries, and startup recovery.
+- Keep whole-playlist downloads available as a separate queue action.
+
 ## 0.1.5 — Resolve transitive XML parser advisories
 
 - Updated the Slint Linux accessibility dependency chain to `zbus_xml 5.2.1`, removing vulnerable `quick-xml 0.38.4` from the lockfile; only fixed `quick-xml 0.41.0` remains.

@@ -2,7 +2,7 @@
 
 Yt Save is a native Rust desktop media downloader for Windows 10 and 11. It coordinates the official [yt-dlp](https://github.com/yt-dlp/yt-dlp) executable, so supported sites are determined by yt-dlp's extractors rather than a YouTube-only URL allowlist. YouTube's full format support is handled by the separately bundled Deno runtime and yt-dlp's bundled `yt-dlp-ejs` component.
 
-The repository is in active development. This foundation build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist selection, reliable pause/resume, tray operation, clipboard assistance, library/history browsing, and installed-app verification are still tracked as unfinished work in [the feature matrix](docs/FEATURE_MATRIX.md).
+The repository is in active development. This build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist preview and per-entry selection are available; sync subscriptions, reliable pause/resume, tray operation, clipboard assistance, library/history browsing, and installed-app verification remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ## Screenshots
 
@@ -15,6 +15,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Native Rust application with a Slint UI and Tokio background work.
 - Accepts HTTP and HTTPS media URLs from any site yt-dlp can extract.
 - Reads media metadata and available format counts through yt-dlp JSON output.
+- Previews up to the first 50 playlist entries. Entries are selectable only when yt-dlp returns a positive playlist index; selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
 - Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
@@ -76,9 +77,10 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker. Queued items can be canceled before they start; active downloads cannot yet be canceled, paused, resumed, or reordered. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- The queue is single-worker. Selected playlist entries run in playlist-index order, and startup recovery uses the index to resolve selected entries with tied creation timestamps. Queued items can be canceled before they start; active downloads cannot yet be canceled, paused, resumed, or reordered. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
-- Playlist URLs are handed to yt-dlp as one job and playlist entries are automatically saved in a playlist-title subfolder. Playlist preview, entry selection, and sync subscriptions are not implemented.
+- Playlist preview is capped at 50 entries. Entries without a valid positive playlist index cannot be selected. Sync subscriptions are not implemented.
+- Existing SQLite databases gain a nullable playlist index on startup; selected queue items retain their original playlist URL and index for retry and recovery.
 - There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle/conversion settings screen yet.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.
 - Website support depends on the upstream yt-dlp extractor and each site's current behavior; no app can promise every URL will work.

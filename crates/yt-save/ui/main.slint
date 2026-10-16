@@ -1,3 +1,5 @@
+import { ListView } from "std-widgets.slint";
+
 struct DownloadRowData {
     id: string,
     title: string,
@@ -8,15 +10,25 @@ struct DownloadRowData {
     output-path: string,
 }
 
+struct PlaylistEntryRowData {
+    row-index: int,
+    ordinal: string,
+    title: string,
+    selectable: bool,
+    selected: bool,
+}
+
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
+    in property <bool> is-enabled: true;
     callback clicked();
 
     height: 42px;
     min-width: 112px;
     border-radius: 10px;
     background: primary ? #7968ff : #232638;
+    opacity: is-enabled ? 1 : 0.45;
     border-width: primary ? 0px : 1px;
     border-color: #34384d;
 
@@ -30,6 +42,7 @@ component ActionButton inherits Rectangle {
     }
 
     TouchArea {
+        enabled: root.is-enabled;
         clicked => { root.clicked(); }
     }
 }
@@ -49,10 +62,17 @@ export component MainWindow inherits Window {
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
+    in-out property <bool> analyzed-is-playlist: false;
+    in property <[PlaylistEntryRowData]> playlist-entries: [];
+    in-out property <int> selected-playlist-count: 0;
+    in-out property <int> selectable-playlist-count: 0;
+    in-out property <string> playlist-selection-summary: "";
     in property <[DownloadRowData]> downloads: [];
 
     callback analyze-requested(string);
     callback enqueue-requested(string);
+    callback playlist-entry-toggle-requested(int);
+    callback enqueue-selected-playlist-entries-requested();
     callback open-download-folder();
     callback clear-completed-requested();
     callback cancel-download-requested(string);
@@ -258,7 +278,7 @@ export component MainWindow inherits Window {
                     }
 
                     if root.analyzed-title != "" : Rectangle {
-                        height: 92px;
+                        height: root.analyzed-is-playlist ? 250px : 92px;
                         background: #121722;
                         border-width: 1px;
                         border-color: #2a3041;
@@ -271,6 +291,60 @@ export component MainWindow inherits Window {
                             spacing: 6px;
                             Text { text: root.analyzed-title; color: #e9ebf4; font-size: 14px; font-weight: 600; }
                             Text { text: root.analyzed-details; color: #8c95ad; font-size: 12px; }
+                            if root.analyzed-is-playlist : HorizontalLayout {
+                                height: 34px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.playlist-selection-summary;
+                                    color: #8c95ad;
+                                    font-size: 11px;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Add selected";
+                                    min-width: 170px;
+                                    primary: true;
+                                    is-enabled: root.selected-playlist-count > 0;
+                                    clicked => { root.enqueue-selected-playlist-entries-requested(); }
+                                }
+                            }
+                            if root.analyzed-is-playlist : ListView {
+                                height: 145px;
+                                for entry in root.playlist-entries: Rectangle {
+                                    height: 30px;
+                                    background: entry.selected ? #22243a : #121722;
+                                    border-radius: 6px;
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: entry.selectable ? (entry.selected ? "✓" : "□") : "—";
+                                            color: entry.selectable ? #b7adff : #555d70;
+                                            width: 24px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                        Text {
+                                            text: entry.ordinal + ". " + entry.title;
+                                            color: entry.selectable ? #d6d9e5 : #71798e;
+                                            font-size: 12px;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    if entry.selectable : TouchArea {
+                                            clicked => { root.playlist-entry-toggle-requested(entry.row-index); }
+                                    }
+                                }
+                            }
+                            if root.analyzed-is-playlist : Text {
+                                text: "The preview is capped at 50 entries. Add to queue downloads the whole playlist.";
+                                color: #727b92;
+                                font-size: 10px;
+                            }
                         }
                     }
 

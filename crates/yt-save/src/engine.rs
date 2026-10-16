@@ -52,16 +52,16 @@ impl DownloadEngine {
     }
 
     pub async fn inspect(&self, url: &str) -> Result<MediaMetadata> {
+        self.inspect_with_playlist_index(url, None).await
+    }
+
+    pub(crate) async fn inspect_with_playlist_index(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+    ) -> Result<MediaMetadata> {
         self.dependencies.require_for_download()?;
-        let mut command = self.base_command();
-        command
-            .arg("--no-warnings")
-            .arg("--skip-download")
-            .arg("--flat-playlist")
-            .arg("--playlist-end")
-            .arg("50")
-            .arg("--dump-single-json")
-            .arg(url);
+        let mut command = self.inspect_command(url, playlist_index)?;
         debug!(host = url_host(url), "requesting yt-dlp metadata");
         let output = command.output().await.context("start yt-dlp metadata extraction")?;
         if !output.status.success() {
@@ -70,10 +70,33 @@ impl DownloadEngine {
         }
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)
             .context("parse yt-dlp's JSON metadata response")?;
-        Ok(MediaMetadata::from_yt_dlp_json(&json, url))
+        let metadata =
+            MediaMetadata::from_yt_dlp_json_for_playlist_item(&json, url, playlist_index);
+        if let Some(selected_index) = playlist_index {
+            let selected_entry_found =
+                json.get("playlist_index").and_then(serde_json::Value::as_i64)
+                    == Some(selected_index)
+                    || metadata
+                        .playlist_entries
+                        .iter()
+                        .any(|entry| entry.playlist_index == Some(selected_index));
+            if json.get("entries").and_then(serde_json::Value::as_array).is_some()
+                && !selected_entry_found
+            {
+                bail!(
+                    "yt-dlp did not return playlist item {selected_index}; it may have been removed."
+                );
+            }
+        }
+        Ok(metadata)
     }
 
-    pub async fn download<F>(&self, url: &str, mut on_progress: F) -> Result<DownloadResult>
+    pub(crate) async fn download_with_playlist_index<F>(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+        mut on_progress: F,
+    ) -> Result<DownloadResult>
     where
         F: FnMut(ProgressUpdate) + Send,
     {
@@ -82,7 +105,7 @@ impl DownloadEngine {
             .await
             .with_context(|| format!("create {}", self.output_directory.display()))?;
 
-        let mut command = self.download_command(url);
+        let mut command = self.download_command(url, playlist_index)?;
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
         let stdout = child.stdout.take().context("open yt-dlp stdout")?;
@@ -134,7 +157,7 @@ impl DownloadEngine {
         command
     }
 
-    fn download_command(&self, url: &str) -> Command {
+    fn download_command(&self, url: &str, playlist_index: Option<i64>) -> Result<Command> {
         let mut command = self.base_command();
         command
             .arg("--no-warnings")
@@ -153,10 +176,34 @@ impl DownloadEngine {
             .arg("--output")
             .arg(OUTPUT_TEMPLATE)
             .arg("--format")
-            .arg("bv*+ba/b")
-            .arg(url);
-        command
+            .arg("bv*+ba/b");
+        add_playlist_item_argument(&mut command, playlist_index)?;
+        command.arg(url);
+        Ok(command)
     }
+
+    fn inspect_command(&self, url: &str, playlist_index: Option<i64>) -> Result<Command> {
+        let mut command = self.base_command();
+        command
+            .arg("--no-warnings")
+            .arg("--skip-download")
+            .arg("--flat-playlist")
+            .arg("--playlist-end")
+            .arg("50");
+        add_playlist_item_argument(&mut command, playlist_index)?;
+        command.arg("--dump-single-json").arg(url);
+        Ok(command)
+    }
+}
+
+fn add_playlist_item_argument(command: &mut Command, playlist_index: Option<i64>) -> Result<()> {
+    if let Some(index) = playlist_index {
+        if index <= 0 {
+            bail!("playlist item index must be a positive integer");
+        }
+        command.arg("--playlist-items").arg(index.to_string());
+    }
+    Ok(())
 }
 
 fn parse_progress_line(value: &str) -> Option<ProgressUpdate> {
@@ -302,11 +349,13 @@ mod tests {
         };
         let engine = DownloadEngine::new(dependencies, output_directory.clone());
         let arguments = engine
-            .download_command("https://example.test/watch/123")
+            .download_command("https://example.test/watch/123", None)
+            .unwrap()
             .as_std()
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert!(!arguments.iter().any(|argument| argument == "--playlist-items"));
 
         let output_flag = arguments.iter().position(|argument| argument == "--output").unwrap();
         assert_eq!(arguments.get(output_flag + 1).map(String::as_str), Some(OUTPUT_TEMPLATE));
@@ -316,6 +365,49 @@ mod tests {
             Some(format!("home:{}", output_directory.display()).as_str())
         );
         assert_eq!(arguments.last().map(String::as_str), Some("https://example.test/watch/123"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_playlist_item_index_is_passed_to_inspection_and_download_only_for_selected_jobs() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        let args = |command: Command| {
+            command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let ordinary_inspection =
+            args(engine.inspect_command("https://example.test/playlist", None).unwrap());
+        assert!(!ordinary_inspection.iter().any(|arg| arg == "--playlist-items"));
+
+        let selected_inspection =
+            args(engine.inspect_command("https://example.test/playlist", Some(7)).unwrap());
+        let inspection_end =
+            selected_inspection.iter().position(|arg| arg == "--playlist-end").unwrap();
+        assert_eq!(selected_inspection.get(inspection_end + 1).map(String::as_str), Some("50"));
+        let selected_download =
+            args(engine.download_command("https://example.test/playlist", Some(7)).unwrap());
+        for arguments in [&selected_inspection, &selected_download] {
+            let option = arguments.iter().position(|arg| arg == "--playlist-items").unwrap();
+            assert_eq!(arguments.get(option + 1).map(String::as_str), Some("7"));
+        }
+
+        assert!(engine.inspect_command("https://example.test/list", Some(0)).is_err());
+        assert!(engine.download_command("https://example.test/list", Some(-2)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

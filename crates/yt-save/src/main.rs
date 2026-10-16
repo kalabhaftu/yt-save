@@ -1,4 +1,5 @@
 mod app;
+mod clipboard_monitor;
 mod dependencies;
 mod engine;
 mod model;

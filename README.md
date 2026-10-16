@@ -2,7 +2,7 @@
 
 Yt Save is a native Rust desktop media downloader for Windows 10 and 11. It coordinates the official [yt-dlp](https://github.com/yt-dlp/yt-dlp) executable, so supported sites are determined by yt-dlp's extractors rather than a YouTube-only URL allowlist. YouTube's full format support is handled by the separately bundled Deno runtime and yt-dlp's bundled `yt-dlp-ejs` component.
 
-The repository is in active development. This build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist preview, per-entry selection, per-job pause/resume, and a persistent download-folder preference are available; sync subscriptions, tray operation, clipboard assistance, library/history browsing, and installed-app verification remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
+The repository is in active development. This build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist preview, per-entry selection, per-job pause/resume, a persistent download-folder preference, and opt-in in-app clipboard URL review are available; a floating clipboard popup, tray operation, sync subscriptions, library/history browsing, and installed-app acceptance remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ## Screenshots
 
@@ -20,6 +20,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Offers Video and Audio only queue choices. Audio can keep its best available source stream in Original format or convert to MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV. Lossy conversions offer Best quality or target 320, 192, and 128 kbps settings and use the bundled FFmpeg tools.
 - Offers per-job video quality presets: Best, 2160p/4K, 1440p, 1080p, 720p, 480p, 360p, or Lowest. Resolution presets cap yt-dlp's selected video height and fall back to the best combined format at or below that cap when separate video/audio streams are unavailable.
 - Remembers the Video/Audio only mode, video quality, audio format, and audio bitrate shown in New download. Presets are saved after a queue item is successfully added; existing, resumed, and retried jobs keep their own saved choices.
+- Offers optional, default-off clipboard monitoring on Windows. When enabled, copied text is checked locally for a single HTTP(S) URL and shown for review; no metadata lookup or download starts until you choose Analyze or Add to queue. The opt-in persists, while clipboard contents are not stored.
 - Lets users choose and save a default download folder with the Windows folder picker. New jobs snapshot that folder, so changing the default does not move queued, paused, interrupted, or retried jobs.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
 - Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
@@ -91,13 +92,13 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist preview is capped at 50 entries. Entries without a valid positive playlist index cannot be selected. Sync subscriptions are not implemented.
 - Existing SQLite databases gain a nullable playlist index plus defaulted download mode, audio format, audio quality, and video quality columns on startup. A download-directory snapshot column is backfilled for legacy queue rows; retries and recovery keep each job's saved destination.
-- There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle settings screen yet. The New download form presets load from SQLite and update only after a new job is successfully queued; each queue item separately retains its own video, audio, and output-folder choices for retries and recovery.
+- Clipboard monitoring currently shows a copied URL for review inside the main window. A floating popup, system tray, Windows notifications, scheduler, media library, and subtitle settings screen are not implemented yet. The New download form presets load from SQLite and update only after a new job is successfully queued; each queue item separately retains its own video, audio, and output-folder choices for retries and recovery.
 - Audio conversion requires the bundled FFmpeg and FFprobe executables. Original audio downloads use yt-dlp's best audio-only source format without an FFmpeg conversion step.
 - ALAC, FLAC, and WAV output cannot restore quality already lost in a lossy source. Bitrate selection applies to lossy conversions, including Vorbis, and is disabled for Original, ALAC, FLAC, and WAV.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.
 - Website support depends on the upstream yt-dlp extractor and each site's current behavior; no app can promise every URL will work.
 - Resolution presets use the heights yt-dlp reports. Actual resolution depends on formats available from the site; a requested cap can fail when the extractor reports no eligible format. Audio-only jobs ignore the video quality choice.
-- The v0.1.9 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, Deno path validation, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
+- The v0.1.11 MSI and Inno Setup installers passed clean install, app launch, bundled-tool checks, Deno path validation, and uninstall in GitHub Actions. Upgrade testing, visual UI review, and a full in-app download acceptance pass remain pending.
 
 ## License
 

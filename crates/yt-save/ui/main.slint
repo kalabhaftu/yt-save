@@ -51,7 +51,7 @@ component ActionButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     in property <string> product-name: "Yt Save";
-    in property <string> app-version: "0.1.11";
+    in property <string> app-version: "0.1.12";
     title: root.product-name;
     preferred-width: 1180px;
     preferred-height: 800px;
@@ -66,6 +66,8 @@ export component MainWindow inherits Window {
     in-out property <string> video-quality: "Best";
     in-out property <string> download-directory: "";
     in-out property <string> status-message: "Paste a media URL to get started.";
+    in-out property <bool> clipboard-monitoring-enabled: false;
+    in-out property <string> clipboard-candidate: "";
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
@@ -80,6 +82,8 @@ export component MainWindow inherits Window {
     callback enqueue-requested(string);
     callback playlist-entry-toggle-requested(int);
     callback enqueue-selected-playlist-entries-requested();
+    callback clipboard-monitoring-requested(bool);
+    callback clipboard-candidate-dismissed();
     callback open-download-folder();
     callback choose-download-directory-requested();
     callback clear-completed-requested();
@@ -179,22 +183,55 @@ export component MainWindow inherits Window {
                     Rectangle { vertical-stretch: 1; }
 
                     Rectangle {
-                        border-radius: 12px;
-                        background: #171b28;
-                        border-width: 1px;
-                        border-color: #282d40;
-                        height: 116px;
-
                         VerticalLayout {
-                            padding: 12px;
-                            spacing: 5px;
-                            Text { text: "ENGINE STATUS"; color: #737b94; font-size: 10px; font-weight: 700; }
-                            Text {
-                                text: root.dependency-status;
-                                color: #aab2c8;
-                                font-size: 11px;
-                                wrap: word-wrap;
-                                vertical-stretch: 1;
+                            spacing: 10px;
+                            Rectangle {
+                                border-radius: 12px;
+                                background: #171b28;
+                                border-width: 1px;
+                                border-color: #282d40;
+                                height: 116px;
+
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 5px;
+                                    Text { text: "ENGINE STATUS"; color: #737b94; font-size: 10px; font-weight: 700; }
+                                    Text {
+                                        text: root.dependency-status;
+                                        color: #aab2c8;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                        vertical-stretch: 1;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                border-radius: 12px;
+                                background: #171b28;
+                                border-width: 1px;
+                                border-color: #282d40;
+                                height: 124px;
+
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 5px;
+                                    Text { text: "CLIPBOARD ASSISTANT"; color: #737b94; font-size: 10px; font-weight: 700; }
+                                    Text {
+                                        text: root.clipboard-monitoring-enabled ? "Checks copied text locally. Nothing is analyzed or downloaded until you choose." : "Off by default. Turn on local checks for copied web links.";
+                                        color: #aab2c8;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                        vertical-stretch: 1;
+                                    }
+                                    ActionButton {
+                                        label: root.clipboard-monitoring-enabled ? "Turn off" : "Turn on";
+                                        primary: root.clipboard-monitoring-enabled;
+                                        button-height: 28px;
+                                        button-min-width: 112px;
+                                        clicked => { root.clipboard-monitoring-requested(!root.clipboard-monitoring-enabled); }
+                                    }
+                                }
                             }
                         }
                     }
@@ -243,7 +280,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 350px;
+                        height: 350px + (root.clipboard-candidate != "" ? 38px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -253,6 +290,34 @@ export component MainWindow inherits Window {
                             padding: 18px;
                             spacing: 8px;
                             Text { text: "New download"; color: #eff0f7; font-size: 15px; font-weight: 600; }
+                            if root.clipboard-candidate != "" : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Copied URL"; color: #a9b0c4; font-size: 11px; }
+                                Text {
+                                    text: root.clipboard-candidate;
+                                    color: #d6d9e5;
+                                    font-size: 11px;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Use";
+                                    button-height: 28px;
+                                    button-min-width: 54px;
+                                    clicked => {
+                                        root.url-input = root.clipboard-candidate;
+                                        root.clipboard-candidate = "";
+                                    }
+                                }
+                                ActionButton {
+                                    label: "Dismiss";
+                                    button-height: 28px;
+                                    button-min-width: 76px;
+                                    clicked => { root.clipboard-candidate-dismissed(); }
+                                }
+                            }
                             HorizontalLayout {
                                 spacing: 10px;
                                 Rectangle {

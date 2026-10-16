@@ -182,6 +182,45 @@ impl Store {
         .context("join preset read")?
     }
 
+    /// Clipboard monitoring is off unless the user previously enabled it explicitly.
+    pub async fn load_clipboard_monitoring_enabled(&self) -> Result<bool> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                Ok(setting_value(connection, "clipboard_monitoring_enabled")?.as_deref()
+                    == Some("true"))
+            })
+        })
+        .await
+        .context("join clipboard preference read")?
+    }
+
+    pub async fn set_clipboard_monitoring_enabled(
+        &self,
+        enabled: bool,
+        updated_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('clipboard_monitoring_enabled', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! {
+                        ":value": if enabled { "true" } else { "false" },
+                        ":updated": updated_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join clipboard preference write")??;
+        Ok(())
+    }
+
     /// Updates New download defaults atomically; queue rows and retries are untouched.
     pub async fn set_download_presets(
         &self,
@@ -976,6 +1015,33 @@ mod tests {
         assert_eq!(recovered.audio_format, AudioFormat::Flac);
         assert_eq!(recovered.audio_quality, AudioQuality::Best);
         assert_eq!(recovered.video_quality, VideoQuality::Best);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clipboard_monitoring_is_off_by_default_and_persists_explicit_choice() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        assert!(!store.load_clipboard_monitoring_enabled().await.unwrap());
+        store.set_clipboard_monitoring_enabled(true, 10).await.unwrap();
+        assert!(store.load_clipboard_monitoring_enabled().await.unwrap());
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert!(reopened.load_clipboard_monitoring_enabled().await.unwrap());
+        reopened
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'yes' WHERE key = 'clipboard_monitoring_enabled'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
+        reopened.set_clipboard_monitoring_enabled(false, 20).await.unwrap();
+        assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

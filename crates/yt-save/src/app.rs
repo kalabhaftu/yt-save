@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     DownloadRowData, MainWindow, PlaylistEntryRowData,
+    clipboard_monitor::ClipboardMonitor,
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
@@ -29,6 +30,7 @@ use crate::{
 enum UiEvent {
     Refresh,
     Status(String),
+    ClipboardCandidate { generation: u64, candidate: String },
     DependencyStatus(String),
     ClearPreview { request_id: u64 },
     Metadata { request_id: u64, source_url: String, metadata: MediaMetadata },
@@ -131,6 +133,8 @@ pub fn run() -> Result<()> {
     runtime
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
+    let clipboard_monitoring_enabled =
+        runtime.block_on(store.load_clipboard_monitoring_enabled())?;
     let engine = DownloadEngine::new(dependencies.clone(), download_directory.clone());
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
@@ -141,15 +145,19 @@ pub fn run() -> Result<()> {
     window.set_audio_format(download_presets.audio_format.as_database_value().into());
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
+    window.set_clipboard_monitoring_enabled(false);
     let saved_rows =
         runtime.block_on(store.list_downloads())?.iter().map(row_view).collect::<Vec<_>>();
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let clipboard_monitor_slot = Arc::new(Mutex::new(None::<ClipboardMonitor>));
+    let clipboard_monitor_generation = Arc::new(AtomicU64::new(0));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
     let weak_window = window.as_weak();
     let event_store = store.clone();
     let event_playlist_selection = playlist_selection.clone();
+    let event_clipboard_generation = clipboard_monitor_generation.clone();
     runtime.spawn(async move {
         let mut latest_analysis_id = 0;
         while let Some(event) = events_rx.recv().await {
@@ -171,6 +179,25 @@ pub fn run() -> Result<()> {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
                             window.set_status_message(message.into());
+                        }
+                    });
+                }
+                UiEvent::ClipboardCandidate { generation, candidate } => {
+                    if event_clipboard_generation.load(Ordering::Relaxed) != generation {
+                        continue;
+                    }
+                    let weak = weak_window.clone();
+                    let active_generation = event_clipboard_generation.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if active_generation.load(Ordering::Relaxed) == generation
+                            && let Some(window) = weak.upgrade()
+                            && window.get_clipboard_monitoring_enabled()
+                        {
+                            window.set_clipboard_candidate(candidate.into());
+                            window.set_status_message(
+                                "A copied web link is ready for review. Nothing starts until you choose an action."
+                                    .into(),
+                            );
                         }
                     });
                 }
@@ -256,6 +283,111 @@ pub fn run() -> Result<()> {
                     });
                 }
             }
+        }
+    });
+
+    if clipboard_monitoring_enabled {
+        match start_clipboard_monitor(
+            &clipboard_monitor_slot,
+            &clipboard_monitor_generation,
+            events_tx.clone(),
+        ) {
+            Ok(()) => window.set_clipboard_monitoring_enabled(true),
+            Err(error) => {
+                error!(%error, "start saved clipboard monitoring preference");
+                window.set_status_message(
+                    format!("Clipboard monitoring could not start: {error}").into(),
+                );
+                let store = store.clone();
+                handle.spawn(async move {
+                    if let Err(save_error) =
+                        store.set_clipboard_monitoring_enabled(false, now()).await
+                    {
+                        error!(%save_error, "disable unavailable clipboard monitoring preference");
+                    }
+                });
+            }
+        }
+    }
+
+    let clipboard_request_slot = clipboard_monitor_slot.clone();
+    let clipboard_request_generation = clipboard_monitor_generation.clone();
+    let clipboard_request_store = store.clone();
+    let clipboard_request_handle = handle.clone();
+    let clipboard_request_events = events_tx.clone();
+    let clipboard_request_window = window.as_weak();
+    window.on_clipboard_monitoring_requested(move |enabled| {
+        let weak = clipboard_request_window.clone();
+        let events = clipboard_request_events.clone();
+        if enabled {
+            match start_clipboard_monitor(
+                &clipboard_request_slot,
+                &clipboard_request_generation,
+                events.clone(),
+            ) {
+                Ok(()) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_clipboard_monitoring_enabled(true);
+                        window.set_status_message(
+                            "Clipboard URL checks are on. Links stay local until you choose Analyze or Add to queue."
+                                .into(),
+                        );
+                    }
+                    let store = clipboard_request_store.clone();
+                    clipboard_request_handle.spawn(async move {
+                        if let Err(error) = store.set_clipboard_monitoring_enabled(true, now()).await
+                        {
+                            error!(%error, "save clipboard monitoring preference");
+                            let _ = events.send(UiEvent::Status(format!(
+                                "Clipboard checks are on for this session, but the setting could not be saved: {error}"
+                            )));
+                        }
+                    });
+                }
+                Err(error) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_clipboard_monitoring_enabled(false);
+                        window.set_status_message(
+                            format!("Clipboard monitoring could not start: {error}").into(),
+                        );
+                    }
+                }
+            }
+        } else {
+            match stop_clipboard_monitor(&clipboard_request_slot, &clipboard_request_generation) {
+                Ok(()) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_clipboard_monitoring_enabled(false);
+                        window.set_clipboard_candidate(SharedString::default());
+                        window.set_status_message("Clipboard URL checks are off.".into());
+                    }
+                    let store = clipboard_request_store.clone();
+                    clipboard_request_handle.spawn(async move {
+                        if let Err(error) = store.set_clipboard_monitoring_enabled(false, now()).await
+                        {
+                            error!(%error, "save clipboard monitoring preference");
+                            let _ = events.send(UiEvent::Status(format!(
+                                "Clipboard checks are off for this session, but the setting could not be saved: {error}"
+                            )));
+                        }
+                    });
+                }
+                Err(error) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_status_message(
+                            format!("Could not stop clipboard monitoring: {error}").into(),
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    let clipboard_dismiss_window = window.as_weak();
+    window.on_clipboard_candidate_dismissed(move || {
+        if let Some(window) = clipboard_dismiss_window.upgrade() {
+            window.set_clipboard_candidate(SharedString::default());
+            window.set_status_message("Copied link dismissed.".into());
         }
     });
 
@@ -921,7 +1053,49 @@ pub fn run() -> Result<()> {
 
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
     window.run().context("run Slint event loop")?;
+    let _ = stop_clipboard_monitor(&clipboard_monitor_slot, &clipboard_monitor_generation);
     runtime.shutdown_timeout(Duration::from_secs(3));
+    Ok(())
+}
+
+fn start_clipboard_monitor(
+    slot: &Arc<Mutex<Option<ClipboardMonitor>>>,
+    generation: &AtomicU64,
+    events: mpsc::UnboundedSender<UiEvent>,
+) -> Result<()> {
+    let mut monitor_slot =
+        slot.lock().map_err(|_| anyhow::anyhow!("clipboard monitor state is unavailable"))?;
+    if monitor_slot.is_some() {
+        return Ok(());
+    }
+
+    let (monitor, candidates) = ClipboardMonitor::start()?;
+    let generation = generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let dispatcher = std::thread::Builder::new()
+        .name("yt-save-clipboard-events".to_owned())
+        .spawn(move || {
+            while let Ok(candidate) = candidates.recv() {
+                if events.send(UiEvent::ClipboardCandidate { generation, candidate }).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("start clipboard candidate dispatcher")?;
+    drop(dispatcher);
+    *monitor_slot = Some(monitor);
+    Ok(())
+}
+
+fn stop_clipboard_monitor(
+    slot: &Arc<Mutex<Option<ClipboardMonitor>>>,
+    generation: &AtomicU64,
+) -> Result<()> {
+    let mut monitor_slot =
+        slot.lock().map_err(|_| anyhow::anyhow!("clipboard monitor state is unavailable"))?;
+    generation.fetch_add(1, Ordering::Relaxed);
+    let monitor = monitor_slot.take();
+    drop(monitor_slot);
+    drop(monitor);
     Ok(())
 }
 

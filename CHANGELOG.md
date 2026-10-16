@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12 — Opt-in clipboard URL review
+
+- Add a default-off Windows clipboard listener that parses one HTTP(S) URL locally and ignores other clipboard text.
+- Persist the explicit monitoring choice; do not store clipboard contents or initiate metadata lookup/download until the user chooses an action.
+- Show copied links in the main window with Use and Dismiss actions, then reuse the existing Analyze and Add to queue controls.
+- Add parser, event-deduplication, and SQLite preference coverage. Floating popup, tray behavior, and Windows notification support remain pending.
+
 ## 0.1.11 — Persistent New download presets
 
 - Restore the Video/Audio only mode, video quality, audio format, and audio bitrate controls from SQLite `app_settings` at startup.

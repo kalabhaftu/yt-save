@@ -130,6 +130,7 @@ pub fn run() -> Result<()> {
     let queue_engine = engine.clone();
     let queue_events = events_tx.clone();
     let queue_slots = Arc::new(Semaphore::new(1));
+    let queue_handle = handle.clone();
     let pending = runtime.block_on(recover_pending(&store))?;
     for record in pending {
         let store = store.clone();
@@ -153,7 +154,7 @@ pub fn run() -> Result<()> {
         let engine = queue_engine.clone();
         let events = queue_events.clone();
         let slots = queue_slots.clone();
-        handle.spawn(async move {
+        queue_handle.spawn(async move {
             if let Err(error) = store.save_download(record.clone()).await {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
                 return;
@@ -171,6 +172,63 @@ pub fn run() -> Result<()> {
             let _ = folder_events
                 .send(UiEvent::Status(format!("Could not open download folder: {error}")));
         }
+    });
+
+    let clear_store = store.clone();
+    let clear_events = events_tx.clone();
+    let clear_handle = handle.clone();
+    window.on_clear_completed_requested(move || {
+        let store = clear_store.clone();
+        let events = clear_events.clone();
+        clear_handle.spawn(async move {
+            match store.clear_completed_downloads().await {
+                Ok(0) => {
+                    let _ = events.send(UiEvent::Status("There are no completed downloads to clear.".to_owned()));
+                }
+                Ok(count) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Removed {count} completed items from history. Downloaded files were left in place."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "clear completed download history");
+                    let _ = events.send(UiEvent::Status(format!("Could not clear completed history: {error}")));
+                }
+            }
+        });
+    });
+
+    let remove_store = store.clone();
+    let remove_events = events_tx.clone();
+    let remove_handle = handle.clone();
+    window.on_remove_download_requested(move |id| {
+        let id = id.to_string();
+        let store = remove_store.clone();
+        let events = remove_events.clone();
+        remove_handle.spawn(async move {
+            match store.remove_download(&id).await {
+                Ok(true) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "Removed the history entry. Any downloaded file was left in place."
+                            .to_owned(),
+                    ));
+                }
+                Ok(false) => {
+                    let _ = events.send(UiEvent::Status(
+                        "Only finished or stopped downloads can be removed from the queue."
+                            .to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "remove download history entry");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not remove that history entry: {error}"
+                    )));
+                }
+            }
+        });
     });
 
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
@@ -196,6 +254,7 @@ async fn recover_pending(store: &Store) -> Result<Vec<DownloadRecord>> {
             pending.push(record);
         }
     }
+    pending.sort_by_key(|record| (record.created_at, record.id.clone()));
     Ok(pending)
 }
 
@@ -418,6 +477,10 @@ mod tests {
         let pending = recover_pending(&store).await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|record| record.status == "Queued"));
+        assert_eq!(
+            pending.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["queued", "active"]
+        );
         let rows = store.list_downloads().await.unwrap();
         let recovered_active = rows.iter().find(|record| record.id == "active").unwrap();
         assert_eq!(recovered_active.status, "Queued");

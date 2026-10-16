@@ -57,8 +57,7 @@ jobs:
             "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
           ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
           if (-not $paths) { throw "The hosted Windows runner does not contain Inno Setup 6." }
-          & $paths[0] /?
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler could not start." }
+          Write-Host "Found Inno Setup compiler at $($paths[0]); the packaging step will compile the installer."
 
       - name: Build verified dependencies and Windows installers
         shell: pwsh

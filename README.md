@@ -2,7 +2,7 @@
 
 Yt Save is a native Rust desktop media downloader for Windows 10 and 11. It coordinates the official [yt-dlp](https://github.com/yt-dlp/yt-dlp) executable, so supported sites are determined by yt-dlp's extractors rather than a YouTube-only URL allowlist. YouTube's full format support is handled by the separately bundled Deno runtime and yt-dlp's bundled `yt-dlp-ejs` component.
 
-The repository is in active development. This foundation build provides URL analysis, a persisted single-worker download queue, progress reporting, and a custom Slint interface. Playlist selection, reliable pause/resume, tray operation, clipboard assistance, library/history views, and finished Windows installers are still tracked as unfinished work in [the feature matrix](docs/FEATURE_MATRIX.md).
+The repository is in active development. This foundation build provides URL analysis, a persisted single-worker download queue, progress reporting, basic completed-history cleanup, and a custom Slint interface. Playlist selection, reliable pause/resume, tray operation, clipboard assistance, library/history browsing, and installed-app verification are still tracked as unfinished work in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ## Screenshots
 
@@ -72,7 +72,7 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker and currently has no interactive pause, retry, cancellation, or reordering controls. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
+- The queue is single-worker and currently has no interactive pause, retry, cancellation, or reordering controls. Finished rows can be removed from history, or completed rows cleared in bulk; these actions leave downloaded files in place. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist URLs are handed to yt-dlp as one job; playlist preview, entry selection, dedicated playlist folders, and sync subscriptions are not implemented.
 - There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle/conversion settings screen yet.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.

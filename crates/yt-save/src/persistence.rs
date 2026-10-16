@@ -106,6 +106,40 @@ impl Store {
         Ok(())
     }
 
+    /// Removes a terminal download record from the database without touching its output file.
+    /// Active and queued work remains attached to its worker and cannot be removed here.
+    pub async fn remove_download(&self, id: &str) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "DELETE FROM downloads
+                     WHERE id = :id
+                       AND status IN ('Completed', 'Failed', 'Canceled', 'Interrupted')",
+                    named_params! { ":id": id },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
+    /// Removes completed history records from the database without touching output files.
+    pub async fn clear_completed_downloads(&self) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected =
+                    connection.execute("DELETE FROM downloads WHERE status = 'Completed'", [])?;
+                Ok(affected)
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
     fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let connection = Connection::open(&self.path)
             .with_context(|| format!("open application database {}", self.path.display()))?;
@@ -206,6 +240,93 @@ mod tests {
 
         let error = store.save_download(record).await.unwrap_err();
         assert!(error.to_string().contains("SQLite's signed integer range"));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_download_deletes_only_terminal_rows_and_keeps_output_file() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let output_path = temp_dir.join("finished.mp4");
+        std::fs::write(&output_path, b"downloaded media").unwrap();
+
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        completed.status = "Completed".to_owned();
+        completed.output_path = Some(output_path.to_string_lossy().into_owned());
+        store.save_download(completed).await.unwrap();
+
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/active".to_owned(),
+            11,
+        );
+        active.status = "Downloading".to_owned();
+        store.save_download(active).await.unwrap();
+
+        assert!(store.remove_download("completed").await.unwrap());
+        assert!(!store.remove_download("completed").await.unwrap());
+        assert!(!store.remove_download("active").await.unwrap());
+
+        let rows = store.list_downloads().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "active");
+        assert!(output_path.exists());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_completed_downloads_returns_count_and_preserves_other_rows_and_files() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let completed_path = temp_dir.join("completed.mp4");
+        std::fs::write(&completed_path, b"downloaded media").unwrap();
+
+        for id in ["completed-1", "completed-2"] {
+            let mut record =
+                DownloadRecord::queued(id.to_owned(), "https://example.test/media".to_owned(), 10);
+            record.status = "Completed".to_owned();
+            record.output_path = Some(completed_path.to_string_lossy().into_owned());
+            store.save_download(record).await.unwrap();
+        }
+
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/queued".to_owned(),
+            11,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let mut failed = DownloadRecord::queued(
+            "failed".to_owned(),
+            "https://example.test/failed".to_owned(),
+            12,
+        );
+        failed.status = "Failed".to_owned();
+        store.save_download(failed).await.unwrap();
+
+        assert_eq!(store.clear_completed_downloads().await.unwrap(), 2);
+        assert_eq!(store.clear_completed_downloads().await.unwrap(), 0);
+
+        let mut remaining: Vec<_> = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.id, record.status))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                ("failed".to_owned(), "Failed".to_owned()),
+                ("queued".to_owned(), "Queued".to_owned()),
+            ]
+        );
+        assert!(completed_path.exists());
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

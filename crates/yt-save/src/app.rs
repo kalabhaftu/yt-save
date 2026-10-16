@@ -597,6 +597,7 @@ pub fn run() -> Result<()> {
                 )
             })
             .unwrap_or_default();
+        let inspection_url = url.clone();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
         let download_presets = DownloadPresets::from_ui_values(
             audio_only,
@@ -615,7 +616,6 @@ pub fn run() -> Result<()> {
         let active_jobs = enqueue_active_jobs.clone();
         let inspector = engine.clone();
         let analysis_generation = enqueue_analysis_generation.clone();
-        let inspection_url = url.clone();
         queue_handle.spawn(async move {
             match inspector.inspect(&inspection_url).await {
                 Ok(metadata) if metadata.is_playlist => {

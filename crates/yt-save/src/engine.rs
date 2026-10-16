@@ -1,10 +1,14 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{
+    path::PathBuf,
+    process::{ExitStatus, Output, Stdio},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
+    sync::watch,
 };
 use tracing::{debug, warn};
 
@@ -46,6 +50,12 @@ pub struct DownloadResult {
     pub output_path: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum EngineOutcome<T> {
+    Completed(T),
+    Canceled,
+}
+
 impl DownloadEngine {
     pub fn new(dependencies: DependencyPaths, output_directory: PathBuf) -> Self {
         Self { dependencies, output_directory }
@@ -60,10 +70,55 @@ impl DownloadEngine {
         url: &str,
         playlist_index: Option<i64>,
     ) -> Result<MediaMetadata> {
+        let (_cancel_sender, mut cancel) = watch::channel(false);
+        match self.inspect_with_playlist_index_cancellable(url, playlist_index, &mut cancel).await?
+        {
+            EngineOutcome::Completed(metadata) => Ok(metadata),
+            EngineOutcome::Canceled => bail!("metadata inspection was canceled"),
+        }
+    }
+
+    pub(crate) async fn inspect_with_playlist_index_cancellable(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<EngineOutcome<MediaMetadata>> {
+        if cancellation_requested(cancel) {
+            return Ok(EngineOutcome::Canceled);
+        }
         self.dependencies.require_for_download()?;
         let mut command = self.inspect_command(url, playlist_index)?;
         debug!(host = url_host(url), "requesting yt-dlp metadata");
-        let output = command.output().await.context("start yt-dlp metadata extraction")?;
+        let mut child = command.spawn().context("start yt-dlp metadata extraction")?;
+        let stdout = child.stdout.take().context("open yt-dlp metadata stdout")?;
+        let stderr = child.stderr.take().context("open yt-dlp metadata stderr")?;
+        let stdout_task = tokio::spawn(read_all(stdout));
+        let stderr_task = tokio::spawn(read_all(stderr));
+        let (status, canceled) = tokio::select! {
+            biased;
+            status = child.wait() => (status.context("wait for yt-dlp metadata")?, false),
+            _ = wait_for_cancellation(cancel) => {
+                match terminate_process_tree(&mut child).await {
+                    Ok(status) => (status, true),
+                    Err(error) => {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        let _ = stdout_task.await;
+                        let _ = stderr_task.await;
+                        return Err(error);
+                    }
+                }
+            },
+        };
+        let output = Output {
+            status,
+            stdout: stdout_task.await.context("join yt-dlp metadata stdout reader")??,
+            stderr: stderr_task.await.context("join yt-dlp metadata stderr reader")??,
+        };
+        if canceled && !output.status.success() {
+            return Ok(EngineOutcome::Canceled);
+        }
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             bail!("yt-dlp could not read this URL: {}", readable_error(&message));
@@ -88,18 +143,22 @@ impl DownloadEngine {
                 );
             }
         }
-        Ok(metadata)
+        Ok(EngineOutcome::Completed(metadata))
     }
 
-    pub(crate) async fn download_with_playlist_index<F>(
+    pub(crate) async fn download_with_playlist_index_cancellable<F>(
         &self,
         url: &str,
         playlist_index: Option<i64>,
+        cancel: &mut watch::Receiver<bool>,
         mut on_progress: F,
-    ) -> Result<DownloadResult>
+    ) -> Result<EngineOutcome<DownloadResult>>
     where
         F: FnMut(ProgressUpdate) + Send,
     {
+        if cancellation_requested(cancel) {
+            return Ok(EngineOutcome::Canceled);
+        }
         self.dependencies.require_for_download()?;
         tokio::fs::create_dir_all(&self.output_directory)
             .await
@@ -119,24 +178,60 @@ impl DownloadEngine {
 
         let mut output_path = None;
         let mut lines = BufReader::new(stdout).lines();
-        while let Some(line) = lines.next_line().await.context("read yt-dlp output")? {
-            if let Some(encoded) = line.strip_prefix(PROGRESS_PREFIX) {
-                if let Some(progress) = parse_progress_line(encoded) {
-                    on_progress(progress);
+        let mut cancellation_triggered = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    cancellation_triggered = true;
+                    if let Err(error) = terminate_process_tree(&mut child).await {
+                        stderr_task.abort();
+                        let _ = stderr_task.await;
+                        return Err(error);
+                    }
+                    break;
                 }
-            } else if let Some(path) = line.strip_prefix(OUTPUT_PREFIX) {
-                output_path = Some(path.to_owned());
-            } else if !line.trim().is_empty() {
-                debug!("yt-dlp emitted status output");
+                line = lines.next_line() => {
+                    let Some(line) = line.context("read yt-dlp output")? else {
+                        break;
+                    };
+                    process_download_line(&line, &mut output_path, &mut on_progress);
+                }
             }
         }
-        let status = child.wait().await.context("wait for yt-dlp")?;
+        let status = if cancellation_triggered {
+            child.wait().await.context("wait for yt-dlp")?
+        } else {
+            tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    cancellation_triggered = true;
+                    match terminate_process_tree(&mut child).await {
+                        Ok(status) => status,
+                        Err(error) => {
+                            stderr_task.abort();
+                            let _ = stderr_task.await;
+                            return Err(error);
+                        }
+                    }
+                }
+                status = child.wait() => status.context("wait for yt-dlp")?,
+            }
+        };
+        if cancellation_triggered {
+            while let Some(line) = lines.next_line().await.context("read yt-dlp output")? {
+                process_download_line(&line, &mut output_path, &mut on_progress);
+            }
+        }
         let stderr = stderr_task.await.unwrap_or_default();
+        if cancellation_triggered && !status.success() {
+            return Ok(EngineOutcome::Canceled);
+        }
         if !status.success() {
             warn!(code = ?status.code(), "yt-dlp download failed");
             bail!("{}", readable_error(stderr.trim()));
         }
-        Ok(DownloadResult { output_path })
+        Ok(EngineOutcome::Completed(DownloadResult { output_path }))
     }
 
     fn base_command(&self) -> Command {
@@ -194,6 +289,117 @@ impl DownloadEngine {
         command.arg("--dump-single-json").arg(url);
         Ok(command)
     }
+}
+
+fn process_download_line<F>(line: &str, output_path: &mut Option<String>, on_progress: &mut F)
+where
+    F: FnMut(ProgressUpdate),
+{
+    if let Some(encoded) = line.strip_prefix(PROGRESS_PREFIX) {
+        if let Some(progress) = parse_progress_line(encoded) {
+            on_progress(progress);
+        }
+    } else if let Some(path) = line.strip_prefix(OUTPUT_PREFIX) {
+        *output_path = Some(path.to_owned());
+    } else if !line.trim().is_empty() {
+        debug!("yt-dlp emitted status output");
+    }
+}
+
+async fn read_all<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+fn cancellation_requested(cancel: &watch::Receiver<bool>) -> bool {
+    *cancel.borrow()
+}
+
+async fn wait_for_cancellation(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if cancellation_requested(cancel) {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn terminate_process_tree(child: &mut tokio::process::Child) -> Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        if let Some(pid) = child.id() {
+            let mut taskkill = Command::new(taskkill_executable());
+            taskkill
+                .args(taskkill_arguments(pid))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .creation_flags(0x0800_0000);
+            match tokio::time::timeout(std::time::Duration::from_secs(10), taskkill.status()).await
+            {
+                Ok(Ok(status)) if status.success() => {
+                    return child.wait().await.context("reap terminated yt-dlp process tree");
+                }
+                Ok(Ok(status)) => {
+                    if let Some(child_status) =
+                        child.try_wait().context("check yt-dlp after taskkill failure")?
+                    {
+                        if child_status.success() {
+                            return Ok(child_status);
+                        }
+                    }
+                    let reason = format!("taskkill exited with status {:?}", status.code());
+                    force_kill_direct_child(child).await?;
+                    bail!("{reason}; yt-dlp stopped, but its process tree could not be confirmed")
+                }
+                Ok(Err(error)) => {
+                    if child
+                        .try_wait()
+                        .context("check yt-dlp after taskkill launch error")?
+                        .is_some_and(|status| status.success())
+                    {
+                        return child.wait().await.context("reap completed yt-dlp process");
+                    }
+                    force_kill_direct_child(child).await?;
+                    bail!("could not launch taskkill to stop yt-dlp's process tree: {error}")
+                }
+                Err(_) => {
+                    force_kill_direct_child(child).await?;
+                    bail!(
+                        "taskkill timed out; yt-dlp stopped, but its process tree could not be confirmed"
+                    )
+                }
+            }
+        }
+    }
+
+    force_kill_direct_child(child).await
+}
+
+async fn force_kill_direct_child(child: &mut tokio::process::Child) -> Result<ExitStatus> {
+    if child.try_wait().context("check yt-dlp before termination")?.is_none() {
+        child.start_kill().context("send termination to yt-dlp")?;
+    }
+    child.wait().await.context("reap terminated yt-dlp process")
+}
+
+#[cfg(windows)]
+fn taskkill_executable() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("taskkill.exe"))
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"))
+}
+
+#[cfg(any(windows, test))]
+fn taskkill_arguments(pid: u32) -> [String; 4] {
+    ["/PID".to_owned(), pid.to_string(), "/T".to_owned(), "/F".to_owned()]
 }
 
 fn add_playlist_item_argument(command: &mut Command, playlist_index: Option<i64>) -> Result<()> {
@@ -275,6 +481,14 @@ mod tests {
         let unknown = parse_progress_line("downloading|500|NA|NA|NA|NA").unwrap();
         assert_eq!(unknown.percent(), None);
         assert_eq!(unknown.speed_bytes_per_second, None);
+    }
+
+    #[test]
+    fn windows_process_tree_termination_uses_pid_argument_without_shell_interpolation() {
+        assert_eq!(
+            taskkill_arguments(4242),
+            ["/PID".to_owned(), "4242".to_owned(), "/T".to_owned(), "/F".to_owned(),]
+        );
     }
 
     #[test]

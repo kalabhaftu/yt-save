@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 — Active download cancellation
+
+- Cancel active yt-dlp metadata inspection and downloads, including the Windows process tree, while preserving partial progress for retry.
+- Keep cancellation, completion, and failure transitions conditional so stale progress cannot overwrite a requested cancellation.
+- Recover an interrupted cancellation as Failed with a warning to check for lingering media processes before retrying.
+- Show saved failure and recovery warnings ahead of byte progress in queue rows.
+
 ## 0.1.6 — Select playlist entries
 
 - Preview up to 50 playlist entries and queue selected entries as separate downloads.

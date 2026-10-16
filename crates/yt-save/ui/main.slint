@@ -410,7 +410,7 @@ export component MainWindow inherits Window {
                                                 Text { text: "Open"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.open-output-requested(row.output-path); } }
                                             }
-                                            if row.status == "Failed" : Rectangle {
+                                            if row.status == "Failed" || row.status == "Interrupted" || row.status == "Canceled" : Rectangle {
                                                 width: 48px;
                                                 height: 24px;
                                                 border-radius: 6px;
@@ -418,7 +418,7 @@ export component MainWindow inherits Window {
                                                 Text { text: "Retry"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.retry-download-requested(row.id); } }
                                             }
-                                            if row.status == "Queued" : Rectangle {
+                                            if row.status == "Queued" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" : Rectangle {
                                                 width: 54px;
                                                 height: 24px;
                                                 border-radius: 6px;

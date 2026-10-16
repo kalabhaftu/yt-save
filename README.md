@@ -19,7 +19,8 @@ Real application screenshots will be added after the first Windows UI validation
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
 - Places playlist entries in an automatically named playlist subfolder while keeping single-video downloads directly in the configured output folder.
-- Lets users cancel a queued item before it starts and retry failed or interrupted downloads.
+- Lets users cancel queued or active yt-dlp jobs, keeps partial files, and retry failed, interrupted, or canceled downloads.
+- On Windows, active cancellation invokes `taskkill.exe` with separate `/PID`, PID, `/T`, and `/F` arguments to stop the yt-dlp process tree. If tree termination cannot be confirmed, the job is marked Failed rather than falsely reported as Canceled.
 - Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
 - Lets users open completed files with the operating system's registered media handler.
 - Stores output in the user's Downloads folder under `Yt Save`.
@@ -77,7 +78,8 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker. Selected playlist entries run in playlist-index order, and startup recovery uses the index to resolve selected entries with tied creation timestamps. Queued items can be canceled before they start; active downloads cannot yet be canceled, paused, resumed, or reordered. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- The queue is single-worker. Selected playlist entries run in playlist-index order, and startup recovery uses the index to resolve selected entries with tied creation timestamps. Queued and active items can be canceled; active cancellation, pause/resume, and reorder still need Windows runtime validation. Failed and canceled items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- Active cancellation uses Windows `taskkill.exe /T /F` to stop the yt-dlp process tree, then reaps the yt-dlp process. If `taskkill.exe` is unavailable, denied, or times out, the app attempts to stop yt-dlp directly and records Failed because it cannot confirm that descendants stopped. If the app exits while a row is Canceling, startup recovery changes it to Failed, retains partial-file progress, and asks the user to check that no media process is still using the files before retrying.
 - Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist preview is capped at 50 entries. Entries without a valid positive playlist index cannot be selected. Sync subscriptions are not implemented.
 - Existing SQLite databases gain a nullable playlist index on startup; selected queue items retain their original playlist URL and index for retry and recovery.

@@ -4,8 +4,25 @@
 //! single, locally validated HTTP(S) URL is sent to the consumer; clipboard text is never
 //! persisted or sent over the network by this module.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkArea {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardCandidate {
+    pub url: String,
+    pub work_area: Option<WorkArea>,
+    pub notifications_allowed: bool,
+}
+
 #[cfg(windows)]
 mod windows_impl {
+
+    use super::{ClipboardCandidate, WorkArea};
 
     use std::cell::RefCell;
     use std::ffi::c_void;
@@ -16,6 +33,9 @@ mod windows_impl {
     use anyhow::{Context, Result, anyhow};
     use url::Url;
     use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
     use windows_sys::Win32::System::DataExchange::{
         AddClipboardFormatListener, CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
         OpenClipboard, RemoveClipboardFormatListener,
@@ -23,10 +43,13 @@ mod windows_impl {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::Shell::{
+        QUERY_USER_NOTIFICATION_STATE, QUNS_ACCEPTS_NOTIFICATIONS, SHQueryUserNotificationState,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        HWND_MESSAGE, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-        TranslateMessage, UnregisterClassW, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+        GetMessageW, HWND_MESSAGE, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+        RegisterClassW, TranslateMessage, UnregisterClassW, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
     };
 
     const CF_UNICODETEXT: u32 = 13;
@@ -40,7 +63,7 @@ mod windows_impl {
     }
 
     struct ThreadState {
-        events: Sender<String>,
+        events: Sender<ClipboardCandidate>,
         sequences: SequenceDeduper,
     }
 
@@ -55,7 +78,7 @@ mod windows_impl {
         ///
         /// Startup completes only after the window has registered as a clipboard listener, so any
         /// Win32 setup failure is returned to the caller instead of being reported asynchronously.
-        pub fn start() -> Result<(Self, Receiver<String>)> {
+        pub fn start() -> Result<(Self, Receiver<ClipboardCandidate>)> {
             let (events_tx, events_rx) = mpsc::channel();
             let (startup_tx, startup_rx) = mpsc::sync_channel(1);
             let worker = thread::Builder::new()
@@ -88,7 +111,7 @@ mod windows_impl {
     }
 
     fn monitor_thread(
-        events: Sender<String>,
+        events: Sender<ClipboardCandidate>,
         startup: SyncSender<std::result::Result<u32, String>>,
     ) {
         let thread_id = unsafe { GetCurrentThreadId() };
@@ -211,7 +234,11 @@ mod windows_impl {
                     .as_deref()
                     .and_then(parse_single_http_url)
             {
-                let _ = events.send(candidate);
+                let _ = events.send(ClipboardCandidate {
+                    url: candidate,
+                    work_area: active_monitor_work_area(),
+                    notifications_allowed: shell_accepts_notifications(),
+                });
             }
             return 0;
         }
@@ -262,6 +289,34 @@ mod windows_impl {
 
     fn last_error(operation: &str) -> String {
         format!("{operation} (Win32 error {})", unsafe { GetLastError() })
+    }
+
+    fn active_monitor_work_area() -> Option<WorkArea> {
+        let foreground = unsafe { GetForegroundWindow() };
+        let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return None;
+        }
+
+        let area = info.rcWork;
+        (area.right > area.left && area.bottom > area.top).then_some(WorkArea {
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
+        })
+    }
+
+    fn shell_accepts_notifications() -> bool {
+        let mut state: QUERY_USER_NOTIFICATION_STATE = 0;
+        (unsafe { SHQueryUserNotificationState(&mut state) }) >= 0
+            && state == QUNS_ACCEPTS_NOTIFICATIONS
     }
 
     fn parse_single_http_url(text: &str) -> Option<String> {
@@ -374,7 +429,7 @@ pub struct ClipboardMonitor;
 #[cfg(not(windows))]
 impl ClipboardMonitor {
     /// Returns an explicit platform error where native clipboard monitoring is unavailable.
-    pub fn start() -> anyhow::Result<(Self, std::sync::mpsc::Receiver<String>)> {
+    pub fn start() -> anyhow::Result<(Self, std::sync::mpsc::Receiver<ClipboardCandidate>)> {
         Err(anyhow::anyhow!("clipboard URL monitoring is supported only on Windows"))
     }
 }

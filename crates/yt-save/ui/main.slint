@@ -51,7 +51,7 @@ component ActionButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     in property <string> product-name: "Yt Save";
-    in property <string> app-version: "0.1.13";
+    in property <string> app-version: "0.1.14";
     title: root.product-name;
     preferred-width: 1180px;
     preferred-height: 800px;
@@ -656,7 +656,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             if root.analyzed-is-playlist : Text {
-                                text: "The preview is capped at 50 entries. Add to queue downloads the whole playlist.";
+                                text: "The preview is capped at 50 entries. Playlist items are queued only after you select them.";
                                 color: #727b92;
                                 font-size: 10px;
                             }
@@ -783,6 +783,111 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+export component ClipboardPopup inherits Window {
+    title: "Yt Save — copied link";
+    preferred-width: 440px;
+    preferred-height: 214px;
+    min-width: 440px;
+    min-height: 214px;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    in-out property <string> candidate-url: "";
+    in-out property <string> source-host: "";
+    callback analyze-requested(string);
+    callback add-video-requested(string);
+    callback add-audio-requested(string);
+    callback more-options-requested(string);
+    callback dismiss-requested();
+
+    Rectangle {
+        x: 8px;
+        y: 8px;
+        width: parent.width - 16px;
+        height: parent.height - 16px;
+        background: #151925;
+        border-width: 1px;
+        border-color: #3a4056;
+        border-radius: 14px;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 8px;
+
+            HorizontalLayout {
+                height: 26px;
+                spacing: 8px;
+                Text { text: "Yt Save"; color: #a9b0c4; font-size: 11px; font-weight: 600; }
+                Text { text: "Copied media link"; color: #f1f2f7; font-size: 15px; font-weight: 700; horizontal-stretch: 1; }
+                ActionButton {
+                    label: "×";
+                    button-height: 28px;
+                    button-min-width: 32px;
+                    clicked => { root.dismiss-requested(); }
+                }
+            }
+
+            Text {
+                text: root.source-host;
+                color: #d6d9e5;
+                font-size: 12px;
+                overflow: elide;
+            }
+
+            Text {
+                text: "Nothing is analyzed or downloaded until you choose an action.";
+                color: #8f98ae;
+                font-size: 11px;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                height: 34px;
+                spacing: 7px;
+                ActionButton {
+                    label: "Analyze";
+                    button-height: 34px;
+                    button-min-width: 83px;
+                    clicked => { root.analyze-requested(root.candidate-url); }
+                }
+                ActionButton {
+                    label: "Add video";
+                    button-height: 34px;
+                    button-min-width: 83px;
+                    primary: true;
+                    clicked => { root.add-video-requested(root.candidate-url); }
+                }
+                ActionButton {
+                    label: "Add audio";
+                    button-height: 34px;
+                    button-min-width: 83px;
+                    clicked => { root.add-audio-requested(root.candidate-url); }
+                }
+            }
+
+            HorizontalLayout {
+                height: 24px;
+                spacing: 12px;
+                Text {
+                    text: root.candidate-url;
+                    color: #777f94;
+                    font-size: 10px;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                ActionButton {
+                    label: "More options";
+                    button-height: 24px;
+                    button-min-width: 90px;
+                    clicked => { root.more-options-requested(root.candidate-url); }
                 }
             }
         }

@@ -16,8 +16,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    AppTray, DownloadRowData, MainWindow, PlaylistEntryRowData,
-    clipboard_monitor::ClipboardMonitor,
+    AppTray, ClipboardPopup, DownloadRowData, MainWindow, PlaylistEntryRowData,
+    clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
@@ -30,7 +30,7 @@ use crate::{
 enum UiEvent {
     Refresh,
     Status(String),
-    ClipboardCandidate { generation: u64, candidate: String },
+    ClipboardCandidate { generation: u64, candidate: ClipboardCandidate },
     DependencyStatus(String),
     ClearPreview { request_id: u64 },
     Metadata { request_id: u64, source_url: String, metadata: MediaMetadata },
@@ -152,6 +152,11 @@ pub fn run() -> Result<()> {
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
     let tray = AppTray::new().context("create system tray icon")?;
+    #[cfg(windows)]
+    let popup = crate::window_activation::create_non_activating_window(ClipboardPopup::new)
+        .context("create clipboard popup")?;
+    #[cfg(not(windows))]
+    let popup = ClipboardPopup::new().context("create clipboard popup")?;
     window.set_product_name(env!("YT_SAVE_PRODUCT_NAME").into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
@@ -176,6 +181,10 @@ pub fn run() -> Result<()> {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UiEvent>();
     let clipboard_monitor_slot = Arc::new(Mutex::new(None::<ClipboardMonitor>));
     let clipboard_monitor_generation = Arc::new(AtomicU64::new(0));
+    let clipboard_popup_generation = Arc::new(AtomicU64::new(0));
+    let clipboard_popup_work_area = Arc::new(Mutex::new(None::<WorkArea>));
+    #[cfg(windows)]
+    configure_clipboard_popup_window(&popup, clipboard_popup_work_area.clone());
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
     let weak_window = window.as_weak();
@@ -183,6 +192,9 @@ pub fn run() -> Result<()> {
     let event_store = store.clone();
     let event_playlist_selection = playlist_selection.clone();
     let event_clipboard_generation = clipboard_monitor_generation.clone();
+    let event_popup = popup.as_weak();
+    let event_popup_generation = clipboard_popup_generation.clone();
+    let event_popup_work_area = clipboard_popup_work_area.clone();
     runtime.spawn(async move {
         let mut latest_analysis_id = 0;
         while let Some(event) = events_rx.recv().await {
@@ -225,17 +237,56 @@ pub fn run() -> Result<()> {
                         continue;
                     }
                     let weak = weak_window.clone();
+                    let popup = event_popup.clone();
+                    let popup_generation = event_popup_generation.clone();
+                    let popup_work_area = event_popup_work_area.clone();
                     let active_generation = event_clipboard_generation.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if active_generation.load(Ordering::Relaxed) == generation
                             && let Some(window) = weak.upgrade()
                             && window.get_clipboard_monitoring_enabled()
                         {
-                            window.set_clipboard_candidate(candidate.into());
+                            window.set_clipboard_candidate(candidate.url.clone().into());
                             window.set_status_message(
                                 "A copied web link is ready for review. Nothing starts until you choose an action."
                                     .into(),
                             );
+                            #[cfg(windows)]
+                            let main_window_is_focused = main_window_has_focus(&window);
+                            #[cfg(not(windows))]
+                            let main_window_is_focused = false;
+                            let popup_id = popup_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                            if candidate.notifications_allowed
+                                && !main_window_is_focused
+                                && let Some(area) = candidate.work_area
+                                && let Ok(mut saved_area) = popup_work_area.lock()
+                            {
+                                *saved_area = Some(area);
+                                if let Some(popup) = popup.upgrade() {
+                                    popup.set_candidate_url(candidate.url.clone().into());
+                                    popup.set_source_host(clipboard_source_host(&candidate.url).into());
+                                    popup.window().set_size(slint::LogicalSize::new(440.0, 214.0));
+                                    let scale = popup.window().scale_factor();
+                                    let (x, y) = initial_popup_position(area, scale, 440, 214);
+                                    popup.window().set_position(slint::PhysicalPosition::new(x, y));
+                                    if let Err(error) = popup.show() {
+                                        error!(%error, "show clipboard review popup");
+                                    } else {
+                                        let weak_popup = popup.as_weak();
+                                        let expiry_generation = popup_generation.clone();
+                                        slint::Timer::single_shot(Duration::from_secs(12), move || {
+                                            if expiry_generation.load(Ordering::Relaxed) == popup_id
+                                                && let Some(popup) = weak_popup.upgrade()
+                                                && let Err(error) = popup.hide()
+                                            {
+                                                error!(%error, "hide expired clipboard review popup");
+                                            }
+                                        });
+                                    }
+                                }
+                            } else if let Some(popup) = popup.upgrade() {
+                                let _ = popup.hide();
+                            }
                         }
                     });
                 }
@@ -354,6 +405,8 @@ pub fn run() -> Result<()> {
     let clipboard_request_handle = handle.clone();
     let clipboard_request_events = events_tx.clone();
     let clipboard_request_window = window.as_weak();
+    let clipboard_request_popup = popup.as_weak();
+    let clipboard_request_popup_generation = clipboard_popup_generation.clone();
     window.on_clipboard_monitoring_requested(move |enabled| {
         let weak = clipboard_request_window.clone();
         let events = clipboard_request_events.clone();
@@ -392,6 +445,12 @@ pub fn run() -> Result<()> {
                 }
             }
         } else {
+            clipboard_request_popup_generation.fetch_add(1, Ordering::Relaxed);
+            if let Some(popup) = clipboard_request_popup.upgrade()
+                && let Err(error) = popup.hide()
+            {
+                error!(%error, "hide clipboard popup after monitoring was disabled");
+            }
             match stop_clipboard_monitor(&clipboard_request_slot, &clipboard_request_generation) {
                 Ok(()) => {
                     if let Some(window) = weak.upgrade() {
@@ -490,6 +549,7 @@ pub fn run() -> Result<()> {
     let enqueue_active_jobs = active_jobs.clone();
     let queue_handle = handle.clone();
     let enqueue_shutdown_started = shutdown_started.clone();
+    let enqueue_analysis_generation = analysis_generation.clone();
     let pending = runtime.block_on(recover_pending(&store))?;
     for record in pending {
         let store = store.clone();
@@ -514,6 +574,11 @@ pub fn run() -> Result<()> {
                 return;
             }
         };
+        let request_id = enqueue_analysis_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = queue_events.send(UiEvent::ClearPreview { request_id });
+        let _ = queue_events.send(UiEvent::Status(
+            "Checking the link before adding it to the queue…".to_owned(),
+        ));
         let (
             audio_only,
             selected_format,
@@ -548,7 +613,40 @@ pub fn run() -> Result<()> {
         let events = queue_events.clone();
         let slots = enqueue_slots.clone();
         let active_jobs = enqueue_active_jobs.clone();
+        let inspector = engine.clone();
+        let analysis_generation = enqueue_analysis_generation.clone();
+        let inspection_url = url.clone();
         queue_handle.spawn(async move {
+            match inspector.inspect(&inspection_url).await {
+                Ok(metadata) if metadata.is_playlist => {
+                    if analysis_generation.load(Ordering::Acquire) == request_id {
+                        let _ = events.send(UiEvent::Metadata {
+                            request_id,
+                            source_url: inspection_url,
+                            metadata,
+                        });
+                        let _ = events.send(UiEvent::Status(
+                            "This URL contains a playlist. Review its entries and select what to queue."
+                                .to_owned(),
+                        ));
+                    } else {
+                        let _ = events.send(UiEvent::Status(
+                            "This link contains a playlist. Analyze it again to review its entries before queueing."
+                                .to_owned(),
+                        ));
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    error!(%error, "inspect media link before queueing");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not check this link before queueing: {error}"
+                    )));
+                    return;
+                }
+            }
+
             let destination = match tokio::task::spawn_blocking(move || {
                 validate_download_directory(Path::new(&selected_directory))
             })
@@ -1119,6 +1217,16 @@ pub fn run() -> Result<()> {
         });
     });
 
+    configure_clipboard_popup(
+        &popup,
+        ClipboardPopupContext {
+            main_window: window.as_weak(),
+            popup_window: popup.as_weak(),
+            popup_generation: clipboard_popup_generation.clone(),
+            shutdown_started: shutdown_started.clone(),
+        },
+    );
+
     configure_tray(
         &window,
         &tray,
@@ -1139,6 +1247,208 @@ pub fn run() -> Result<()> {
     let _ = stop_clipboard_monitor(&clipboard_monitor_slot, &clipboard_monitor_generation);
     runtime.shutdown_timeout(Duration::from_secs(3));
     Ok(())
+}
+
+#[derive(Clone)]
+struct ClipboardPopupContext {
+    main_window: slint::Weak<MainWindow>,
+    popup_window: slint::Weak<ClipboardPopup>,
+    popup_generation: Arc<AtomicU64>,
+    shutdown_started: Arc<AtomicBool>,
+}
+
+fn configure_clipboard_popup(popup: &ClipboardPopup, context: ClipboardPopupContext) {
+    let analyze_context = context.clone();
+    popup.on_analyze_requested(move |url| {
+        dismiss_clipboard_popup(&analyze_context);
+        if let Some(window) = analyze_context.main_window.upgrade() {
+            let url = url.to_string();
+            window.set_url_input(url.clone().into());
+            window.set_status_message("Reading media details…".into());
+            if let Err(error) = window.show() {
+                error!(%error, "show window to analyze copied link");
+                return;
+            }
+            window.invoke_analyze_requested(url.into());
+        }
+    });
+
+    let video_context = context.clone();
+    popup.on_add_video_requested(move |url| {
+        queue_clipboard_candidate(url.to_string(), false, video_context.clone());
+    });
+
+    let audio_context = context.clone();
+    popup.on_add_audio_requested(move |url| {
+        queue_clipboard_candidate(url.to_string(), true, audio_context.clone());
+    });
+
+    let options_context = context.clone();
+    popup.on_more_options_requested(move |url| {
+        dismiss_clipboard_popup(&options_context);
+        if let Some(window) = options_context.main_window.upgrade() {
+            window.set_url_input(url);
+            if let Err(error) = window.show() {
+                error!(%error, "show window for copied-link options");
+            }
+        }
+    });
+
+    popup.on_dismiss_requested(move || dismiss_clipboard_popup(&context));
+}
+
+fn dismiss_clipboard_popup(context: &ClipboardPopupContext) {
+    context.popup_generation.fetch_add(1, Ordering::Relaxed);
+    if let Some(window) = context.main_window.upgrade() {
+        window.set_clipboard_candidate(SharedString::default());
+    }
+    if let Some(popup) = context.popup_window.upgrade()
+        && let Err(error) = popup.hide()
+    {
+        error!(%error, "hide clipboard review popup");
+    }
+}
+
+fn queue_clipboard_candidate(url: String, audio_only: bool, context: ClipboardPopupContext) {
+    dismiss_clipboard_popup(&context);
+    if context.shutdown_started.load(Ordering::Acquire) {
+        if let Some(window) = context.main_window.upgrade() {
+            window.set_status_message("The application is shutting down.".into());
+        }
+        return;
+    }
+    let url = match validate_url(&url) {
+        Ok(url) => url,
+        Err(message) => {
+            if let Some(window) = context.main_window.upgrade() {
+                window.set_status_message(message.into());
+            }
+            return;
+        }
+    };
+
+    if let Some(window) = context.main_window.upgrade() {
+        window.set_url_input(url.clone().into());
+        window.set_audio_only(audio_only);
+        window.set_status_message("Checking the copied link before adding it to the queue…".into());
+        if let Err(error) = window.show() {
+            error!(%error, "show window to add copied link");
+            return;
+        }
+        window.invoke_enqueue_requested(url.into());
+    }
+}
+
+fn clipboard_source_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "Web media".to_owned())
+}
+
+fn initial_popup_position(
+    area: WorkArea,
+    scale: f32,
+    logical_width: i32,
+    logical_height: i32,
+) -> (i32, i32) {
+    let scale = scale.max(1.0);
+    let width = (logical_width as f32 * scale).round() as i32;
+    let height = (logical_height as f32 * scale).round() as i32;
+    (
+        area.right.saturating_sub(width).saturating_sub(16).max(area.left.saturating_add(16)),
+        area.bottom.saturating_sub(height).saturating_sub(16).max(area.top.saturating_add(16)),
+    )
+}
+
+#[cfg(windows)]
+fn configure_clipboard_popup_window(
+    popup: &ClipboardPopup,
+    work_area: Arc<Mutex<Option<WorkArea>>>,
+) {
+    use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
+
+    let native_style_ready = Arc::new(AtomicBool::new(false));
+    popup.window().on_winit_window_event(move |slint_window, event| {
+        if matches!(
+            event,
+            winit::event::WindowEvent::RedrawRequested
+                | winit::event::WindowEvent::Resized(_)
+                | winit::event::WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            let work_area = work_area.lock().ok().and_then(|area| *area);
+            let native_style_ready = native_style_ready.clone();
+            slint_window.with_winit_window(|window| {
+                if !native_style_ready.load(Ordering::Acquire) && set_window_no_activate(window) {
+                    native_style_ready.store(true, Ordering::Release);
+                }
+
+                if let Some(area) = work_area {
+                    let size = window.inner_size();
+                    let width = i32::try_from(size.width).unwrap_or(i32::MAX);
+                    let height = i32::try_from(size.height).unwrap_or(i32::MAX);
+                    let x = area
+                        .right
+                        .saturating_sub(width)
+                        .saturating_sub(16)
+                        .max(area.left.saturating_add(16));
+                    let y = area
+                        .bottom
+                        .saturating_sub(height)
+                        .saturating_sub(16)
+                        .max(area.top.saturating_add(16));
+                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
+            });
+        }
+
+        EventResult::Propagate
+    });
+}
+
+#[cfg(windows)]
+fn main_window_has_focus(window: &MainWindow) -> bool {
+    use slint::winit_030::WinitWindowAccessor;
+    window.window().with_winit_window(|window| window.has_focus()).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn set_window_no_activate(window: &slint::winit_030::winit::window::Window) -> bool {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
+        },
+    };
+
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let required_style = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | required_style);
+        let updated_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if updated_style & required_style != required_style {
+            return false;
+        }
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        ) != 0
+    }
 }
 
 fn start_clipboard_monitor(
@@ -2262,6 +2572,19 @@ mod tests {
         );
         assert!(validate_url("file:///C:/private.mp4").is_err());
         assert!(validate_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn clipboard_popup_position_accounts_for_dpi_and_monitor_origin() {
+        let area = WorkArea { left: -1920, top: 80, right: 0, bottom: 1160 };
+
+        assert_eq!(initial_popup_position(area, 1.5, 440, 214), (-676, 823));
+    }
+
+    #[test]
+    fn clipboard_popup_displays_the_source_host_for_any_extractor_site() {
+        assert_eq!(clipboard_source_host("https://media.example/watch/1"), "media.example");
+        assert_eq!(clipboard_source_host("https://[invalid"), "Web media");
     }
 
     #[test]

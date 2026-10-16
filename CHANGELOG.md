@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.14 — Clipboard popup and playlist confirmation
+
+- Add a default-off, non-activating Windows popup for copied HTTP(S) media links, positioned in the active monitor's work area and suppressed when Windows reports quiet time or full-screen/presentation activity.
+- Offer Analyze, Add video, Add audio, More options, and Dismiss actions; the popup expires after 12 seconds and performs no metadata lookup until the user chooses an action.
+- Inspect Add to queue requests before saving; playlist URLs open entry selection and queue only items the user selects.
+- Keep clipboard payloads in memory only. Popup focus, monitor/DPI placement, Windows notification state, and clipboard/tray behavior still need Windows runtime acceptance.
+
 ## 0.1.13 — System tray and orderly shutdown
 
 - Add a Slint system tray menu to reopen or hide the main window, pause all downloads, resume paused downloads, open the download folder, and quit.

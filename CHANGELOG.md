@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.13 — System tray and orderly shutdown
+
+- Add a Slint system tray menu to reopen or hide the main window, pause all downloads, resume paused downloads, open the download folder, and quit.
+- Persist default-off close-to-tray and minimize-to-tray preferences.
+- Pause queued items and request safe pauses from active jobs before quitting; retain the window and tray if active jobs do not stop cleanly.
+- Add tray preference and status-summary coverage. Windows tray interaction, native minimize behavior, and installer lifecycle acceptance remain pending.
+
 ## 0.1.12 — Opt-in clipboard URL review
 
 - Add a default-off Windows clipboard listener that parses one HTTP(S) URL locally and ignores other clipboard text.

@@ -51,7 +51,7 @@ component ActionButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     in property <string> product-name: "Yt Save";
-    in property <string> app-version: "0.1.12";
+    in property <string> app-version: "0.1.13";
     title: root.product-name;
     preferred-width: 1180px;
     preferred-height: 800px;
@@ -68,6 +68,8 @@ export component MainWindow inherits Window {
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
+    in-out property <bool> close-to-tray-enabled: false;
+    in-out property <bool> minimize-to-tray-enabled: false;
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
@@ -84,6 +86,8 @@ export component MainWindow inherits Window {
     callback enqueue-selected-playlist-entries-requested();
     callback clipboard-monitoring-requested(bool);
     callback clipboard-candidate-dismissed();
+    callback close-to-tray-requested(bool);
+    callback minimize-to-tray-requested(bool);
     callback open-download-folder();
     callback choose-download-directory-requested();
     callback clear-completed-requested();
@@ -93,6 +97,12 @@ export component MainWindow inherits Window {
     callback remove-download-requested(string);
     callback retry-download-requested(string);
     callback open-output-requested(string);
+
+    changed minimized => {
+        if root.minimized && root.minimize-to-tray-enabled {
+            root.hide();
+        }
+    }
 
     VerticalLayout {
         spacing: 0px;
@@ -230,6 +240,34 @@ export component MainWindow inherits Window {
                                         button-height: 28px;
                                         button-min-width: 112px;
                                         clicked => { root.clipboard-monitoring-requested(!root.clipboard-monitoring-enabled); }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                border-radius: 12px;
+                                background: #171b28;
+                                border-width: 1px;
+                                border-color: #282d40;
+                                height: 112px;
+
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 5px;
+                                    Text { text: "TRAY BEHAVIOR"; color: #737b94; font-size: 10px; font-weight: 700; }
+                                    ActionButton {
+                                        label: root.close-to-tray-enabled ? "Close to tray: On" : "Close to tray: Off";
+                                        primary: root.close-to-tray-enabled;
+                                        button-height: 28px;
+                                        button-min-width: 142px;
+                                        clicked => { root.close-to-tray-requested(!root.close-to-tray-enabled); }
+                                    }
+                                    ActionButton {
+                                        label: root.minimize-to-tray-enabled ? "Minimize to tray: On" : "Minimize to tray: Off";
+                                        primary: root.minimize-to-tray-enabled;
+                                        button-height: 28px;
+                                        button-min-width: 142px;
+                                        clicked => { root.minimize-to-tray-requested(!root.minimize-to-tray-enabled); }
                                     }
                                 }
                             }
@@ -747,6 +785,54 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+}
+
+export component AppTray inherits SystemTrayIcon {
+    in-out property <int> active-count: 0;
+    in-out property <int> paused-count: 0;
+    in property <string> tray-tooltip: "Yt Save";
+    icon: @image-url("../../../assets/yt-save.png");
+    tooltip: root.tray-tooltip;
+
+    callback open-requested();
+    callback hide-requested();
+    callback pause-all-requested();
+    callback resume-all-requested();
+    callback open-folder-requested();
+    callback quit-requested();
+
+    clicked => { root.open-requested(); }
+
+    Menu {
+        MenuItem {
+            title: "Open Yt Save";
+            activated => { root.open-requested(); }
+        }
+        MenuItem {
+            title: "Hide to tray";
+            activated => { root.hide-requested(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Pause all downloads";
+            enabled: root.active-count > 0;
+            activated => { root.pause-all-requested(); }
+        }
+        MenuItem {
+            title: "Resume paused downloads";
+            enabled: root.paused-count > 0;
+            activated => { root.resume-all-requested(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Open download folder";
+            activated => { root.open-folder-requested(); }
+        }
+        MenuItem {
+            title: "Quit Yt Save";
+            activated => { root.quit-requested(); }
         }
     }
 }

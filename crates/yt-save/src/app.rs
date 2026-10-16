@@ -3,20 +3,20 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    DownloadRowData, MainWindow, PlaylistEntryRowData,
+    AppTray, DownloadRowData, MainWindow, PlaylistEntryRowData,
     clipboard_monitor::ClipboardMonitor,
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
@@ -24,7 +24,7 @@ use crate::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
         format_duration,
     },
-    persistence::Store,
+    persistence::{Store, TrayPreferences},
 };
 
 enum UiEvent {
@@ -135,9 +135,12 @@ pub fn run() -> Result<()> {
     let download_presets = runtime.block_on(store.load_download_presets())?;
     let clipboard_monitoring_enabled =
         runtime.block_on(store.load_clipboard_monitoring_enabled())?;
+    let tray_preferences = runtime.block_on(store.load_tray_preferences())?;
+    let tray_preferences_state = Arc::new(Mutex::new(tray_preferences));
     let engine = DownloadEngine::new(dependencies.clone(), download_directory.clone());
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
+    let tray = AppTray::new().context("create system tray icon")?;
     window.set_product_name(env!("YT_SAVE_PRODUCT_NAME").into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
@@ -146,15 +149,26 @@ pub fn run() -> Result<()> {
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
     window.set_clipboard_monitoring_enabled(false);
-    let saved_rows =
-        runtime.block_on(store.list_downloads())?.iter().map(row_view).collect::<Vec<_>>();
+    window.set_close_to_tray_enabled(tray_preferences.close_to_tray);
+    window.set_minimize_to_tray_enabled(tray_preferences.minimize_to_tray);
+    let saved_downloads = runtime.block_on(store.list_downloads())?;
+    let saved_active_count =
+        saved_downloads.iter().filter(|record| is_active_status(&record.status)).count();
+    let saved_paused_count =
+        saved_downloads.iter().filter(|record| record.status == "Paused").count();
+    tray.set_active_count(saved_active_count as i32);
+    tray.set_paused_count(saved_paused_count as i32);
+    tray.set_tray_tooltip(tray_tooltip(saved_active_count, saved_paused_count).into());
+    let saved_rows = saved_downloads.iter().map(row_view).collect::<Vec<_>>();
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UiEvent>();
     let clipboard_monitor_slot = Arc::new(Mutex::new(None::<ClipboardMonitor>));
     let clipboard_monitor_generation = Arc::new(AtomicU64::new(0));
+    let shutdown_started = Arc::new(AtomicBool::new(false));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
     let weak_window = window.as_weak();
+    let weak_tray = tray.as_weak();
     let event_store = store.clone();
     let event_playlist_selection = playlist_selection.clone();
     let event_clipboard_generation = clipboard_monitor_generation.clone();
@@ -164,11 +178,24 @@ pub fn run() -> Result<()> {
             match event {
                 UiEvent::Refresh => match event_store.list_downloads().await {
                     Ok(records) => {
+                        let active_count = records
+                            .iter()
+                            .filter(|record| is_active_status(&record.status))
+                            .count();
+                        let paused_count =
+                            records.iter().filter(|record| record.status == "Paused").count();
                         let rows = records.iter().map(row_view).collect::<Vec<_>>();
                         let weak = weak_window.clone();
+                        let weak_tray = weak_tray.clone();
+                        let tooltip = tray_tooltip(active_count, paused_count);
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(window) = weak.upgrade() {
                                 window.set_downloads(ModelRc::new(VecModel::from(rows)));
+                            }
+                            if let Some(tray) = weak_tray.upgrade() {
+                                tray.set_active_count(active_count as i32);
+                                tray.set_paused_count(paused_count as i32);
+                                tray.set_tray_tooltip(tooltip.into());
                             }
                         });
                     }
@@ -409,7 +436,13 @@ pub fn run() -> Result<()> {
     let analyze_handle = handle.clone();
     let analysis_generation = Arc::new(AtomicU64::new(0));
     let analyze_generation = analysis_generation.clone();
+    let analyze_shutdown_started = shutdown_started.clone();
     window.on_analyze_requested(move |submitted_url| {
+        if analyze_shutdown_started.load(Ordering::Acquire) {
+            let _ = analyze_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let request_id = analyze_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = analyze_events.send(UiEvent::ClearPreview { request_id });
         let url = match validate_url(&submitted_url) {
@@ -445,6 +478,7 @@ pub fn run() -> Result<()> {
     let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let enqueue_active_jobs = active_jobs.clone();
     let queue_handle = handle.clone();
+    let enqueue_shutdown_started = shutdown_started.clone();
     let pending = runtime.block_on(recover_pending(&store))?;
     for record in pending {
         let store = store.clone();
@@ -457,6 +491,11 @@ pub fn run() -> Result<()> {
     let _ = events_tx.send(UiEvent::Refresh);
 
     window.on_enqueue_requested(move |submitted_url| {
+        if enqueue_shutdown_started.load(Ordering::Acquire) {
+            let _ =
+                queue_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let url = match validate_url(&submitted_url) {
             Ok(url) => url,
             Err(message) => {
@@ -568,7 +607,13 @@ pub fn run() -> Result<()> {
     let selected_active_jobs = active_jobs.clone();
     let selected_playlist = playlist_selection.clone();
     let selected_queue_window = window.as_weak();
+    let selected_shutdown_started = shutdown_started.clone();
     window.on_enqueue_selected_playlist_entries_requested(move || {
+        if selected_shutdown_started.load(Ordering::Acquire) {
+            let _ = selected_queue_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let selection = selected_playlist.lock().ok().and_then(|state| state.clone());
         let Some(selection) = selection else {
             let _ = selected_queue_events
@@ -720,7 +765,13 @@ pub fn run() -> Result<()> {
     let retry_slots = queue_slots.clone();
     let retry_active_jobs = active_jobs.clone();
     let retry_handle = handle.clone();
+    let retry_shutdown_started = shutdown_started.clone();
     window.on_retry_download_requested(move |id| {
+        if retry_shutdown_started.load(Ordering::Acquire) {
+            let _ =
+                retry_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let id = id.to_string();
         let store = retry_store.clone();
         let engine = retry_engine.clone();
@@ -756,7 +807,13 @@ pub fn run() -> Result<()> {
     let resume_slots = queue_slots.clone();
     let resume_active_jobs = active_jobs.clone();
     let resume_handle = handle.clone();
+    let resume_shutdown_started = shutdown_started.clone();
     window.on_resume_download_requested(move |id| {
+        if resume_shutdown_started.load(Ordering::Acquire) {
+            let _ =
+                resume_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let id = id.to_string();
         let store = resume_store.clone();
         let engine = resume_engine.clone();
@@ -1051,6 +1108,19 @@ pub fn run() -> Result<()> {
         });
     });
 
+    configure_tray(
+        &window,
+        &tray,
+        store.clone(),
+        handle.clone(),
+        events_tx.clone(),
+        active_jobs.clone(),
+        engine.clone(),
+        queue_slots.clone(),
+        tray_preferences_state.clone(),
+        shutdown_started,
+    );
+
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
     window.run().context("run Slint event loop")?;
     let _ = stop_clipboard_monitor(&clipboard_monitor_slot, &clipboard_monitor_generation);
@@ -1097,6 +1167,392 @@ fn stop_clipboard_monitor(
     drop(monitor_slot);
     drop(monitor);
     Ok(())
+}
+
+fn configure_tray(
+    window: &MainWindow,
+    tray: &AppTray,
+    store: Store,
+    handle: tokio::runtime::Handle,
+    events: mpsc::UnboundedSender<UiEvent>,
+    active_jobs: ActiveJobs,
+    engine: DownloadEngine,
+    slots: Arc<Semaphore>,
+    preferences: Arc<Mutex<TrayPreferences>>,
+    shutdown_started: Arc<AtomicBool>,
+) {
+    let open_window = window.as_weak();
+    tray.on_open_requested(move || {
+        if let Some(window) = open_window.upgrade() {
+            window.window().set_minimized(false);
+            if let Err(error) = window.show() {
+                error!(%error, "show window from system tray");
+            }
+        }
+    });
+
+    let hide_window = window.as_weak();
+    tray.on_hide_requested(move || {
+        if let Some(window) = hide_window.upgrade()
+            && let Err(error) = window.hide()
+        {
+            error!(%error, "hide window to system tray");
+        }
+    });
+
+    let open_folder_window = window.as_weak();
+    tray.on_open_folder_requested(move || {
+        if let Some(window) = open_folder_window.upgrade() {
+            window.invoke_open_download_folder();
+        }
+    });
+
+    let pause_store = store.clone();
+    let pause_active_jobs = active_jobs.clone();
+    let pause_events = events.clone();
+    let pause_handle = handle.clone();
+    let pause_shutdown_guard = shutdown_started.clone();
+    tray.on_pause_all_requested(move || {
+        if pause_shutdown_guard.load(Ordering::Acquire) {
+            return;
+        }
+        let store = pause_store.clone();
+        let active_jobs = pause_active_jobs.clone();
+        let events = pause_events.clone();
+        pause_handle.spawn(async move {
+            match pause_all_downloads(&store, &active_jobs).await {
+                Ok((queued_count, active_count)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Paused {queued_count} queued item(s); requested a safe pause for {active_count} active item(s)."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "pause all downloads from system tray");
+                    let _ = events.send(UiEvent::Status(format!("Could not pause all downloads: {error}")));
+                }
+            }
+        });
+    });
+
+    let resume_store = store.clone();
+    let resume_engine = engine.clone();
+    let resume_events = events.clone();
+    let resume_slots = slots.clone();
+    let resume_active_jobs = active_jobs.clone();
+    let resume_handle = handle.clone();
+    let resume_shutdown_guard = shutdown_started.clone();
+    tray.on_resume_all_requested(move || {
+        if resume_shutdown_guard.load(Ordering::Acquire) {
+            return;
+        }
+        let store = resume_store.clone();
+        let engine = resume_engine.clone();
+        let events = resume_events.clone();
+        let slots = resume_slots.clone();
+        let active_jobs = resume_active_jobs.clone();
+        resume_handle.spawn(async move {
+            match resume_all_downloads(store, engine, events.clone(), slots, active_jobs).await {
+                Ok(count) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ =
+                        events.send(UiEvent::Status(format!("Resumed {count} paused item(s).")));
+                }
+                Err(error) => {
+                    error!(%error, "resume all downloads from system tray");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not resume paused downloads: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
+    let quit_store = store.clone();
+    let quit_handle = handle.clone();
+    let quit_events = events.clone();
+    let quit_active_jobs = active_jobs.clone();
+    let quit_window = window.as_weak();
+    let quit_tray = tray.as_weak();
+    let quit_guard = shutdown_started.clone();
+    tray.on_quit_requested(move || {
+        begin_orderly_quit(
+            quit_handle.clone(),
+            quit_store.clone(),
+            quit_active_jobs.clone(),
+            quit_events.clone(),
+            quit_window.clone(),
+            quit_tray.clone(),
+            quit_guard.clone(),
+        );
+    });
+
+    let preferences_state = preferences.clone();
+    let preference_store = store.clone();
+    let preference_handle = handle.clone();
+    let preference_events = events.clone();
+    let preference_window = window.as_weak();
+    window.on_close_to_tray_requested(move |enabled| {
+        if let Some(window) = preference_window.upgrade() {
+            window.set_close_to_tray_enabled(enabled);
+        }
+        save_tray_preference_update(
+            &preferences_state,
+            Some(enabled),
+            None,
+            preference_store.clone(),
+            preference_handle.clone(),
+            preference_events.clone(),
+        );
+    });
+
+    let preferences_state = preferences.clone();
+    let preference_store = store.clone();
+    let preference_handle = handle.clone();
+    let preference_events = events.clone();
+    let preference_window = window.as_weak();
+    window.on_minimize_to_tray_requested(move |enabled| {
+        if let Some(window) = preference_window.upgrade() {
+            window.set_minimize_to_tray_enabled(enabled);
+        }
+        save_tray_preference_update(
+            &preferences_state,
+            None,
+            Some(enabled),
+            preference_store.clone(),
+            preference_handle.clone(),
+            preference_events.clone(),
+        );
+    });
+
+    let close_preferences = preferences.clone();
+    let close_store = store;
+    let close_handle = handle;
+    let close_events = events;
+    let close_active_jobs = active_jobs;
+    let close_window = window.as_weak();
+    let close_tray = tray.as_weak();
+    let close_guard = shutdown_started;
+    window.window().on_close_requested(move || {
+        let close_to_tray =
+            close_preferences.lock().map(|preferences| preferences.close_to_tray).unwrap_or(false);
+        if close_to_tray {
+            CloseRequestResponse::HideWindow
+        } else {
+            begin_orderly_quit(
+                close_handle.clone(),
+                close_store.clone(),
+                close_active_jobs.clone(),
+                close_events.clone(),
+                close_window.clone(),
+                close_tray.clone(),
+                close_guard.clone(),
+            );
+            CloseRequestResponse::KeepWindowShown
+        }
+    });
+}
+
+fn save_tray_preference_update(
+    state: &Arc<Mutex<TrayPreferences>>,
+    close_to_tray: Option<bool>,
+    minimize_to_tray: Option<bool>,
+    store: Store,
+    handle: tokio::runtime::Handle,
+    events: mpsc::UnboundedSender<UiEvent>,
+) {
+    let preferences = match state.lock() {
+        Ok(mut preferences) => {
+            if let Some(enabled) = close_to_tray {
+                preferences.close_to_tray = enabled;
+            }
+            if let Some(enabled) = minimize_to_tray {
+                preferences.minimize_to_tray = enabled;
+            }
+            *preferences
+        }
+        Err(_) => {
+            let _ = events.send(UiEvent::Status(
+                "Could not update tray behavior because settings state is unavailable.".to_owned(),
+            ));
+            return;
+        }
+    };
+
+    handle.spawn(async move {
+        if let Err(error) = store.set_tray_preferences(preferences, now()).await {
+            error!(%error, "save tray behavior preferences");
+            let _ = events.send(UiEvent::Status(format!(
+                "Tray behavior changed for this session but could not be saved: {error}"
+            )));
+        }
+    });
+}
+
+fn begin_orderly_quit(
+    handle: tokio::runtime::Handle,
+    store: Store,
+    active_jobs: ActiveJobs,
+    events: mpsc::UnboundedSender<UiEvent>,
+    window: slint::Weak<MainWindow>,
+    tray: slint::Weak<AppTray>,
+    shutdown_started: Arc<AtomicBool>,
+) {
+    if shutdown_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(window) = window.upgrade() {
+        window.set_status_message(
+            "Pausing queue work safely before quitting. Partial files are being preserved.".into(),
+        );
+    }
+
+    handle.spawn(async move {
+        let shutdown_result = async {
+            pause_all_downloads(&store, &active_jobs).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let active_count = active_jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
+                    .len();
+                if active_count == 0 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "active jobs did not stop within 30 seconds; the app is still open"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match shutdown_result {
+            Ok(()) => {
+                let _ = events.send(UiEvent::Status(
+                    "Downloads are paused. The application is shutting down.".to_owned(),
+                ));
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(tray) = tray.upgrade() {
+                        tray.set_visible(false);
+                    }
+                    if let Some(window) = window.upgrade()
+                        && let Err(error) = window.hide()
+                    {
+                        error!(%error, "hide window during orderly shutdown");
+                    }
+                });
+            }
+            Err(error) => {
+                shutdown_started.store(false, Ordering::Release);
+                error!(%error, "orderly application shutdown");
+                let _ = events.send(UiEvent::Status(format!(
+                    "Could not safely quit: {error}. The window and tray remain available."
+                )));
+            }
+        }
+    });
+}
+
+async fn pause_all_downloads(store: &Store, active_jobs: &ActiveJobs) -> Result<(usize, usize)> {
+    let records = store.list_downloads().await?;
+    let mut queued_count = 0;
+    let mut active_count = 0;
+    for record in records {
+        if record.status == "Queued" && store.pause_queued_download(&record.id, now()).await? {
+            queued_count += 1;
+            continue;
+        }
+        if matches!(
+            record.status.as_str(),
+            "Queued" | "Analyzing" | "Downloading" | "Post-processing" | "Pausing" | "Canceling"
+        ) && request_pause_for_active_record(store, active_jobs, &record).await?
+        {
+            active_count += 1;
+        }
+    }
+    Ok((queued_count, active_count))
+}
+
+async fn request_pause_for_active_record(
+    store: &Store,
+    active_jobs: &ActiveJobs,
+    record: &DownloadRecord,
+) -> Result<bool> {
+    let control = active_jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
+        .get(&record.id)
+        .cloned();
+    let Some(control) = control else {
+        return Ok(false);
+    };
+
+    match record.status.as_str() {
+        "Pausing" => {
+            control.send_replace(JobSignal::Pause);
+            return Ok(true);
+        }
+        "Canceling" => {
+            control.send_replace(JobSignal::Cancel);
+            return Ok(true);
+        }
+        _ => {}
+    }
+
+    if store.request_active_pause(&record.id, now()).await? {
+        control.send_replace(JobSignal::Pause);
+        return Ok(true);
+    }
+    if store.is_pausing(&record.id).await? {
+        control.send_replace(JobSignal::Pause);
+        return Ok(true);
+    }
+    if store.is_canceling(&record.id).await? {
+        control.send_replace(JobSignal::Cancel);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn resume_all_downloads(
+    store: Store,
+    engine: DownloadEngine,
+    events: mpsc::UnboundedSender<UiEvent>,
+    slots: Arc<Semaphore>,
+    active_jobs: ActiveJobs,
+) -> Result<usize> {
+    let records = store.list_downloads().await?;
+    let mut resumed_count = 0;
+    for record in records.into_iter().filter(|record| record.status == "Paused") {
+        if let Some(pending) = store.resume_download(&record.id, now()).await? {
+            tokio::spawn(run_download_job(
+                pending,
+                store.clone(),
+                engine.clone(),
+                events.clone(),
+                slots.clone(),
+                active_jobs.clone(),
+            ));
+            resumed_count += 1;
+        }
+    }
+    Ok(resumed_count)
+}
+
+fn is_active_status(status: &str) -> bool {
+    matches!(status, "Analyzing" | "Downloading" | "Post-processing" | "Pausing" | "Canceling")
+}
+
+fn tray_tooltip(active_count: usize, paused_count: usize) -> String {
+    if active_count == 0 && paused_count == 0 {
+        "Yt Save".to_owned()
+    } else {
+        format!("Yt Save — {active_count} active, {paused_count} paused")
+    }
 }
 
 async fn recover_pending(store: &Store) -> Result<Vec<DownloadRecord>> {
@@ -1683,6 +2139,20 @@ impl AppPaths {
 mod tests {
     use super::*;
     use crate::model::{AudioFormat, AudioQuality, VideoQuality};
+
+    #[test]
+    fn tray_summary_counts_only_active_and_paused_states() {
+        assert!(is_active_status("Analyzing"));
+        assert!(is_active_status("Downloading"));
+        assert!(is_active_status("Post-processing"));
+        assert!(is_active_status("Pausing"));
+        assert!(is_active_status("Canceling"));
+        assert!(!is_active_status("Queued"));
+        assert!(!is_active_status("Paused"));
+        assert!(!is_active_status("Completed"));
+        assert_eq!(tray_tooltip(0, 0), "Yt Save");
+        assert_eq!(tray_tooltip(1, 2), "Yt Save — 1 active, 2 paused");
+    }
 
     #[test]
     fn download_destination_must_be_an_existing_directory_and_is_canonicalized() {

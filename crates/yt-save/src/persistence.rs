@@ -7,6 +7,12 @@ use crate::model::{
     AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, VideoQuality,
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrayPreferences {
+    pub close_to_tray: bool,
+    pub minimize_to_tray: bool,
+}
+
 #[derive(Clone)]
 pub struct Store {
     path: PathBuf,
@@ -218,6 +224,53 @@ impl Store {
         })
         .await
         .context("join clipboard preference write")??;
+        Ok(())
+    }
+
+    /// Tray behavior is opt-in; an unset or invalid preference keeps normal window behavior.
+    pub async fn load_tray_preferences(&self) -> Result<TrayPreferences> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                Ok(TrayPreferences {
+                    close_to_tray: setting_value(connection, "close_to_tray_enabled")?.as_deref()
+                        == Some("true"),
+                    minimize_to_tray: setting_value(connection, "minimize_to_tray_enabled")?
+                        .as_deref()
+                        == Some("true"),
+                })
+            })
+        })
+        .await
+        .context("join tray preference read")?
+    }
+
+    pub async fn set_tray_preferences(
+        &self,
+        preferences: TrayPreferences,
+        updated_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES
+                        ('close_to_tray_enabled', :close, :updated),
+                        ('minimize_to_tray_enabled', :minimize, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! {
+                        ":close": if preferences.close_to_tray { "true" } else { "false" },
+                        ":minimize": if preferences.minimize_to_tray { "true" } else { "false" },
+                        ":updated": updated_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join tray preference write")??;
         Ok(())
     }
 
@@ -1042,6 +1095,47 @@ mod tests {
         assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
         reopened.set_clipboard_monitoring_enabled(false, 20).await.unwrap();
         assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tray_preferences_default_off_and_persist_independently() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_tray_preferences().await.unwrap(), TrayPreferences::default());
+
+        store
+            .set_tray_preferences(
+                TrayPreferences { close_to_tray: true, minimize_to_tray: false },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_tray_preferences().await.unwrap(),
+            TrayPreferences { close_to_tray: true, minimize_to_tray: false }
+        );
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(
+            reopened.load_tray_preferences().await.unwrap(),
+            TrayPreferences { close_to_tray: true, minimize_to_tray: false }
+        );
+        reopened
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'yes' WHERE key = 'minimize_to_tray_enabled'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            reopened.load_tray_preferences().await.unwrap(),
+            TrayPreferences { close_to_tray: true, minimize_to_tray: false }
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

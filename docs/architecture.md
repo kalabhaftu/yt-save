@@ -27,6 +27,6 @@ The project selects Slint's GPL-3.0-or-later open-source license and therefore l
 
 ## First vertical slice
 
-The implemented flow accepts any HTTP(S) URL, stores it as a queue record, obtains metadata with yt-dlp JSON output, runs a download, parses machine-readable progress, and stores completion or failure. The app does not maintain a site allowlist. yt-dlp decides whether a URL has a usable extractor. Download destinations are checked as existing directories and canonicalized before a queue item is persisted.
+The implemented flow accepts any HTTP(S) URL, obtains metadata with yt-dlp JSON output, runs a download, parses machine-readable progress, and stores completion or failure. The app does not maintain a site allowlist. yt-dlp decides whether a URL has a usable extractor. Download destinations are checked as existing directories and canonicalized before a queue item is persisted. Queue actions inspect playlist URLs before persistence so users can select entries rather than accidentally queueing a whole playlist.
 
-Pause, resume, retries, playlist item selection, process lifetime jobs, and complete crash recovery remain open items. Tray code is implemented but still needs Windows runtime acceptance. See the feature matrix for evidence and limits.
+Pause, resume, retry, cancel, playlist item selection, tray controls, and crash recovery have persisted implementations. They still need the Windows runtime acceptance checks listed in the feature matrix; the clipboard popup also awaits focus and monitor-placement validation there.

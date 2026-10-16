@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 — Dependency preflight and installer smoke tests
+
+- Added asynchronous startup checks that launch yt-dlp, Deno, FFmpeg, and FFprobe and report their version or failure. A failed Deno check warns that JavaScript-based formats may be incomplete; it does not gate other yt-dlp jobs.
+- Added an Open action for completed files using the operating system's registered handler, with path validation off the UI thread.
+- Added tagged Windows release checks that install, launch, inspect bundled tools, and uninstall both installer formats in isolated runner directories.
+- Updated the feature matrix to distinguish Deno CLI/path validation from a real YouTube download test.
+
 ## 0.1.2 — Retry failed downloads
 
 - Added a retry action for failed jobs. A conditional SQLite update rejects duplicate/stale retry actions and preserves partial-file progress for yt-dlp continuation.

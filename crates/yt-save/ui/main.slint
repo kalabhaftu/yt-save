@@ -5,6 +5,7 @@ struct DownloadRowData {
     status: string,
     progress: float,
     detail: string,
+    output-path: string,
 }
 
 component ActionButton inherits Rectangle {
@@ -56,6 +57,7 @@ export component MainWindow inherits Window {
     callback clear-completed-requested();
     callback remove-download-requested(string);
     callback retry-download-requested(string);
+    callback open-output-requested(string);
 
     VerticalLayout {
         spacing: 0px;
@@ -325,6 +327,14 @@ export component MainWindow inherits Window {
                                             spacing: 8px;
                                             Text { text: row.title; color: #e4e6ef; font-size: 13px; font-weight: 600; overflow: elide; horizontal-stretch: 1; }
                                             Text { text: row.status; color: row.status == "Completed" ? #74d6ae : #9aa2b8; font-size: 11px; }
+                                            if row.status == "Completed" && row.output-path != "" : Rectangle {
+                                                width: 48px;
+                                                height: 24px;
+                                                border-radius: 6px;
+                                                background: #252a39;
+                                                Text { text: "Open"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea { clicked => { root.open-output-requested(row.output-path); } }
+                                            }
                                             if row.status == "Failed" : Rectangle {
                                                 width: 48px;
                                                 height: 24px;

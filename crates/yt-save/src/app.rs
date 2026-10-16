@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
@@ -18,6 +23,7 @@ use crate::{
 enum UiEvent {
     Refresh,
     Status(String),
+    DependencyStatus(String),
     Metadata(MediaMetadata),
 }
 
@@ -39,7 +45,6 @@ pub fn run() -> Result<()> {
     let window = MainWindow::new().context("create main window")?;
     window.set_product_name(env!("YT_SAVE_PRODUCT_NAME").into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
-    window.set_dependency_status(dependencies.readiness_summary().into());
     let saved_rows =
         runtime.block_on(store.list_downloads())?.iter().map(row_view).collect::<Vec<_>>();
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
@@ -70,6 +75,14 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
+                UiEvent::DependencyStatus(message) => {
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_dependency_status(message.into());
+                        }
+                    });
+                }
                 UiEvent::Metadata(metadata) => {
                     let format_summary = if metadata.is_playlist {
                         String::new()
@@ -97,6 +110,19 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+    });
+
+    let dependency_events = events_tx.clone();
+    let dependency_paths = dependencies.clone();
+    handle.spawn(async move {
+        let readiness = dependency_paths.preflight().await;
+        let summary = readiness.summary();
+        let status = if readiness.yt_dlp_ready() {
+            summary
+        } else {
+            format!("yt-dlp failed its startup check; download jobs may fail. {summary}")
+        };
+        let _ = dependency_events.send(UiEvent::DependencyStatus(status));
     });
 
     let analyze_events = events_tx.clone();
@@ -265,6 +291,19 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let output_events = events_tx.clone();
+    let output_handle = handle.clone();
+    window.on_open_output_requested(move |output_path| {
+        let path = PathBuf::from(output_path.as_str());
+        let events = output_events.clone();
+        output_handle.spawn_blocking(move || {
+            if let Err(error) = open_file(&path) {
+                let _ = events
+                    .send(UiEvent::Status(format!("Could not open downloaded file: {error}")));
+            }
+        });
+    });
+
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
     window.run().context("run Slint event loop")?;
     runtime.shutdown_timeout(Duration::from_secs(3));
@@ -427,6 +466,7 @@ fn row_view(record: &DownloadRecord) -> DownloadRowData {
         status: SharedString::from(record.status.as_str()),
         progress: record.progress,
         detail: SharedString::from(details),
+        output_path: SharedString::from(record.output_path.as_deref().unwrap_or_default()),
     }
 }
 
@@ -450,6 +490,57 @@ fn open_folder(path: &PathBuf) -> Result<()> {
     };
     command.spawn().context("launch file manager")?;
     Ok(())
+}
+
+fn validate_output_file(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        anyhow::bail!("file does not exist at {}", path.display());
+    }
+    Ok(())
+}
+
+fn open_file(path: &Path) -> Result<()> {
+    validate_output_file(path)?;
+
+    open_with_platform_handler(path)
+}
+
+#[cfg(windows)]
+fn open_with_platform_handler(path: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    // ShellExecuteW opens the file through its registered Windows association.
+    let operation = wide_null_terminated(OsStr::new("open"));
+    let file = wide_null_terminated(path.as_os_str());
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as isize) <= 32 {
+        anyhow::bail!("Windows could not open the file (ShellExecute error {})", result as isize);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_with_platform_handler(path: &Path) -> Result<()> {
+    let mut command =
+        if cfg!(target_os = "macos") { Command::new("open") } else { Command::new("xdg-open") };
+    command.arg(path).spawn().context("launch the default media player")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_null_terminated(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().chain(Some(0)).collect()
 }
 
 struct AppPaths {
@@ -486,6 +577,53 @@ mod tests {
         );
         assert!(validate_url("file:///C:/private.mp4").is_err());
         assert!(validate_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn missing_output_file_fails_before_launching_a_handler() {
+        let path = std::env::temp_dir().join(format!("yt-save-missing-{}.mp4", Uuid::new_v4()));
+        assert!(open_file(&path).is_err());
+    }
+
+    #[test]
+    fn existing_media_file_passes_validation_without_launching_a_handler() {
+        let path = std::env::temp_dir().join(format!("yt-save-media {}.mp4", Uuid::new_v4()));
+        std::fs::write(&path, b"fixture media").unwrap();
+
+        let result = validate_output_file(&path);
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_directory_is_not_accepted_as_a_completed_media_file() {
+        let path = std::env::temp_dir().join(format!("yt-save-directory-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+
+        let result = open_file(&path);
+
+        std::fs::remove_dir(&path).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_open_arguments_preserve_spaces_and_unicode_without_shell_quoting() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = std::env::temp_dir().join("Yt Save media Ω.mp4");
+        let encoded_path = wide_null_terminated(path.as_os_str());
+        let decoded_path = std::ffi::OsString::from_wide(&encoded_path[..encoded_path.len() - 1]);
+        let encoded_operation = wide_null_terminated(std::ffi::OsStr::new("open"));
+
+        assert_eq!(decoded_path, path.as_os_str());
+        assert_eq!(encoded_path.last(), Some(&0));
+        assert_eq!(
+            std::ffi::OsString::from_wide(&encoded_operation[..encoded_operation.len() - 1])
+                .as_os_str(),
+            std::ffi::OsStr::new("open")
+        );
     }
 
     #[tokio::test]

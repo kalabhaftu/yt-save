@@ -22,6 +22,12 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = {
+    version = "0.61.2",
+    features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"],
+}
+
 [build-dependencies]
 serde_json.workspace = true
 slint-build = "1.18.1"

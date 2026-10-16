@@ -17,6 +17,8 @@ Real application screenshots will be added after the first Windows UI validation
 - Reads media metadata and available format counts through yt-dlp JSON output.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Uses structured process arguments and yt-dlp progress templates; no shell command construction.
+- Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
+- Lets users open completed files with the operating system's registered media handler.
 - Stores output in the user's Downloads folder under `Yt Save`.
 - Uses pinned, SHA-256-verified upstream releases for yt-dlp, Deno, and FFmpeg/FFprobe.
 
@@ -72,7 +74,8 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker and currently has no interactive pause, cancellation, or reordering controls. Failed items can be retried; finished rows can be removed from history, or completed rows cleared in bulk. These history actions leave downloaded files in place. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
+- The queue is single-worker and currently has no interactive pause, cancellation, or reordering controls. Failed items can be retried, completed files can be opened with the default media player, and finished rows can be removed from history without deleting the files.
+- Completed rows can also be cleared in bulk. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist URLs are handed to yt-dlp as one job; playlist preview, entry selection, dedicated playlist folders, and sync subscriptions are not implemented.
 - There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle/conversion settings screen yet.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.

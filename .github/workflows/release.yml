@@ -63,6 +63,10 @@ jobs:
         shell: pwsh
         run: ./scripts/build_windows_package.ps1 -Configuration release
 
+      - name: Smoke-test MSI and Inno installers
+        shell: pwsh
+        run: ./scripts/test_windows_installers.ps1
+
       - name: Publish installers and checksums
         shell: pwsh
         env:

@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -1298,6 +1298,8 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     });
 
     let preferences_state = preferences.clone();
+    let preference_write_lock = Arc::new(AsyncMutex::new(()));
+    let close_preference_write_lock = preference_write_lock.clone();
     let preference_store = store.clone();
     let preference_handle = handle.clone();
     let preference_events = events.clone();
@@ -1310,6 +1312,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
             &preferences_state,
             Some(enabled),
             None,
+            close_preference_write_lock.clone(),
             preference_store.clone(),
             preference_handle.clone(),
             preference_events.clone(),
@@ -1317,6 +1320,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     });
 
     let preferences_state = preferences.clone();
+    let minimize_preference_write_lock = preference_write_lock.clone();
     let preference_store = store.clone();
     let preference_handle = handle.clone();
     let preference_events = events.clone();
@@ -1329,6 +1333,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
             &preferences_state,
             None,
             Some(enabled),
+            minimize_preference_write_lock.clone(),
             preference_store.clone(),
             preference_handle.clone(),
             preference_events.clone(),
@@ -1365,11 +1370,12 @@ fn save_tray_preference_update(
     state: &Arc<Mutex<TrayPreferences>>,
     close_to_tray: Option<bool>,
     minimize_to_tray: Option<bool>,
+    write_lock: Arc<AsyncMutex<()>>,
     store: Store,
     handle: tokio::runtime::Handle,
     events: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let preferences = match state.lock() {
+    match state.lock() {
         Ok(mut preferences) => {
             if let Some(enabled) = close_to_tray {
                 preferences.close_to_tray = enabled;
@@ -1377,7 +1383,6 @@ fn save_tray_preference_update(
             if let Some(enabled) = minimize_to_tray {
                 preferences.minimize_to_tray = enabled;
             }
-            *preferences
         }
         Err(_) => {
             let _ = events.send(UiEvent::Status(
@@ -1387,7 +1392,18 @@ fn save_tray_preference_update(
         }
     };
 
+    let state = state.clone();
     handle.spawn(async move {
+        let _write_guard = write_lock.lock().await;
+        let preferences = match state.lock() {
+            Ok(preferences) => *preferences,
+            Err(_) => {
+                let _ = events.send(UiEvent::Status(
+                    "Tray behavior changed for this session but could not be saved because settings state is unavailable.".to_owned(),
+                ));
+                return;
+            }
+        };
         if let Err(error) = store.set_tray_preferences(preferences, now()).await {
             error!(%error, "save tray behavior preferences");
             let _ = events.send(UiEvent::Status(format!(
@@ -1463,9 +1479,21 @@ fn begin_orderly_quit(
             Err(error) => {
                 shutdown_started.store(false, Ordering::Release);
                 error!(%error, "orderly application shutdown");
-                let _ = events.send(UiEvent::Status(format!(
+                let message = format!(
                     "Could not safely quit: {error}. The window and tray remain available."
-                )));
+                );
+                let _ = events.send(UiEvent::Status(message.clone()));
+                if let Err(invoke_error) = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = window.upgrade() {
+                        window.window().set_minimized(false);
+                        window.set_status_message(message.into());
+                        if let Err(show_error) = window.show() {
+                            error!(%show_error, "show window after orderly shutdown failure");
+                        }
+                    }
+                }) {
+                    error!(%invoke_error, "restore window after orderly shutdown failure");
+                }
             }
         }
     });

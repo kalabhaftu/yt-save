@@ -1273,7 +1273,6 @@ fn configure_tray(
     let quit_events = events.clone();
     let quit_active_jobs = active_jobs.clone();
     let quit_window = window.as_weak();
-    let quit_tray = tray.as_weak();
     let quit_guard = shutdown_started.clone();
     tray.on_quit_requested(move || {
         begin_orderly_quit(
@@ -1282,7 +1281,6 @@ fn configure_tray(
             quit_active_jobs.clone(),
             quit_events.clone(),
             quit_window.clone(),
-            quit_tray.clone(),
             quit_guard.clone(),
         );
     });
@@ -1331,7 +1329,6 @@ fn configure_tray(
     let close_events = events;
     let close_active_jobs = active_jobs;
     let close_window = window.as_weak();
-    let close_tray = tray.as_weak();
     let close_guard = shutdown_started;
     window.window().on_close_requested(move || {
         let close_to_tray =
@@ -1345,7 +1342,6 @@ fn configure_tray(
                 close_active_jobs.clone(),
                 close_events.clone(),
                 close_window.clone(),
-                close_tray.clone(),
                 close_guard.clone(),
             );
             CloseRequestResponse::KeepWindowShown
@@ -1395,7 +1391,6 @@ fn begin_orderly_quit(
     active_jobs: ActiveJobs,
     events: mpsc::UnboundedSender<UiEvent>,
     window: slint::Weak<MainWindow>,
-    tray: slint::Weak<AppTray>,
     shutdown_started: Arc<AtomicBool>,
 ) {
     if shutdown_started.swap(true, Ordering::AcqRel) {
@@ -1436,13 +1431,20 @@ fn begin_orderly_quit(
                     "Downloads are paused. The application is shutting down.".to_owned(),
                 ));
                 let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(tray) = tray.upgrade() {
-                        tray.set_visible(false);
-                    }
                     if let Some(window) = window.upgrade()
                         && let Err(error) = window.hide()
                     {
                         error!(%error, "hide window during orderly shutdown");
+                    }
+                    if let Err(error) = slint::quit_event_loop() {
+                        shutdown_started.store(false, Ordering::Release);
+                        error!(%error, "quit Slint event loop during orderly shutdown");
+                        if let Some(window) = window.upgrade() {
+                            window.set_status_message(
+                                format!("Could not finish shutting down: {error}").into(),
+                            );
+                            let _ = window.show();
+                        }
                     }
                 });
             }

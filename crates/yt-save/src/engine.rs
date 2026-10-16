@@ -350,10 +350,9 @@ async fn terminate_process_tree(child: &mut tokio::process::Child) -> Result<Exi
                 Ok(Ok(status)) => {
                     if let Some(child_status) =
                         child.try_wait().context("check yt-dlp after taskkill failure")?
+                        && child_status.success()
                     {
-                        if child_status.success() {
-                            return Ok(child_status);
-                        }
+                        return Ok(child_status);
                     }
                     let reason = format!("taskkill exited with status {:?}", status.code());
                     force_kill_direct_child(child).await?;

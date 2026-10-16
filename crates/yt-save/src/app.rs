@@ -41,10 +41,10 @@ struct ActiveJobRegistration {
 
 impl Drop for ActiveJobRegistration {
     fn drop(&mut self) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            if jobs.get(&self.id).is_some_and(|sender| Arc::ptr_eq(sender, &self.sender)) {
-                jobs.remove(&self.id);
-            }
+        if let Ok(mut jobs) = self.jobs.lock()
+            && jobs.get(&self.id).is_some_and(|sender| Arc::ptr_eq(sender, &self.sender))
+        {
+            jobs.remove(&self.id);
         }
     }
 }
@@ -883,6 +883,7 @@ async fn finish_canceled_job(
     store: Store,
     events: mpsc::UnboundedSender<UiEvent>,
 ) {
+    let job_id = record.id.clone();
     record.status = "Canceled".to_owned();
     record.error = Some("Canceled by user; partial files were kept.".to_owned());
     record.updated_at = now();
@@ -900,7 +901,7 @@ async fn finish_canceled_job(
             ));
         }
         Err(error) => {
-            error!(%error, job_id = %record.id, "persist canceled download state");
+            error!(%error, job_id = %job_id, "persist canceled download state");
             let _ = events.send(UiEvent::Status(
                 "The process stopped, but the app could not save the canceled state.".to_owned(),
             ));

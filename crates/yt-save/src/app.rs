@@ -20,8 +20,8 @@ use crate::{
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
     model::{
-        AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata,
-        PlaylistEntry, VideoQuality, format_bytes, format_duration,
+        DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
+        format_duration,
     },
     persistence::Store,
 };
@@ -1508,6 +1508,7 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AudioFormat, AudioQuality, VideoQuality};
 
     #[test]
     fn download_destination_must_be_an_existing_directory_and_is_canonicalized() {

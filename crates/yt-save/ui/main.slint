@@ -22,10 +22,12 @@ component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
     in property <bool> is-enabled: true;
+    in property <length> button-height: 42px;
+    in property <length> button-min-width: 112px;
     callback clicked();
 
-    height: 42px;
-    min-width: 112px;
+    height: root.button-height;
+    min-width: root.button-min-width;
     border-radius: 10px;
     background: primary ? #7968ff : #232638;
     opacity: is-enabled ? 1 : 0.45;
@@ -58,6 +60,9 @@ export component MainWindow inherits Window {
     background: #0c0e15;
 
     in-out property <string> url-input: "";
+    in-out property <bool> audio-only: false;
+    in-out property <string> audio-format: "original";
+    in-out property <string> audio-quality: "best";
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <string> analyzed-title: "";
@@ -222,7 +227,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 160px;
+                        height: 306px;
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -230,7 +235,7 @@ export component MainWindow inherits Window {
 
                         VerticalLayout {
                             padding: 18px;
-                            spacing: 12px;
+                            spacing: 8px;
                             Text { text: "New download"; color: #eff0f7; font-size: 15px; font-weight: 600; }
                             HorizontalLayout {
                                 spacing: 10px;
@@ -272,6 +277,179 @@ export component MainWindow inherits Window {
                                     primary: true;
                                     clicked => { root.enqueue-requested(root.url-input); }
                                 }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text {
+                                    text: "Download mode";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Video";
+                                    primary: !root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 86px;
+                                    clicked => { root.audio-only = false; }
+                                }
+                                ActionButton {
+                                    label: "Audio only";
+                                    primary: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 102px;
+                                    clicked => { root.audio-only = true; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text {
+                                    text: "Audio format";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Original";
+                                    primary: root.audio-format == "original";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 82px;
+                                    clicked => { root.audio-format = "original"; }
+                                }
+                                ActionButton {
+                                    label: "MP3";
+                                    primary: root.audio-format == "mp3";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "mp3"; }
+                                }
+                                ActionButton {
+                                    label: "M4A";
+                                    primary: root.audio-format == "m4a";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "m4a"; }
+                                }
+                                ActionButton {
+                                    label: "Opus";
+                                    primary: root.audio-format == "opus";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "opus"; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text {
+                                    text: "Other formats";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "AAC";
+                                    primary: root.audio-format == "aac";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "aac"; }
+                                }
+                                ActionButton {
+                                    label: "ALAC";
+                                    primary: root.audio-format == "alac";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "alac"; }
+                                }
+                                ActionButton {
+                                    label: "FLAC";
+                                    primary: root.audio-format == "flac";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "flac"; }
+                                }
+                                ActionButton {
+                                    label: "Vorbis";
+                                    primary: root.audio-format == "vorbis";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "vorbis"; }
+                                }
+                                ActionButton {
+                                    label: "WAV";
+                                    primary: root.audio-format == "wav";
+                                    is-enabled: root.audio-only;
+                                    button-height: 30px;
+                                    button-min-width: 64px;
+                                    clicked => { root.audio-format = "wav"; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text {
+                                    text: "Audio quality";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Best";
+                                    primary: root.audio-quality == "best";
+                                    is-enabled: root.audio-only && root.audio-format != "original" && root.audio-format != "alac" && root.audio-format != "flac" && root.audio-format != "wav";
+                                    button-height: 30px;
+                                    button-min-width: 68px;
+                                    clicked => { root.audio-quality = "best"; }
+                                }
+                                ActionButton {
+                                    label: "320 kbps";
+                                    primary: root.audio-quality == "320k";
+                                    is-enabled: root.audio-only && root.audio-format != "original" && root.audio-format != "alac" && root.audio-format != "flac" && root.audio-format != "wav";
+                                    button-height: 30px;
+                                    button-min-width: 82px;
+                                    clicked => { root.audio-quality = "320k"; }
+                                }
+                                ActionButton {
+                                    label: "192 kbps";
+                                    primary: root.audio-quality == "192k";
+                                    is-enabled: root.audio-only && root.audio-format != "original" && root.audio-format != "alac" && root.audio-format != "flac" && root.audio-format != "wav";
+                                    button-height: 30px;
+                                    button-min-width: 82px;
+                                    clicked => { root.audio-quality = "192k"; }
+                                }
+                                ActionButton {
+                                    label: "128 kbps";
+                                    primary: root.audio-quality == "128k";
+                                    is-enabled: root.audio-only && root.audio-format != "original" && root.audio-format != "alac" && root.audio-format != "flac" && root.audio-format != "wav";
+                                    button-height: 30px;
+                                    button-min-width: 82px;
+                                    clicked => { root.audio-quality = "128k"; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            Text {
+                                height: 12px;
+                                text: root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-only && root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                color: #747d96;
+                                font-size: 10px;
+                                overflow: elide;
                             }
                             Text { text: root.status-message; color: #99a2ba; font-size: 12px; }
                         }

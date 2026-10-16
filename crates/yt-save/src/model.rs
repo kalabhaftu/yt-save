@@ -1,5 +1,154 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DownloadMode {
+    #[default]
+    Video,
+    AudioOnly,
+}
+
+impl DownloadMode {
+    pub fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::AudioOnly => "audio",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::AudioOnly),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioFormat {
+    #[default]
+    Original,
+    Mp3,
+    M4a,
+    Opus,
+    Aac,
+    Alac,
+    Flac,
+    Vorbis,
+    Wav,
+}
+
+impl AudioFormat {
+    pub fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Mp3 => "mp3",
+            Self::M4a => "m4a",
+            Self::Opus => "opus",
+            Self::Aac => "aac",
+            Self::Alac => "alac",
+            Self::Flac => "flac",
+            Self::Vorbis => "vorbis",
+            Self::Wav => "wav",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "original" => Some(Self::Original),
+            "mp3" => Some(Self::Mp3),
+            "m4a" => Some(Self::M4a),
+            "opus" => Some(Self::Opus),
+            "aac" => Some(Self::Aac),
+            "alac" => Some(Self::Alac),
+            "flac" => Some(Self::Flac),
+            "vorbis" => Some(Self::Vorbis),
+            "wav" => Some(Self::Wav),
+            _ => None,
+        }
+    }
+
+    pub fn yt_dlp_name(self) -> Option<&'static str> {
+        match self {
+            Self::Original => None,
+            Self::Mp3 => Some("mp3"),
+            Self::M4a => Some("m4a"),
+            Self::Opus => Some("opus"),
+            Self::Aac => Some("aac"),
+            Self::Alac => Some("alac"),
+            Self::Flac => Some("flac"),
+            Self::Vorbis => Some("vorbis"),
+            Self::Wav => Some("wav"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Mp3 => "MP3",
+            Self::M4a => "M4A",
+            Self::Opus => "Opus",
+            Self::Aac => "AAC",
+            Self::Alac => "ALAC",
+            Self::Flac => "FLAC",
+            Self::Vorbis => "Vorbis",
+            Self::Wav => "WAV",
+        }
+    }
+
+    pub fn supports_quality_setting(self) -> bool {
+        matches!(self, Self::Mp3 | Self::M4a | Self::Opus | Self::Aac | Self::Vorbis)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioQuality {
+    #[default]
+    Best,
+    K320,
+    K192,
+    K128,
+}
+
+impl AudioQuality {
+    pub fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Best => "best",
+            Self::K320 => "320k",
+            Self::K192 => "192k",
+            Self::K128 => "128k",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "best" => Some(Self::Best),
+            "320k" => Some(Self::K320),
+            "192k" => Some(Self::K192),
+            "128k" => Some(Self::K128),
+            _ => None,
+        }
+    }
+
+    pub fn yt_dlp_argument(self) -> &'static str {
+        match self {
+            Self::Best => "0",
+            Self::K320 => "320K",
+            Self::K192 => "192K",
+            Self::K128 => "128K",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Best => "Best",
+            Self::K320 => "320 kbps",
+            Self::K192 => "192 kbps",
+            Self::K128 => "128 kbps",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaMetadata {
     pub id: String,
@@ -86,6 +235,9 @@ pub struct DownloadRecord {
     /// SQLite rowid assigned when this queue item was first inserted.
     pub queue_order: i64,
     pub playlist_index: Option<i64>,
+    pub download_mode: DownloadMode,
+    pub audio_format: AudioFormat,
+    pub audio_quality: AudioQuality,
     pub title: String,
     pub source: String,
     pub status: String,
@@ -107,6 +259,9 @@ impl DownloadRecord {
             url,
             queue_order: 0,
             playlist_index: None,
+            download_mode: DownloadMode::Video,
+            audio_format: AudioFormat::Original,
+            audio_quality: AudioQuality::Best,
             title: "Waiting for media details".to_owned(),
             source: String::new(),
             status: "Queued".to_owned(),
@@ -236,5 +391,49 @@ mod tests {
         assert_eq!(format_duration(Some(3661.0)), "1:01:01");
         assert_eq!(format_bytes(None), "Size not reported");
         assert_eq!(format_bytes(Some(1_500_000)), "1.5 MB");
+    }
+
+    #[test]
+    fn persisted_audio_choices_have_stable_database_values() {
+        for (mode, value) in [(DownloadMode::Video, "video"), (DownloadMode::AudioOnly, "audio")] {
+            assert_eq!(DownloadMode::from_database_value(value), Some(mode));
+            assert_eq!(mode.as_database_value(), value);
+        }
+        for (format, value) in [
+            (AudioFormat::Original, "original"),
+            (AudioFormat::Mp3, "mp3"),
+            (AudioFormat::M4a, "m4a"),
+            (AudioFormat::Opus, "opus"),
+            (AudioFormat::Aac, "aac"),
+            (AudioFormat::Alac, "alac"),
+            (AudioFormat::Flac, "flac"),
+            (AudioFormat::Vorbis, "vorbis"),
+            (AudioFormat::Wav, "wav"),
+        ] {
+            assert_eq!(AudioFormat::from_database_value(value), Some(format));
+            assert_eq!(format.as_database_value(), value);
+        }
+        assert_eq!(AudioFormat::Mp3.yt_dlp_name(), Some("mp3"));
+        assert_eq!(AudioFormat::Original.yt_dlp_name(), None);
+        assert_eq!(DownloadMode::from_database_value("other"), None);
+        assert!(AudioFormat::Aac.supports_quality_setting());
+        assert!(!AudioFormat::Alac.supports_quality_setting());
+        assert!(!AudioFormat::Flac.supports_quality_setting());
+        assert!(AudioFormat::Vorbis.supports_quality_setting());
+    }
+
+    #[test]
+    fn audio_quality_has_stable_persistence_and_yt_dlp_values() {
+        for (quality, stored, argument) in [
+            (AudioQuality::Best, "best", "0"),
+            (AudioQuality::K320, "320k", "320K"),
+            (AudioQuality::K192, "192k", "192K"),
+            (AudioQuality::K128, "128k", "128K"),
+        ] {
+            assert_eq!(AudioQuality::from_database_value(stored), Some(quality));
+            assert_eq!(quality.as_database_value(), stored);
+            assert_eq!(quality.yt_dlp_argument(), argument);
+        }
+        assert_eq!(AudioQuality::from_database_value("256k"), None);
     }
 }

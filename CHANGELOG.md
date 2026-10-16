@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8 — Audio-only output
+
+- Add per-item Video or Audio only selection and Original, MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV output choices, plus persisted Best/320/192/128 kbps quality settings for applicable conversions.
+- Preserve choices through SQLite migration, retries, and startup recovery; converted audio uses yt-dlp's FFmpeg postprocessor and reports missing bundled tools clearly. ALAC/FLAC/WAV limitations are explained in the UI and docs.
+- Add command and persistence coverage; Windows UI and real media conversion acceptance remain pending.
+
 ## 0.1.7 — Active download cancellation
 
 - Cancel active yt-dlp metadata inspection and downloads, including the Windows process tree, while preserving partial progress for retry.

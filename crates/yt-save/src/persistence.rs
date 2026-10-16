@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, named_params, types::Type};
 
-use crate::model::DownloadRecord;
+use crate::model::{AudioFormat, AudioQuality, DownloadMode, DownloadRecord};
 
 #[derive(Clone)]
 pub struct Store {
@@ -37,7 +37,10 @@ impl Store {
                     error TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    playlist_index INTEGER
+                    playlist_index INTEGER,
+                    download_mode TEXT NOT NULL DEFAULT 'video',
+                    audio_format TEXT NOT NULL DEFAULT 'original',
+                    audio_quality TEXT NOT NULL DEFAULT 'best'
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -58,6 +61,22 @@ impl Store {
             if !has_playlist_index {
                 connection
                     .execute_batch("ALTER TABLE downloads ADD COLUMN playlist_index INTEGER;")?;
+            }
+            for (column, definition) in [
+                ("download_mode", "TEXT NOT NULL DEFAULT 'video'"),
+                ("audio_format", "TEXT NOT NULL DEFAULT 'original'"),
+                ("audio_quality", "TEXT NOT NULL DEFAULT 'best'"),
+            ] {
+                let exists = {
+                    let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
+                    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                    columns.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|name| name == column)
+                };
+                if !exists {
+                    connection.execute_batch(&format!(
+                        "ALTER TABLE downloads ADD COLUMN {column} {definition};"
+                    ))?;
+                }
             }
             Ok(())
         })?;
@@ -82,11 +101,12 @@ impl Store {
                     "INSERT INTO downloads (
                         id, url, title, source, status, progress, downloaded_bytes,
                         total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                        error, created_at, updated_at, playlist_index
+                        error, created_at, updated_at, playlist_index,
+                        download_mode, audio_format, audio_quality
                     ) VALUES (
                         :id, :url, :title, :source, :status, :progress, :downloaded,
                         :total, :speed, :eta, :output, :error, :created, :updated,
-                        :playlist_index
+                        :playlist_index, :download_mode, :audio_format, :audio_quality
                     ) ON CONFLICT(id) DO UPDATE SET
                         url=excluded.url, title=excluded.title, source=excluded.source,
                         status=excluded.status, progress=excluded.progress,
@@ -95,7 +115,10 @@ impl Store {
                         speed_bytes_per_second=excluded.speed_bytes_per_second,
                         eta_seconds=excluded.eta_seconds, output_path=excluded.output_path,
                         error=excluded.error, updated_at=excluded.updated_at,
-                        playlist_index=excluded.playlist_index",
+                        playlist_index=excluded.playlist_index,
+                        download_mode=excluded.download_mode,
+                        audio_format=excluded.audio_format,
+                        audio_quality=excluded.audio_quality",
                     named_params! {
                         ":id": record.id,
                         ":url": record.url,
@@ -112,6 +135,9 @@ impl Store {
                         ":created": record.created_at,
                         ":updated": record.updated_at,
                         ":playlist_index": record.playlist_index,
+                        ":download_mode": record.download_mode.as_database_value(),
+                        ":audio_format": record.audio_format.as_database_value(),
+                        ":audio_quality": record.audio_quality.as_database_value(),
                     },
                 )?;
                 Ok(())
@@ -464,7 +490,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
     let mut statement = connection.prepare(
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                error, created_at, updated_at, playlist_index, rowid
+                error, created_at, updated_at, playlist_index,
+                download_mode, audio_format, audio_quality, rowid
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -485,7 +512,10 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
                 playlist_index: row.get(14)?,
-                queue_order: row.get(15)?,
+                download_mode: download_mode_from_row(row, 15)?,
+                audio_format: audio_format_from_row(row, 16)?,
+                audio_quality: audio_quality_from_row(row, 17)?,
+                queue_order: row.get(18)?,
             })
         })
         .optional()?;
@@ -505,7 +535,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
     let mut statement = connection.prepare(
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                error, created_at, updated_at, playlist_index, rowid
+                error, created_at, updated_at, playlist_index,
+                download_mode, audio_format, audio_quality, rowid
          FROM downloads ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -525,10 +556,39 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
             playlist_index: row.get(14)?,
-            queue_order: row.get(15)?,
+            download_mode: download_mode_from_row(row, 15)?,
+            audio_format: audio_format_from_row(row, 16)?,
+            audio_quality: audio_quality_from_row(row, 17)?,
+            queue_order: row.get(18)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+fn download_mode_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<DownloadMode> {
+    let value: String = row.get(index)?;
+    DownloadMode::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
+}
+
+fn audio_format_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<AudioFormat> {
+    let value: String = row.get(index)?;
+    AudioFormat::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
+}
+
+fn audio_quality_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<AudioQuality> {
+    let value: String = row.get(index)?;
+    AudioQuality::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
+}
+
+fn invalid_enum_value(index: usize, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unrecognized persisted download choice: {value}"),
+        )),
+    )
 }
 
 fn optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
@@ -560,6 +620,9 @@ mod tests {
         let mut record =
             DownloadRecord::queued("job-1".to_owned(), "https://example.test/media".to_owned(), 10);
         record.playlist_index = Some(4);
+        record.download_mode = DownloadMode::AudioOnly;
+        record.audio_format = AudioFormat::Opus;
+        record.audio_quality = AudioQuality::K320;
         record.downloaded_bytes = Some(345);
         record.total_bytes = Some(1_000);
         record.eta_seconds = Some(12);
@@ -575,6 +638,42 @@ mod tests {
         assert_eq!(rows[0].total_bytes, Some(1_000));
         assert_eq!(rows[0].eta_seconds, Some(12));
         assert_eq!(rows[0].playlist_index, Some(4));
+        assert_eq!(rows[0].download_mode, DownloadMode::AudioOnly);
+        assert_eq!(rows[0].audio_format, AudioFormat::Opus);
+        assert_eq!(rows[0].audio_quality, AudioQuality::K320);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn alac_and_vorbis_choices_round_trip_through_sqlite() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+
+        for (id, audio_format, audio_quality) in [
+            ("alac-job", AudioFormat::Alac, AudioQuality::Best),
+            ("vorbis-job", AudioFormat::Vorbis, AudioQuality::K192),
+        ] {
+            let mut record =
+                DownloadRecord::queued(id.to_owned(), "https://example.test/media".to_owned(), 10);
+            record.download_mode = DownloadMode::AudioOnly;
+            record.audio_format = audio_format;
+            record.audio_quality = audio_quality;
+            store.save_download(record).await.unwrap();
+        }
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        let rows = reopened.list_downloads().await.unwrap();
+        for (id, audio_format, audio_quality) in [
+            ("alac-job", AudioFormat::Alac, AudioQuality::Best),
+            ("vorbis-job", AudioFormat::Vorbis, AudioQuality::K192),
+        ] {
+            let record = rows.iter().find(|record| record.id == id).unwrap();
+            assert_eq!(record.download_mode, DownloadMode::AudioOnly);
+            assert_eq!(record.audio_format, audio_format);
+            assert_eq!(record.audio_quality, audio_quality);
+        }
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -618,6 +717,9 @@ mod tests {
         let legacy = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(legacy.id, "legacy-job");
         assert_eq!(legacy.playlist_index, None);
+        assert_eq!(legacy.download_mode, DownloadMode::Video);
+        assert_eq!(legacy.audio_format, AudioFormat::Original);
+        assert_eq!(legacy.audio_quality, AudioQuality::Best);
 
         let mut selected = DownloadRecord::queued(
             "selected-job".to_owned(),
@@ -625,6 +727,9 @@ mod tests {
             30,
         );
         selected.playlist_index = Some(7);
+        selected.download_mode = DownloadMode::AudioOnly;
+        selected.audio_format = AudioFormat::M4a;
+        selected.audio_quality = AudioQuality::K192;
         store.save_download(selected).await.unwrap();
         drop(store);
 
@@ -638,6 +743,9 @@ mod tests {
             .unwrap();
         assert_eq!(selected.url, "https://example.test/list");
         assert_eq!(selected.playlist_index, Some(7));
+        assert_eq!(selected.download_mode, DownloadMode::AudioOnly);
+        assert_eq!(selected.audio_format, AudioFormat::M4a);
+        assert_eq!(selected.audio_quality, AudioQuality::K192);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -756,6 +864,9 @@ mod tests {
         failed.total_bytes = Some(1_000);
         failed.error = Some("temporary network error".to_owned());
         failed.playlist_index = Some(5);
+        failed.download_mode = DownloadMode::AudioOnly;
+        failed.audio_format = AudioFormat::Mp3;
+        failed.audio_quality = AudioQuality::K128;
         store.save_download(failed).await.unwrap();
 
         let queued = DownloadRecord::queued(
@@ -773,6 +884,9 @@ mod tests {
         assert_eq!(retried.total_bytes, Some(1_000));
         assert_eq!(retried.updated_at, 20);
         assert_eq!(retried.playlist_index, Some(5));
+        assert_eq!(retried.download_mode, DownloadMode::AudioOnly);
+        assert_eq!(retried.audio_format, AudioFormat::Mp3);
+        assert_eq!(retried.audio_quality, AudioQuality::K128);
         assert!(store.retry_download("failed", 21).await.unwrap().is_none());
         assert!(store.retry_download("queued", 22).await.unwrap().is_none());
 

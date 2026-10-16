@@ -12,7 +12,10 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use crate::{dependencies::DependencyPaths, model::MediaMetadata};
+use crate::{
+    dependencies::DependencyPaths,
+    model::{AudioFormat, AudioQuality, DownloadMode, MediaMetadata},
+};
 
 const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
@@ -150,6 +153,9 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
+        download_mode: DownloadMode,
+        audio_format: AudioFormat,
+        audio_quality: AudioQuality,
         cancel: &mut watch::Receiver<bool>,
         mut on_progress: F,
     ) -> Result<EngineOutcome<DownloadResult>>
@@ -160,11 +166,12 @@ impl DownloadEngine {
             return Ok(EngineOutcome::Canceled);
         }
         self.dependencies.require_for_download()?;
+        let mut command =
+            self.download_command(url, playlist_index, download_mode, audio_format, audio_quality)?;
         tokio::fs::create_dir_all(&self.output_directory)
             .await
             .with_context(|| format!("create {}", self.output_directory.display()))?;
 
-        let mut command = self.download_command(url, playlist_index)?;
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
         let stdout = child.stdout.take().context("open yt-dlp stdout")?;
@@ -252,7 +259,14 @@ impl DownloadEngine {
         command
     }
 
-    fn download_command(&self, url: &str, playlist_index: Option<i64>) -> Result<Command> {
+    fn download_command(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+        download_mode: DownloadMode,
+        audio_format: AudioFormat,
+        audio_quality: AudioQuality,
+    ) -> Result<Command> {
         let mut command = self.base_command();
         command
             .arg("--no-warnings")
@@ -270,8 +284,36 @@ impl DownloadEngine {
             .arg(format!("home:{}", self.output_directory.display()))
             .arg("--output")
             .arg(OUTPUT_TEMPLATE)
-            .arg("--format")
-            .arg("bv*+ba/b");
+            .arg("--format");
+        match download_mode {
+            DownloadMode::Video => {
+                command.arg("bv*+ba/b");
+            }
+            DownloadMode::AudioOnly => {
+                command.arg("bestaudio");
+                if let Some(format) = audio_format.yt_dlp_name() {
+                    let missing = match (
+                        self.dependencies.ffmpeg.is_file(),
+                        self.dependencies.ffprobe.is_file(),
+                    ) {
+                        (false, false) => Some("FFmpeg and FFprobe are missing"),
+                        (false, true) => Some("FFmpeg is missing"),
+                        (true, false) => Some("FFprobe is missing"),
+                        (true, true) => None,
+                    };
+                    if let Some(missing) = missing {
+                        bail!(
+                            "Converting audio to {} requires the bundled FFmpeg and FFprobe tools; {missing}.",
+                            audio_format.label()
+                        );
+                    }
+                    command.arg("--extract-audio").arg("--audio-format").arg(format);
+                    if audio_format.supports_quality_setting() {
+                        command.arg("--audio-quality").arg(audio_quality.yt_dlp_argument());
+                    }
+                }
+            }
+        }
         add_playlist_item_argument(&mut command, playlist_index)?;
         command.arg(url);
         Ok(command)
@@ -436,6 +478,11 @@ fn readable_error(value: &str) -> String {
     let message = value.to_ascii_lowercase();
     if message.contains("unsupported url") || message.contains("no suitable extractor") {
         "yt-dlp does not currently support this URL.".to_owned()
+    } else if message.contains("ffmpeg not found")
+        || message.contains("ffprobe not found")
+        || message.contains("ffmpeg-location")
+    {
+        "Media processing needs the bundled FFmpeg and FFprobe tools, but yt-dlp could not locate them. Restore the bundled media tools and try again.".to_owned()
     } else if message.contains("http error 404") || message.contains("not found") {
         "The media was not found. Check the URL and try again.".to_owned()
     } else if message.contains("http error 403") || message.contains("forbidden") {
@@ -562,7 +609,13 @@ mod tests {
         };
         let engine = DownloadEngine::new(dependencies, output_directory.clone());
         let arguments = engine
-            .download_command("https://example.test/watch/123", None)
+            .download_command(
+                "https://example.test/watch/123",
+                None,
+                DownloadMode::Video,
+                AudioFormat::Original,
+                AudioQuality::Best,
+            )
             .unwrap()
             .as_std()
             .get_args()
@@ -612,15 +665,179 @@ mod tests {
         let inspection_end =
             selected_inspection.iter().position(|arg| arg == "--playlist-end").unwrap();
         assert_eq!(selected_inspection.get(inspection_end + 1).map(String::as_str), Some("50"));
-        let selected_download =
-            args(engine.download_command("https://example.test/playlist", Some(7)).unwrap());
+        let selected_download = args(
+            engine
+                .download_command(
+                    "https://example.test/playlist",
+                    Some(7),
+                    DownloadMode::Video,
+                    AudioFormat::Original,
+                    AudioQuality::Best,
+                )
+                .unwrap(),
+        );
         for arguments in [&selected_inspection, &selected_download] {
             let option = arguments.iter().position(|arg| arg == "--playlist-items").unwrap();
             assert_eq!(arguments.get(option + 1).map(String::as_str), Some("7"));
         }
 
         assert!(engine.inspect_command("https://example.test/list", Some(0)).is_err());
-        assert!(engine.download_command("https://example.test/list", Some(-2)).is_err());
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/list",
+                    Some(-2),
+                    DownloadMode::Video,
+                    AudioFormat::Original,
+                    AudioQuality::Best,
+                )
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_command_selects_original_source_or_structured_ffmpeg_conversion() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        std::fs::write(&dependencies.ffmpeg, b"test executable placeholder").unwrap();
+        std::fs::write(&dependencies.ffprobe, b"test executable placeholder").unwrap();
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        let args = |mode, format, quality| {
+            engine
+                .download_command("https://example.test/audio", None, mode, format, quality)
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let original = args(DownloadMode::AudioOnly, AudioFormat::Original, AudioQuality::K192);
+        let original_format = original.iter().position(|arg| arg == "--format").unwrap();
+        assert_eq!(original.get(original_format + 1).map(String::as_str), Some("bestaudio"));
+        assert!(!original.iter().any(|arg| arg == "--extract-audio"));
+        assert!(!original.iter().any(|arg| arg == "--audio-format"));
+        assert!(!original.iter().any(|arg| arg == "--audio-quality"));
+
+        for (format, yt_dlp_format) in [
+            (AudioFormat::Mp3, "mp3"),
+            (AudioFormat::M4a, "m4a"),
+            (AudioFormat::Opus, "opus"),
+            (AudioFormat::Aac, "aac"),
+            (AudioFormat::Alac, "alac"),
+            (AudioFormat::Flac, "flac"),
+            (AudioFormat::Vorbis, "vorbis"),
+            (AudioFormat::Wav, "wav"),
+        ] {
+            let converted = args(DownloadMode::AudioOnly, format, AudioQuality::K192);
+            assert!(converted.iter().any(|arg| arg == "--extract-audio"));
+            let format_flag = converted.iter().position(|arg| arg == "--audio-format").unwrap();
+            assert_eq!(converted.get(format_flag + 1).map(String::as_str), Some(yt_dlp_format));
+            if format.supports_quality_setting() {
+                let quality_flag =
+                    converted.iter().position(|arg| arg == "--audio-quality").unwrap();
+                assert_eq!(converted.get(quality_flag + 1).map(String::as_str), Some("192K"));
+            } else {
+                assert!(!converted.iter().any(|arg| arg == "--audio-quality"));
+            }
+        }
+
+        let video = args(DownloadMode::Video, AudioFormat::Mp3, AudioQuality::K192);
+        let video_format = video.iter().position(|arg| arg == "--format").unwrap();
+        assert_eq!(video.get(video_format + 1).map(String::as_str), Some("bv*+ba/b"));
+        assert!(!video.iter().any(|arg| arg == "--extract-audio"));
+        assert!(!video.iter().any(|arg| arg == "--audio-quality"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn converted_lossy_audio_passes_best_and_bitrate_qualities_as_separate_arguments() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        std::fs::write(&dependencies.ffmpeg, b"test executable placeholder").unwrap();
+        std::fs::write(&dependencies.ffprobe, b"test executable placeholder").unwrap();
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        for (quality, expected) in [
+            (AudioQuality::Best, "0"),
+            (AudioQuality::K320, "320K"),
+            (AudioQuality::K192, "192K"),
+            (AudioQuality::K128, "128K"),
+        ] {
+            let arguments = engine
+                .download_command(
+                    "https://example.test/audio",
+                    None,
+                    DownloadMode::AudioOnly,
+                    AudioFormat::Mp3,
+                    quality,
+                )
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let quality_flag = arguments.iter().position(|arg| arg == "--audio-quality").unwrap();
+            assert_eq!(arguments.get(quality_flag + 1).map(String::as_str), Some(expected));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_conversion_reports_missing_ffmpeg_and_ffprobe_before_spawn() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/audio",
+                    None,
+                    DownloadMode::AudioOnly,
+                    AudioFormat::Original,
+                    AudioQuality::Best,
+                )
+                .is_ok()
+        );
+        let error = match engine.download_command(
+            "https://example.test/audio",
+            None,
+            DownloadMode::AudioOnly,
+            AudioFormat::Mp3,
+            AudioQuality::Best,
+        ) {
+            Ok(_) => panic!("conversion should reject missing bundled FFmpeg tools"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires the bundled FFmpeg and FFprobe"));
+        assert!(error.to_string().contains("FFmpeg and FFprobe are missing"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -634,5 +851,14 @@ mod tests {
             readable_error("ERROR: Unsupported URL: https://example.test/x"),
             "yt-dlp does not currently support this URL."
         );
+    }
+
+    #[test]
+    fn unavailable_ffmpeg_errors_are_not_reported_as_missing_media() {
+        let error = readable_error(
+            "ERROR: Postprocessing: ffmpeg not found. Please install or provide the path using --ffmpeg-location",
+        );
+        assert!(error.contains("Media processing needs the bundled FFmpeg and FFprobe"));
+        assert!(!error.contains("media was not found"));
     }
 }

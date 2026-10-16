@@ -140,6 +140,58 @@ impl Store {
         .context("join database write")?
     }
 
+    /// Atomically moves a failed or interrupted record back to the queue and returns its state.
+    /// The conditional update prevents a stale or duplicate UI action from starting a second retry.
+    pub async fn retry_download(
+        &self,
+        id: &str,
+        updated_at: i64,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status IN ('Failed', 'Interrupted')",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                if affected == 0 {
+                    return Ok(None);
+                }
+
+                let mut statement = connection.prepare(
+                    "SELECT id, url, title, source, status, progress, downloaded_bytes,
+                            total_bytes, speed_bytes_per_second, eta_seconds, output_path,
+                            error, created_at, updated_at
+                     FROM downloads WHERE id = :id",
+                )?;
+                let record = statement.query_row(named_params! { ":id": id }, |row| {
+                    Ok(DownloadRecord {
+                        id: row.get(0)?,
+                        url: row.get(1)?,
+                        title: row.get(2)?,
+                        source: row.get(3)?,
+                        status: row.get(4)?,
+                        progress: row.get(5)?,
+                        downloaded_bytes: optional_u64(row, 6)?,
+                        total_bytes: optional_u64(row, 7)?,
+                        speed_bytes_per_second: row.get(8)?,
+                        eta_seconds: optional_u64(row, 9)?,
+                        output_path: row.get(10)?,
+                        error: row.get(11)?,
+                        created_at: row.get(12)?,
+                        updated_at: row.get(13)?,
+                    })
+                })?;
+                Ok(Some(record))
+            })
+        })
+        .await
+        .context("join database write")?
+    }
+
     fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let connection = Connection::open(&self.path)
             .with_context(|| format!("open application database {}", self.path.display()))?;
@@ -327,6 +379,42 @@ mod tests {
             ]
         );
         assert!(completed_path.exists());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_download_only_requeues_failed_or_interrupted_rows_once() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut failed = DownloadRecord::queued(
+            "failed".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        failed.status = "Failed".to_owned();
+        failed.progress = 34.5;
+        failed.downloaded_bytes = Some(345);
+        failed.total_bytes = Some(1_000);
+        failed.error = Some("temporary network error".to_owned());
+        store.save_download(failed).await.unwrap();
+
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/queued".to_owned(),
+            11,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let retried = store.retry_download("failed", 20).await.unwrap().unwrap();
+        assert_eq!(retried.status, "Queued");
+        assert_eq!(retried.error, None);
+        assert_eq!(retried.progress, 34.5);
+        assert_eq!(retried.downloaded_bytes, Some(345));
+        assert_eq!(retried.total_bytes, Some(1_000));
+        assert_eq!(retried.updated_at, 20);
+        assert!(store.retry_download("failed", 21).await.unwrap().is_none());
+        assert!(store.retry_download("queued", 22).await.unwrap().is_none());
+
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

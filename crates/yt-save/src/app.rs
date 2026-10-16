@@ -130,13 +130,14 @@ pub fn run() -> Result<()> {
     let queue_engine = engine.clone();
     let queue_events = events_tx.clone();
     let queue_slots = Arc::new(Semaphore::new(1));
+    let enqueue_slots = queue_slots.clone();
     let queue_handle = handle.clone();
     let pending = runtime.block_on(recover_pending(&store))?;
     for record in pending {
         let store = store.clone();
         let engine = engine.clone();
         let events = events_tx.clone();
-        let slots = queue_slots.clone();
+        let slots = enqueue_slots.clone();
         handle.spawn(run_download_job(record, store, engine, events, slots));
     }
     let _ = events_tx.send(UiEvent::Refresh);
@@ -153,7 +154,7 @@ pub fn run() -> Result<()> {
         let store = queue_store.clone();
         let engine = queue_engine.clone();
         let events = queue_events.clone();
-        let slots = queue_slots.clone();
+        let slots = enqueue_slots.clone();
         queue_handle.spawn(async move {
             if let Err(error) = store.save_download(record.clone()).await {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
@@ -162,6 +163,39 @@ pub fn run() -> Result<()> {
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status("Added to the download queue.".to_owned()));
             run_download_job(record, store, engine, events, slots).await;
+        });
+    });
+
+    let retry_store = store.clone();
+    let retry_engine = engine.clone();
+    let retry_events = events_tx.clone();
+    let retry_slots = queue_slots.clone();
+    let retry_handle = handle.clone();
+    window.on_retry_download_requested(move |id| {
+        let id = id.to_string();
+        let store = retry_store.clone();
+        let engine = retry_engine.clone();
+        let events = retry_events.clone();
+        let slots = retry_slots.clone();
+        retry_handle.spawn(async move {
+            match store.retry_download(&id, now()).await {
+                Ok(Some(record)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "Retry queued. yt-dlp will continue a compatible partial file.".to_owned(),
+                    ));
+                    run_download_job(record, store, engine, events, slots).await;
+                }
+                Ok(None) => {
+                    let _ = events.send(UiEvent::Status(
+                        "Only failed or interrupted downloads can be retried.".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "queue download retry");
+                    let _ = events.send(UiEvent::Status(format!("Could not queue retry: {error}")));
+                }
+            }
         });
     });
 

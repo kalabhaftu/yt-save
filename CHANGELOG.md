@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — Retry failed downloads
+
+- Added a retry action for failed jobs. A conditional SQLite update rejects duplicate/stale retry actions and preserves partial-file progress for yt-dlp continuation.
+- Updated the feature matrix and limitations to distinguish working retry and history cleanup from pause, cancellation, and reordering, which remain unfinished.
+
 ## 0.1.1 — Queue cleanup and release workflow fix
 
 - Added safe history removal for finished queue records and bulk clearing for completed records; downloaded files stay in place.

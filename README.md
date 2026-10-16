@@ -72,7 +72,7 @@ Cargo and GitHub Actions updates are configured in Dependabot. External binaries
 
 ## Known limitations
 
-- The queue is single-worker and currently has no interactive pause, retry, cancellation, or reordering controls. Finished rows can be removed from history, or completed rows cleared in bulk; these actions leave downloaded files in place. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
+- The queue is single-worker and currently has no interactive pause, cancellation, or reordering controls. Failed items can be retried; finished rows can be removed from history, or completed rows cleared in bulk. These history actions leave downloaded files in place. Queued and interrupted items are automatically resumed on the next app launch; yt-dlp's `--continue` option resumes available partial files.
 - Playlist URLs are handed to yt-dlp as one job; playlist preview, entry selection, dedicated playlist folders, and sync subscriptions are not implemented.
 - There is no system tray, clipboard monitor, notification popup, scheduler, media library, or subtitle/conversion settings screen yet.
 - Full YouTube support requires the bundled Deno runtime. The official yt-dlp executable already contains `yt-dlp-ejs`.

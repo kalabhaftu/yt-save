@@ -1,0 +1,30 @@
+[package]
+name = "yt-save"
+description = "Native Windows desktop media downloader powered by yt-dlp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+directories.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slint.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+slint-build = "1.18.1"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

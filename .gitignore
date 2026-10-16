@@ -1,0 +1,32 @@
+# Local master brief supplied for this task; keep it available in the workspace.
+/prompt.txt
+
+# Rust build outputs and locally acquired binary dependencies.
+/target/
+/dist/
+/dependencies/
+/artifacts/
+*.pdb
+*.msi
+*.wixpdb
+*.exe
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local application data and logs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+.env
+.env.*
+!.env.example
+
+# IDE and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

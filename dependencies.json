@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "target": "windows-x86_64",
+  "components": [
+    {
+      "id": "yt-dlp",
+      "version": "2026.08.19",
+      "asset": "yt-dlp.exe",
+      "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+      "sha256": "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
+      "architecture": "x86_64",
+      "license": "GPL-3.0-or-later; embedded yt-dlp-ejs is Unlicense with MIT/ISC notices",
+      "license_url": "https://github.com/yt-dlp/yt-dlp#licensing",
+      "update_policy": "Only change the pinned release after checksum and release-note review. The official Windows executable includes yt-dlp-ejs.",
+      "extract": "copy"
+    },
+    {
+      "id": "deno",
+      "version": "2.9.7",
+      "asset": "deno-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip",
+      "sha256": "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238",
+      "architecture": "x86_64",
+      "license": "MIT and bundled dependency licenses",
+      "license_url": "https://github.com/denoland/deno",
+      "update_policy": "Pin an official Deno release archive, verify SHA-256, and update with the yt-dlp runtime compatibility floor checked.",
+      "extract": "deno"
+    },
+    {
+      "id": "ffmpeg",
+      "version": "8.1 (BtbN n8.1 LGPL shared build)",
+      "asset": "ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
+      "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/643944121",
+      "accept": "application/octet-stream",
+      "sha256": "66bfa3595d633afadf22be4ff5385cbdae8998006e61755e01333491e595b178",
+      "architecture": "x86_64",
+      "license": "LGPL-2.1-or-later build variant; retain upstream notices and shared libraries",
+      "license_url": "https://ffmpeg.org/legal.html",
+      "build_source": "https://github.com/BtbN/FFmpeg-Builds",
+      "update_policy": "Pin the immutable GitHub release asset ID and digest, inspect the build configuration and license files, then refresh bundled DLLs and notices together.",
+      "extract": "ffmpeg"
+    }
+  ]
+}

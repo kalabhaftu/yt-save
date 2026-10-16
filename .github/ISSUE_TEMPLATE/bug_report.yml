@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem in Yt Save.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Include steps to reproduce and avoid sharing private or access-controlled media URLs.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the action and the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant error or log
+      description: Remove URLs, usernames, tokens, and other private information.
+    validations:
+      required: false

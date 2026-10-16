@@ -1,0 +1,343 @@
+struct DownloadRowData {
+    id: string,
+    title: string,
+    source: string,
+    status: string,
+    progress: float,
+    detail: string,
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    callback clicked();
+
+    height: 42px;
+    min-width: 112px;
+    border-radius: 10px;
+    background: primary ? #7968ff : #232638;
+    border-width: primary ? 0px : 1px;
+    border-color: #34384d;
+
+    Text {
+        text: label;
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component MainWindow inherits Window {
+    in property <string> product-name: "Yt Save";
+    in property <string> app-version: "0.1.0";
+    title: root.product-name;
+    preferred-width: 1180px;
+    preferred-height: 800px;
+    min-width: 800px;
+    min-height: 620px;
+    background: #0c0e15;
+
+    in-out property <string> url-input: "";
+    in-out property <string> status-message: "Paste a media URL to get started.";
+    in-out property <string> dependency-status: "Checking bundled tools…";
+    in-out property <string> analyzed-title: "";
+    in-out property <string> analyzed-details: "";
+    in property <[DownloadRowData]> downloads: [];
+
+    callback analyze-requested(string);
+    callback enqueue-requested(string);
+    callback open-download-folder();
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 68px;
+            background: #11141f;
+            border-color: #202436;
+            border-width: 0px;
+
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                spacing: 12px;
+
+                Image {
+                    source: @image-url("../../../assets/yt-save.png");
+                    width: 34px;
+                    height: 34px;
+                    image-fit: contain;
+                }
+                Text {
+                    text: root.product-name;
+                    color: #f3f4fa;
+                    font-size: 20px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Text {
+                    text: "DOWNLOAD MANAGER";
+                    color: #777f99;
+                    font-size: 11px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    width: 1px;
+                    height: 22px;
+                    background: #292e40;
+                }
+                Text {
+                    text: "Windows desktop";
+                    color: #8d95ac;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 0px;
+
+            Rectangle {
+                width: 220px;
+                background: #10131d;
+                border-color: #202436;
+                border-width: 0px;
+
+                VerticalLayout {
+                    padding-top: 18px;
+                    padding-bottom: 18px;
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "WORKSPACE";
+                        color: #6e7690;
+                        font-size: 10px;
+                        font-weight: 700;
+                        height: 30px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        height: 42px;
+                        border-radius: 9px;
+                        background: #23243a;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 10px;
+                            Text { text: "↓"; color: #a79aff; font-size: 18px; vertical-alignment: center; }
+                            Text { text: "Downloads"; color: #f4f2ff; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    Rectangle {
+                        border-radius: 12px;
+                        background: #171b28;
+                        border-width: 1px;
+                        border-color: #282d40;
+                        height: 116px;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 5px;
+                            Text { text: "ENGINE STATUS"; color: #737b94; font-size: 10px; font-weight: 700; }
+                            Text {
+                                text: root.dependency-status;
+                                color: #aab2c8;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                                vertical-stretch: 1;
+                            }
+                        }
+                    }
+                    Text {
+                        text: "VERSION " + root.app-version;
+                        color: #626a82;
+                        font-size: 10px;
+                        height: 28px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle {
+                background: #0c0e15;
+                VerticalLayout {
+                    padding-top: 30px;
+                    padding-bottom: 30px;
+                    padding-left: 36px;
+                    padding-right: 36px;
+                    spacing: 20px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "Downloads"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
+                            Text { text: "Save media from sites supported by yt-dlp."; color: #8c94aa; font-size: 13px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton {
+                            label: "Open folder";
+                            clicked => { root.open-download-folder(); }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 160px;
+                        background: #151925;
+                        border-width: 1px;
+                        border-color: #2a3043;
+                        border-radius: 14px;
+
+                        VerticalLayout {
+                            padding: 18px;
+                            spacing: 12px;
+                            Text { text: "New download"; color: #eff0f7; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Rectangle {
+                                    border-radius: 9px;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    horizontal-stretch: 1;
+                                    TextInput {
+                                        text <=> root.url-input;
+                                        x: 12px;
+                                        width: parent.width - 24px;
+                                        height: parent.height;
+                                        accessible-placeholder-text: "Paste a video, audio, playlist, or other supported media URL";
+                                        color: #ecedf4;
+                                        font-size: 13px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                        accepted => { root.enqueue-requested(root.url-input); }
+                                    }
+                                    if root.url-input == "" : Text {
+                                        x: 12px;
+                                        width: parent.width - 24px;
+                                        height: parent.height;
+                                        text: "Paste a video, audio, playlist, or other supported media URL";
+                                        color: #727b92;
+                                        font-size: 13px;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                ActionButton {
+                                    label: "Analyze";
+                                    clicked => { root.analyze-requested(root.url-input); }
+                                }
+                                ActionButton {
+                                    label: "Add to queue";
+                                    primary: true;
+                                    clicked => { root.enqueue-requested(root.url-input); }
+                                }
+                            }
+                            Text { text: root.status-message; color: #99a2ba; font-size: 12px; }
+                        }
+                    }
+
+                    if root.analyzed-title != "" : Rectangle {
+                        height: 92px;
+                        background: #121722;
+                        border-width: 1px;
+                        border-color: #2a3041;
+                        border-radius: 12px;
+                        VerticalLayout {
+                            padding-top: 14px;
+                            padding-bottom: 14px;
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 6px;
+                            Text { text: root.analyzed-title; color: #e9ebf4; font-size: 14px; font-weight: 600; }
+                            Text { text: root.analyzed-details; color: #8c95ad; font-size: 12px; }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        height: 28px;
+                        Text { text: "Queue"; color: #e9eaf1; font-size: 16px; font-weight: 600; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: "Saved across restarts"; color: #747d96; font-size: 11px; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        background: #10131c;
+                        border-width: 1px;
+                        border-color: #252a3a;
+                        border-radius: 13px;
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 0px;
+                            if root.downloads.length == 0 : VerticalLayout {
+                                vertical-stretch: 1;
+                                alignment: center;
+                                spacing: 8px;
+                                Text { text: "Your queue is clear"; color: #d9dce7; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
+                                Text { text: "Paste a URL above to add a download."; color: #778099; font-size: 12px; horizontal-alignment: center; }
+                            }
+                            for row in root.downloads: Rectangle {
+                                height: 76px;
+                                background: #10131c;
+                                border-color: #202536;
+                                border-width: 0px;
+                                HorizontalLayout {
+                                    padding-top: 11px;
+                                    padding-bottom: 11px;
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 12px;
+                                    Rectangle {
+                                        width: 42px;
+                                        height: 42px;
+                                        border-radius: 10px;
+                                        background: #22263a;
+                                        Text { text: "▶"; color: #aaa0ff; font-size: 15px; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 3px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text { text: row.title; color: #e4e6ef; font-size: 13px; font-weight: 600; overflow: elide; horizontal-stretch: 1; }
+                                            Text { text: row.status; color: row.status == "Completed" ? #74d6ae : #9aa2b8; font-size: 11px; }
+                                        }
+                                        Rectangle {
+                                            height: 4px;
+                                            border-radius: 2px;
+                                            background: #282d3c;
+                                            Rectangle {
+                                                width: parent.width * row.progress / 100;
+                                                height: parent.height;
+                                                border-radius: 2px;
+                                                background: #8778ff;
+                                            }
+                                        }
+                                        Text { text: row.detail; color: #757e97; font-size: 10px; overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

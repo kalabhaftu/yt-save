@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="$(var.ProductName)"
+    Manufacturer="$(var.Publisher)"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="$(var.UpgradeCode)"
+    Scope="perMachine"
+    InstallerVersion="500">
+    <Property Id="INNO_INSTALLATION_FOUND">
+      <RegistrySearch
+        Id="InnoSetupInstallMarker"
+        Root="HKLM"
+        Key="Software\$(var.BundleIdentifier)"
+        Name="InstalledByInno"
+        Type="raw"
+        Bitness="always64" />
+    </Property>
+    <Launch
+      Condition="NOT INNO_INSTALLATION_FOUND"
+      Message="Uninstall the Inno Setup installation of Yt Save before installing the MSI package." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="ApplicationIcon" SourceFile="$(var.ProjectDir)\assets\yt-save.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ApplicationIcon" />
+    <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
+      <ComponentGroupRef Id="CoreFiles" />
+      <ComponentGroupRef Id="RuntimeDependencies" />
+      <ComponentGroupRef Id="LicenseFiles" />
+      <ComponentGroupRef Id="StartMenuShortcuts" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)">
+        <Directory Id="BinFolder" Name="bin" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="$(var.ProductName)" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="CoreFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*" Bitness="always64">
+          <File Id="YtSaveExe" Source="$(var.StageDir)\$(var.ExecutableName)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="RuntimeDependencies" Directory="BinFolder">
+      <Files Include="$(var.StageDir)\bin\**" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="LicenseFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.StageDir)\LICENSE" />
+      <Files Include="$(var.StageDir)\THIRD_PARTY_NOTICES.md" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="StartMenuShortcuts" Directory="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="*" Bitness="always64">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="$(var.ProductName)"
+          Target="[#YtSaveExe]"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\$(var.BundleIdentifier)"
+          Name="InstalledByMSI"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

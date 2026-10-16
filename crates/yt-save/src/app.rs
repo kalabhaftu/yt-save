@@ -1415,13 +1415,9 @@ fn main_window_has_focus(window: &MainWindow) -> bool {
 #[cfg(windows)]
 fn set_window_no_activate(window: &slint::winit_030::winit::window::Window) -> bool {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::{
-        Foundation::HWND,
-        UI::WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW,
-        },
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
 
     let Ok(handle) = window.window_handle() else {
@@ -1430,7 +1426,7 @@ fn set_window_no_activate(window: &slint::winit_030::winit::window::Window) -> b
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         return false;
     };
-    let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+    let hwnd = handle.hwnd.get() as *mut std::ffi::c_void;
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let required_style = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;

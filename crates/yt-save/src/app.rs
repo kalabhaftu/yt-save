@@ -33,6 +33,7 @@ use crate::{
 
 enum UiEvent {
     Refresh,
+    FilterHistory(String),
     Status(String),
     ClipboardCandidate { generation: u64, candidate: ClipboardCandidate },
     DependencyStatus(String),
@@ -185,6 +186,7 @@ pub fn run() -> Result<()> {
     tray.set_tray_tooltip(tray_tooltip(saved_active_count, saved_paused_count).into());
     let saved_rows = row_views(&saved_downloads);
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
+    let event_initial_records = saved_downloads;
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UiEvent>();
     let clipboard_monitor_slot = Arc::new(Mutex::new(None::<ClipboardMonitor>));
@@ -205,18 +207,23 @@ pub fn run() -> Result<()> {
     let event_popup_work_area = clipboard_popup_work_area.clone();
     runtime.spawn(async move {
         let mut latest_analysis_id = 0;
+        let mut history_search = String::new();
+        let mut cached_downloads = event_initial_records;
         while let Some(event) = events_rx.recv().await {
             match event {
                 UiEvent::Refresh => match event_store.list_downloads().await {
                     Ok(records) => {
-                        let active_count = records
+                        cached_downloads = records;
+                        let active_count = cached_downloads
                             .iter()
                             .filter(|record| is_active_status(&record.status))
                             .count();
-                        let paused_count =
-                            records.iter().filter(|record| record.status == "Paused").count();
-                        let rows = row_views(&records);
-                        let summary = queue_summary_text(&records);
+                        let paused_count = cached_downloads
+                            .iter()
+                            .filter(|record| record.status == "Paused")
+                            .count();
+                        let rows = row_views_filtered(&cached_downloads, &history_search);
+                        let summary = queue_summary_text(&cached_downloads);
                         let weak = weak_window.clone();
                         let weak_tray = weak_tray.clone();
                         let tooltip = tray_tooltip(active_count, paused_count);
@@ -234,6 +241,16 @@ pub fn run() -> Result<()> {
                     }
                     Err(error) => error!(%error, "refresh download list"),
                 },
+                UiEvent::FilterHistory(query) => {
+                    history_search = query;
+                    let rows = row_views_filtered(&cached_downloads, &history_search);
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_downloads(ModelRc::new(VecModel::from(rows)));
+                        }
+                    });
+                }
                 UiEvent::Status(message) => {
                     let weak = weak_window.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -570,6 +587,11 @@ pub fn run() -> Result<()> {
         dispatcher_shutdown_started,
     ));
     let _ = events_tx.send(UiEvent::Refresh);
+
+    let history_search_events = events_tx.clone();
+    window.on_history_search_requested(move |query| {
+        let _ = history_search_events.send(UiEvent::FilterHistory(query.to_string()));
+    });
 
     window.on_enqueue_requested(move |submitted_url| {
         if enqueue_shutdown_started.load(Ordering::Acquire) {
@@ -2606,10 +2628,15 @@ fn validate_url(value: &str) -> std::result::Result<String, String> {
 }
 
 fn row_views(records: &[DownloadRecord]) -> Vec<DownloadRowData> {
+    row_views_filtered(records, "")
+}
+
+fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRowData> {
+    let query = query.trim().to_lowercase();
     let mut position = 0usize;
     records
         .iter()
-        .map(|record| {
+        .filter_map(|record| {
             let queue_position = if record.status == "Queued" {
                 position += 1;
                 format!("#{}", position)
@@ -2618,7 +2645,22 @@ fn row_views(records: &[DownloadRecord]) -> Vec<DownloadRowData> {
             } else {
                 String::new()
             };
-            row_view_with_queue_position(record, &queue_position)
+            let matches_query = query.is_empty()
+                || [
+                    record.title.as_str(),
+                    record.source.as_str(),
+                    record.url.as_str(),
+                    record.status.as_str(),
+                    record.output_path.as_deref().unwrap_or_default(),
+                    record.error.as_deref().unwrap_or_default(),
+                    record.download_mode.as_database_value(),
+                    record.audio_format.as_database_value(),
+                    record.audio_quality.as_database_value(),
+                    record.video_quality.as_database_value(),
+                ]
+                .iter()
+                .any(|value| value.to_lowercase().contains(&query));
+            matches_query.then(|| row_view_with_queue_position(record, &queue_position))
         })
         .collect()
 }
@@ -2691,6 +2733,7 @@ fn row_view_with_queue_position(record: &DownloadRecord, queue_position: &str) -
         id: SharedString::from(record.id.as_str()),
         title: SharedString::from(record.title.as_str()),
         source: SharedString::from(record.source.as_str()),
+        url: SharedString::from(record.url.as_str()),
         status: SharedString::from(record.status.as_str()),
         progress: record.progress,
         detail: SharedString::from(details),
@@ -2962,6 +3005,27 @@ mod tests {
             "2 queued · 1 paused · 800.0 B known; 2 sizes unknown"
         );
         assert_eq!(queue_summary_text(&[]), "No pending work");
+    }
+
+    #[test]
+    fn history_search_is_case_insensitive_and_preserves_full_queue_positions() {
+        let first =
+            DownloadRecord::queued("first".to_owned(), "https://example.test/first".to_owned(), 10);
+        let mut second = DownloadRecord::queued(
+            "second".to_owned(),
+            "https://media.example.test/featured".to_owned(),
+            11,
+        );
+        second.title = "Featured clip".to_owned();
+        second.source = "Example Site".to_owned();
+
+        let rows = row_views_filtered(&[first, second], "MEDIA.EXAMPLE.TEST");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_str(), "second");
+        assert_eq!(rows[0].url.as_str(), "https://media.example.test/featured");
+        assert_eq!(rows[0].queue_position.as_str(), "#2");
+        assert!(row_views_filtered(&[], "no match").is_empty());
     }
 
     #[test]

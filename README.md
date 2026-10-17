@@ -17,6 +17,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Reads media metadata and available format counts through yt-dlp JSON output.
 - Previews up to the first 50 playlist entries. Entries are selectable only when yt-dlp returns a positive playlist index; selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
 - Persists queued items, progress, completion, and failure records in SQLite.
+- Searches visible queue and history rows locally by title, source, URL, status, format, output path, or error text.
 - Exports the saved history as UTF-8 CSV with queue, media, progress, output, error, and timestamp fields; the Windows Save dialog asks before replacing an existing file.
 - Shows queue positions and an aggregate remaining-size estimate when yt-dlp has reported sizes; lets users move queued or paused items up, down, to the top, or to the bottom within their priority group, and supports a High priority flag. One dispatcher starts work in that persisted order, up to the saved parallel-download limit of 1–8; lowering the limit leaves active downloads running and delays new starts until capacity is available. Users can also save a 1–8 per-download fragment limit for yt-dlp HLS/DASH transfers.
 - Offers Video and Audio only queue choices. Audio can keep its best available source stream in Original format or convert to MP3, M4A, Opus, AAC, ALAC, FLAC, Vorbis, or WAV. Lossy conversions offer Best quality or target 320, 192, and 128 kbps settings and use the bundled FFmpeg tools.

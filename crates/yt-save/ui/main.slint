@@ -4,6 +4,7 @@ struct DownloadRowData {
     id: string,
     title: string,
     source: string,
+    url: string,
     status: string,
     progress: float,
     detail: string,
@@ -71,6 +72,7 @@ export component MainWindow inherits Window {
     in-out property <string> queue-summary: "No pending work";
     in-out property <string> max-concurrent-downloads: "1";
     in-out property <string> concurrent-fragments: "1";
+    in-out property <string> history-search: "";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
     in-out property <bool> close-to-tray-enabled: false;
@@ -97,6 +99,7 @@ export component MainWindow inherits Window {
     callback choose-download-directory-requested();
     callback clear-completed-requested();
     callback export-history-requested();
+    callback history-search-requested(string);
     callback cancel-download-requested(string);
     callback pause-download-requested(string);
     callback resume-download-requested(string);
@@ -120,6 +123,10 @@ export component MainWindow inherits Window {
 
     changed concurrent-fragments => {
         root.concurrent-fragments-requested(root.concurrent-fragments);
+    }
+
+    changed history-search => {
+        root.history-search-requested(root.history-search);
     }
 
     VerticalLayout {
@@ -682,7 +689,7 @@ export component MainWindow inherits Window {
                     }
 
                     VerticalLayout {
-                        height: 78px;
+                        height: 112px;
                         spacing: 4px;
                         HorizontalLayout {
                             height: 36px;
@@ -716,6 +723,38 @@ export component MainWindow inherits Window {
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }
+                        HorizontalLayout {
+                            height: 32px;
+                            Text { text: "Search"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                            Rectangle {
+                                border-radius: 8px;
+                                background: #0e111a;
+                                border-width: 1px;
+                                border-color: #343a4e;
+                                horizontal-stretch: 1;
+                                TextInput {
+                                    text <=> root.history-search;
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: parent.height;
+                                    accessible-placeholder-text: "Search title, site, URL, status, or file path";
+                                    color: #ecedf4;
+                                    font-size: 12px;
+                                    selection-background-color: #5751a3;
+                                    vertical-alignment: center;
+                                }
+                                if root.history-search == "" : Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: parent.height;
+                                    text: "Search title, site, URL, status, or file path";
+                                    color: #727b92;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
 
                     Rectangle {
@@ -733,8 +772,8 @@ export component MainWindow inherits Window {
                                 vertical-stretch: 1;
                                 alignment: center;
                                 spacing: 8px;
-                                Text { text: "Your queue is clear"; color: #d9dce7; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
-                                Text { text: "Paste a URL above to add a download."; color: #778099; font-size: 12px; horizontal-alignment: center; }
+                                Text { text: root.history-search == "" ? "Your queue is clear" : "No matching downloads"; color: #d9dce7; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
+                                Text { text: root.history-search == "" ? "Paste a URL above to add a download." : "Try a title, site, URL, status, or file path."; color: #778099; font-size: 12px; horizontal-alignment: center; }
                             }
                             for row in root.downloads: Rectangle {
                                 height: 86px;

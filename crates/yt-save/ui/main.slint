@@ -8,6 +8,8 @@ struct DownloadRowData {
     progress: float,
     detail: string,
     output-path: string,
+    queue-position: string,
+    priority: int,
 }
 
 struct PlaylistEntryRowData {
@@ -66,6 +68,7 @@ export component MainWindow inherits Window {
     in-out property <string> video-quality: "Best";
     in-out property <string> download-directory: "";
     in-out property <string> status-message: "Paste a media URL to get started.";
+    in-out property <string> queue-summary: "No pending work";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
     in-out property <bool> close-to-tray-enabled: false;
@@ -96,6 +99,8 @@ export component MainWindow inherits Window {
     callback resume-download-requested(string);
     callback remove-download-requested(string);
     callback retry-download-requested(string);
+    callback queue-move-requested(string, string);
+    callback download-priority-requested(string, int);
     callback open-output-requested(string);
 
     changed minimized => {
@@ -671,7 +676,7 @@ export component MainWindow inherits Window {
                             label: "Clear completed";
                             clicked => { root.clear-completed-requested(); }
                         }
-                        Text { text: "Saved across restarts"; color: #747d96; font-size: 11px; vertical-alignment: center; }
+                        Text { text: root.queue-summary; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
                     }
 
                     Rectangle {
@@ -693,7 +698,7 @@ export component MainWindow inherits Window {
                                 Text { text: "Paste a URL above to add a download."; color: #778099; font-size: 12px; horizontal-alignment: center; }
                             }
                             for row in root.downloads: Rectangle {
-                                height: 76px;
+                                height: 86px;
                                 background: #10131c;
                                 border-color: #202536;
                                 border-width: 0px;
@@ -777,7 +782,24 @@ export component MainWindow inherits Window {
                                                 background: #8778ff;
                                             }
                                         }
-                                        Text { text: row.detail; color: #757e97; font-size: 10px; overflow: elide; }
+                                        HorizontalLayout {
+                                            spacing: 5px;
+                                            Text { text: row.detail; color: #757e97; font-size: 10px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                            if row.queue-position != "" : HorizontalLayout {
+                                                spacing: 4px;
+                                                Text { text: row.queue-position; color: #a9b0c4; font-size: 10px; vertical-alignment: center; }
+                                                ActionButton { label: "↑"; button-height: 22px; button-min-width: 24px; clicked => { root.queue-move-requested(row.id, "up"); } }
+                                                ActionButton { label: "↓"; button-height: 22px; button-min-width: 24px; clicked => { root.queue-move-requested(row.id, "down"); } }
+                                                ActionButton { label: "Top"; button-height: 22px; button-min-width: 36px; clicked => { root.queue-move-requested(row.id, "top"); } }
+                                                ActionButton { label: "Bottom"; button-height: 22px; button-min-width: 48px; clicked => { root.queue-move-requested(row.id, "bottom"); } }
+                                                ActionButton {
+                                                    label: row.priority == 1 ? "High" : "Normal";
+                                                    button-height: 22px;
+                                                    button-min-width: 52px;
+                                                    clicked => { root.download-priority-requested(row.id, row.priority == 1 ? 0 : 1); }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

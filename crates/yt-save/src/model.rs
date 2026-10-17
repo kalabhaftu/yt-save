@@ -368,8 +368,10 @@ fn playlist_index(value: &serde_json::Value) -> Option<i64> {
 pub struct DownloadRecord {
     pub id: String,
     pub url: String,
-    /// SQLite rowid assigned when this queue item was first inserted.
+    /// Persisted queue position; equal ranks are resolved by SQLite rowid.
     pub queue_order: i64,
+    /// A value of 1 runs ahead of normal priority (0) items.
+    pub priority: i32,
     pub playlist_index: Option<i64>,
     pub download_mode: DownloadMode,
     pub audio_format: AudioFormat,
@@ -397,6 +399,7 @@ impl DownloadRecord {
             id,
             url,
             queue_order: 0,
+            priority: 0,
             playlist_index: None,
             download_mode: DownloadMode::Video,
             audio_format: AudioFormat::Original,

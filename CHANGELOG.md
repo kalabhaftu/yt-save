@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Persist queue rank and High/Normal priority, and add move up/down/top/bottom controls for queued and paused items.
+- Replace competing per-item waiters with a single dispatcher that claims the next row in the current persisted order; save selected playlist entries as one atomic batch.
+- Add backward-compatible queue schema migration and coverage for rank migration, queue order, priority, reordering, and conditional claims. CI and Windows UI acceptance are pending.
+
 ## 0.1.14 — Clipboard popup and playlist confirmation
 
 - Add a default-off, non-activating Windows popup for copied HTTP(S) media links, positioned in the active monitor's work area and suppressed when Windows reports quiet time or full-screen/presentation activity.

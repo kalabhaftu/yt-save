@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Row, named_params, types::Type};
+use rusqlite::{
+    Connection, OptionalExtension, Row, TransactionBehavior, named_params, types::Type,
+};
 
 use crate::model::{
     AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, VideoQuality,
@@ -16,6 +18,14 @@ pub struct TrayPreferences {
 #[derive(Clone)]
 pub struct Store {
     path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
 }
 
 impl Store {
@@ -50,7 +60,9 @@ impl Store {
                     audio_format TEXT NOT NULL DEFAULT 'original',
                     audio_quality TEXT NOT NULL DEFAULT 'best',
                     video_quality TEXT NOT NULL DEFAULT 'best',
-                    download_directory TEXT NOT NULL DEFAULT ''
+                    download_directory TEXT NOT NULL DEFAULT '',
+                    queue_rank INTEGER NOT NULL DEFAULT 0,
+                    priority INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -90,6 +102,34 @@ impl Store {
                     ))?;
                 }
             }
+            let has_queue_rank = {
+                let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == "queue_rank")
+            };
+            if !has_queue_rank {
+                connection.execute_batch(
+                    "ALTER TABLE downloads ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0;
+                     UPDATE downloads SET queue_rank = rowid * 1024;",
+                )?;
+            }
+            let has_priority = {
+                let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|name| name == "priority")
+            };
+            if !has_priority {
+                connection.execute_batch(
+                    "ALTER TABLE downloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_queue
+                    ON downloads(status, priority DESC, queue_rank ASC);",
+            )?;
             Ok(())
         })?;
         Ok(store)
@@ -311,67 +351,194 @@ impl Store {
     }
 
     pub async fn save_download(&self, record: DownloadRecord) -> Result<()> {
-        let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
-        let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
-        let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
-                connection.execute(
-                    "INSERT INTO downloads (
-                        id, url, title, source, status, progress, downloaded_bytes,
-                        total_bytes, speed_bytes_per_second, eta_seconds, output_path,
-                        error, created_at, updated_at, playlist_index,
-                        download_mode, audio_format, audio_quality, video_quality,
-                        download_directory
-                    ) VALUES (
-                        :id, :url, :title, :source, :status, :progress, :downloaded,
-                        :total, :speed, :eta, :output, :error, :created, :updated,
-                        :playlist_index, :download_mode, :audio_format, :audio_quality,
-                        :video_quality, :download_directory
-                    ) ON CONFLICT(id) DO UPDATE SET
-                        url=excluded.url, title=excluded.title, source=excluded.source,
-                        status=excluded.status, progress=excluded.progress,
-                        downloaded_bytes=excluded.downloaded_bytes,
-                        total_bytes=excluded.total_bytes,
-                        speed_bytes_per_second=excluded.speed_bytes_per_second,
-                        eta_seconds=excluded.eta_seconds, output_path=excluded.output_path,
-                        error=excluded.error, updated_at=excluded.updated_at,
-                        playlist_index=excluded.playlist_index,
-                        download_mode=excluded.download_mode,
-                        audio_format=excluded.audio_format,
-                        audio_quality=excluded.audio_quality,
-                        video_quality=excluded.video_quality,
-                        download_directory=excluded.download_directory",
-                    named_params! {
-                        ":id": record.id,
-                        ":url": record.url,
-                        ":title": record.title,
-                        ":source": record.source,
-                        ":status": record.status,
-                        ":progress": record.progress,
-                        ":downloaded": downloaded_bytes,
-                        ":total": total_bytes,
-                        ":speed": record.speed_bytes_per_second,
-                        ":eta": eta_seconds,
-                        ":output": record.output_path,
-                        ":error": record.error,
-                        ":created": record.created_at,
-                        ":updated": record.updated_at,
-                        ":playlist_index": record.playlist_index,
-                        ":download_mode": record.download_mode.as_database_value(),
-                        ":audio_format": record.audio_format.as_database_value(),
-                        ":audio_quality": record.audio_quality.as_database_value(),
-                        ":video_quality": record.video_quality.as_database_value(),
-                        ":download_directory": record.download_directory,
-                    },
-                )?;
-                Ok(())
-            })
+            store.with_connection(|connection| save_download_record(connection, &record))
         })
         .await
         .context("join database write")??;
         Ok(())
+    }
+
+    /// Saves related queue rows in one write transaction so playlist batches stay contiguous.
+    pub async fn save_downloads(&self, records: Vec<DownloadRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                for record in &records {
+                    save_download_record(&transaction, record)?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join queue batch write")??;
+        Ok(())
+    }
+
+    pub async fn next_queued_download(&self) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let id = connection
+                    .query_row(
+                        "SELECT id FROM downloads WHERE status = 'Queued'
+                         ORDER BY priority DESC, queue_rank ASC, rowid ASC LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                match id {
+                    Some(id) => load_download_by_id(connection, &id),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .context("join queue read")?
+    }
+
+    /// Claims only if `id` is still first, so a concurrent reorder is honored before launch.
+    pub async fn claim_queued_download_if_next(
+        &self,
+        id: &str,
+        updated_at: i64,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let next_id = transaction
+                    .query_row(
+                        "SELECT id FROM downloads WHERE status = 'Queued'
+                         ORDER BY priority DESC, queue_rank ASC, rowid ASC LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if next_id.as_deref() != Some(id.as_str()) {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                let affected = transaction.execute(
+                    "UPDATE downloads SET status = 'Analyzing', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Queued'",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                let record =
+                    if affected == 1 { load_download_by_id(&transaction, &id)? } else { None };
+                transaction.commit()?;
+                Ok(record)
+            })
+        })
+        .await
+        .context("join queue claim")?
+    }
+
+    /// Moves a queued or paused item within its priority group.
+    pub async fn move_download(&self, id: &str, movement: QueueMove) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let selected = transaction
+                    .query_row(
+                        "SELECT priority FROM downloads WHERE id = :id AND status IN ('Queued', 'Paused')",
+                        named_params! { ":id": id },
+                        |row| row.get::<_, i32>(0),
+                    )
+                    .optional()?;
+                let Some(priority) = selected else {
+                    transaction.commit()?;
+                    return Ok(false);
+                };
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM downloads WHERE status IN ('Queued', 'Paused') AND priority = :priority
+                     ORDER BY queue_rank ASC, rowid ASC",
+                )?;
+                let rows = statement.query_map(named_params! { ":priority": priority }, |row| row.get::<_, String>(0))?;
+                let mut ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                let Some(index) = ids.iter().position(|item_id| item_id == &id) else {
+                    transaction.commit()?;
+                    return Ok(false);
+                };
+                let destination = match movement {
+                    QueueMove::Up => index.checked_sub(1),
+                    QueueMove::Down => (index + 1 < ids.len()).then_some(index + 1),
+                    QueueMove::Top => Some(0),
+                    QueueMove::Bottom => Some(ids.len().saturating_sub(1)),
+                };
+                let Some(destination) = destination else {
+                    transaction.commit()?;
+                    return Ok(false);
+                };
+                if destination != index {
+                    let moved = ids.remove(index);
+                    ids.insert(destination, moved);
+                    let base_rank = transaction.query_row(
+                        "SELECT coalesce(max(queue_rank), 0) FROM downloads WHERE priority = :priority",
+                        named_params! { ":priority": priority },
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    for (rank_index, item_id) in ids.iter().enumerate() {
+                        transaction.execute(
+                            "UPDATE downloads SET queue_rank = :rank WHERE id = :id AND status IN ('Queued', 'Paused')",
+                            named_params! {
+                                ":rank": base_rank + (rank_index as i64 + 1) * 1024,
+                                ":id": item_id,
+                            },
+                        )?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(destination != index)
+            })
+        })
+        .await
+        .context("join queue reorder")?
+    }
+
+    pub async fn set_download_priority(
+        &self,
+        id: &str,
+        priority: i32,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET priority = :priority, updated_at = :updated,
+                         queue_rank = coalesce((
+                             SELECT max(queue_rank) FROM downloads AS existing
+                             WHERE existing.priority = :priority
+                               AND existing.id <> downloads.id
+                         ), 0) + 1024
+                     WHERE id = :id AND status IN ('Queued', 'Paused')
+                       AND priority <> :priority",
+                    named_params! {
+                        ":priority": priority.clamp(0, 1),
+                        ":updated": updated_at,
+                        ":id": id,
+                    },
+                )?;
+                Ok(affected > 0)
+            })
+        })
+        .await
+        .context("join queue priority write")?
     }
 
     /// Removes a terminal download record from the database without touching its output file.
@@ -440,34 +607,6 @@ impl Store {
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
-            })
-        })
-        .await
-        .context("join database write")?
-    }
-
-    /// Claims a waiting job for its worker. Cancellation and claiming race through
-    /// conditional updates, so only one transition out of `Queued` can succeed.
-    pub async fn claim_queued_download(
-        &self,
-        id: &str,
-        updated_at: i64,
-    ) -> Result<Option<DownloadRecord>> {
-        let store = self.clone();
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
-                let affected = connection.execute(
-                    "UPDATE downloads
-                     SET status = 'Analyzing', error = NULL, updated_at = :updated
-                     WHERE id = :id AND status = 'Queued'",
-                    named_params! { ":id": id, ":updated": updated_at },
-                )?;
-                if affected == 0 {
-                    return Ok(None);
-                }
-
-                load_download_by_id(connection, &id)
             })
         })
         .await
@@ -779,7 +918,12 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Queued', error = NULL, updated_at = :updated
+                     SET status = 'Queued', error = NULL, updated_at = :updated,
+                         queue_rank = coalesce((
+                             SELECT max(queue_rank) FROM downloads AS existing
+                             WHERE existing.priority = downloads.priority
+                               AND existing.id <> downloads.id
+                         ), 0) + 1024
                      WHERE id = :id AND status IN ('Failed', 'Interrupted', 'Canceled')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
@@ -827,6 +971,76 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         operation(&connection)
     }
+
+    fn with_connection_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut connection = Connection::open(&self.path)
+            .with_context(|| format!("open application database {}", self.path.display()))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        operation(&mut connection)
+    }
+}
+
+fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Result<()> {
+    let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
+    let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
+    let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
+    connection.execute(
+        "INSERT INTO downloads (
+            id, url, title, source, status, progress, downloaded_bytes,
+            total_bytes, speed_bytes_per_second, eta_seconds, output_path,
+            error, created_at, updated_at, playlist_index,
+            download_mode, audio_format, audio_quality, video_quality,
+            download_directory, queue_rank, priority
+        ) VALUES (
+            :id, :url, :title, :source, :status, :progress, :downloaded,
+            :total, :speed, :eta, :output, :error, :created, :updated,
+            :playlist_index, :download_mode, :audio_format, :audio_quality,
+            :video_quality, :download_directory,
+            coalesce((SELECT max(queue_rank) FROM downloads
+                      WHERE priority = :priority), 0) + 1024,
+            :priority
+        ) ON CONFLICT(id) DO UPDATE SET
+            url=excluded.url, title=excluded.title, source=excluded.source,
+            status=excluded.status, progress=excluded.progress,
+            downloaded_bytes=excluded.downloaded_bytes,
+            total_bytes=excluded.total_bytes,
+            speed_bytes_per_second=excluded.speed_bytes_per_second,
+            eta_seconds=excluded.eta_seconds, output_path=excluded.output_path,
+            error=excluded.error, updated_at=excluded.updated_at,
+            playlist_index=excluded.playlist_index,
+            download_mode=excluded.download_mode,
+            audio_format=excluded.audio_format,
+            audio_quality=excluded.audio_quality,
+            video_quality=excluded.video_quality,
+            download_directory=excluded.download_directory",
+        named_params! {
+            ":id": record.id,
+            ":url": record.url,
+            ":title": record.title,
+            ":source": record.source,
+            ":status": record.status,
+            ":progress": record.progress,
+            ":downloaded": downloaded_bytes,
+            ":total": total_bytes,
+            ":speed": record.speed_bytes_per_second,
+            ":eta": eta_seconds,
+            ":output": record.output_path,
+            ":error": record.error,
+            ":created": record.created_at,
+            ":updated": record.updated_at,
+            ":playlist_index": record.playlist_index,
+            ":download_mode": record.download_mode.as_database_value(),
+            ":audio_format": record.audio_format.as_database_value(),
+            ":audio_quality": record.audio_quality.as_database_value(),
+            ":video_quality": record.video_quality.as_database_value(),
+            ":download_directory": record.download_directory,
+            ":priority": record.priority,
+        },
+    )?;
+    Ok(())
 }
 
 fn setting_value(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -845,8 +1059,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
-                download_mode, audio_format, audio_quality, video_quality, rowid,
-                download_directory
+                download_mode, audio_format, audio_quality, video_quality, queue_rank,
+                priority, download_directory
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -871,8 +1085,9 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 audio_format: audio_format_from_row(row, 16)?,
                 audio_quality: audio_quality_from_row(row, 17)?,
                 video_quality: video_quality_from_row(row, 18)?,
-                download_directory: row.get(20)?,
+                download_directory: row.get(21)?,
                 queue_order: row.get(19)?,
+                priority: row.get(20)?,
             })
         })
         .optional()?;
@@ -893,9 +1108,14 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
-                download_mode, audio_format, audio_quality, video_quality, rowid,
-                download_directory
-         FROM downloads ORDER BY created_at DESC, rowid DESC",
+                download_mode, audio_format, audio_quality, video_quality, queue_rank,
+                priority, download_directory
+         FROM downloads
+         ORDER BY CASE WHEN status IN ('Queued', 'Paused') THEN 0 ELSE 1 END,
+                  CASE WHEN status IN ('Queued', 'Paused') THEN priority ELSE 0 END DESC,
+                  CASE WHEN status IN ('Queued', 'Paused') THEN queue_rank ELSE 0 END ASC,
+                  CASE WHEN status IN ('Queued', 'Paused') THEN rowid ELSE 0 END ASC,
+                  created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(DownloadRecord {
@@ -918,8 +1138,9 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             audio_format: audio_format_from_row(row, 16)?,
             audio_quality: audio_quality_from_row(row, 17)?,
             video_quality: video_quality_from_row(row, 18)?,
-            download_directory: row.get(20)?,
+            download_directory: row.get(21)?,
             queue_order: row.get(19)?,
+            priority: row.get(20)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -1008,6 +1229,86 @@ mod tests {
         assert_eq!(rows[0].audio_format, AudioFormat::Opus);
         assert_eq!(rows[0].audio_quality, AudioQuality::K320);
         assert_eq!(rows[0].video_quality, VideoQuality::P2160);
+        assert!(rows[0].queue_order > 0);
+        assert_eq!(rows[0].priority, 0);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_rank_priority_reordering_and_claiming_share_one_order() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let records = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                DownloadRecord::queued(
+                    id.to_owned(),
+                    format!("https://example.test/{id}"),
+                    index as i64 + 10,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.save_downloads(records).await.unwrap();
+
+        let initial = store.list_downloads().await.unwrap();
+        assert_eq!(
+            initial.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(initial[1].queue_order - initial[0].queue_order, 1024);
+        assert_eq!(initial[2].queue_order - initial[1].queue_order, 1024);
+
+        assert!(store.move_download("third", QueueMove::Top).await.unwrap());
+        assert!(store.set_download_priority("first", 1, 19).await.unwrap());
+        assert!(store.set_download_priority("second", 1, 20).await.unwrap());
+        assert_eq!(store.next_queued_download().await.unwrap().unwrap().id, "first");
+        assert!(store.claim_queued_download_if_next("third", 21).await.unwrap().is_none());
+        assert_eq!(
+            store.claim_queued_download_if_next("first", 22).await.unwrap().unwrap().status,
+            "Analyzing"
+        );
+        assert_eq!(store.next_queued_download().await.unwrap().unwrap().id, "second");
+
+        let pending_ids = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.status == "Queued")
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(pending_ids, ["second", "third"]);
+        assert!(!store.move_download("first", QueueMove::Bottom).await.unwrap());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reordering_pending_rows_does_not_reuse_active_queue_ranks() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let first =
+            DownloadRecord::queued("first".to_owned(), "https://example.test/first".to_owned(), 10);
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/active".to_owned(),
+            11,
+        );
+        active.status = "Downloading".to_owned();
+        let second = DownloadRecord::queued(
+            "second".to_owned(),
+            "https://example.test/second".to_owned(),
+            12,
+        );
+        store.save_downloads(vec![first, active, second]).await.unwrap();
+
+        assert!(store.move_download("second", QueueMove::Top).await.unwrap());
+        let rows = store.list_downloads().await.unwrap();
+        let mut ranks = rows.iter().map(|record| record.queue_order).collect::<Vec<_>>();
+        ranks.sort_unstable();
+        assert!(ranks.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(store.next_queued_download().await.unwrap().unwrap().id, "second");
+        assert_eq!(rows.iter().find(|record| record.id == "active").unwrap().status, "Downloading");
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -1326,7 +1627,14 @@ mod tests {
                         created_at, updated_at
                     ) VALUES (
                         'legacy-job', 'https://example.test/list', 'Old row', 'Example',
-                        'Completed', 100, 10, 20
+                        'Queued', 0, 10, 20
+                    );
+                    INSERT INTO downloads (
+                        id, url, title, source, status, progress,
+                        created_at, updated_at
+                    ) VALUES (
+                        'legacy-job-later', 'https://example.test/other', 'Later row', 'Example',
+                        'Queued', 0, 5, 20
                     );",
                 )
                 .unwrap();
@@ -1339,8 +1647,16 @@ mod tests {
             legacy_default
         );
         store.backfill_legacy_download_directories(legacy_default.clone()).await.unwrap();
-        let legacy = store.list_downloads().await.unwrap().remove(0);
+        let rows = store.list_downloads().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            ["legacy-job", "legacy-job-later"]
+        );
+        assert_eq!(rows[1].queue_order, 2048);
+        let legacy = &rows[0];
         assert_eq!(legacy.id, "legacy-job");
+        assert_eq!(legacy.queue_order, 1024);
+        assert_eq!(legacy.priority, 0);
         assert_eq!(legacy.playlist_index, None);
         assert_eq!(legacy.download_mode, DownloadMode::Video);
         assert_eq!(legacy.audio_format, AudioFormat::Original);
@@ -1655,7 +1971,7 @@ mod tests {
 
         assert!(store.pause_queued_download("queued", 20).await.unwrap());
         assert!(!store.pause_queued_download("queued", 21).await.unwrap());
-        assert!(store.claim_queued_download("queued", 21).await.unwrap().is_none());
+        assert!(store.claim_queued_download_if_next("queued", 21).await.unwrap().is_none());
 
         let paused = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(paused.status, "Paused");
@@ -1679,7 +1995,7 @@ mod tests {
         assert_eq!(resumed.playlist_index, Some(4));
         assert!(store.resume_download("queued", 23).await.unwrap().is_none());
         assert_eq!(
-            store.claim_queued_download("queued", 24).await.unwrap().unwrap().status,
+            store.claim_queued_download_if_next("queued", 24).await.unwrap().unwrap().status,
             "Analyzing"
         );
 
@@ -1716,7 +2032,7 @@ mod tests {
 
         let (paused, claimed) = tokio::join!(
             store.pause_queued_download("queued", 20),
-            store.claim_queued_download("queued", 21),
+            store.claim_queued_download_if_next("queued", 21),
         );
         let paused = paused.unwrap();
         let claimed = claimed.unwrap();
@@ -1918,7 +2234,7 @@ mod tests {
 
         assert!(store.cancel_queued_download("queued", 20).await.unwrap());
         assert!(!store.cancel_queued_download("queued", 21).await.unwrap());
-        assert!(store.claim_queued_download("queued", 21).await.unwrap().is_none());
+        assert!(store.claim_queued_download_if_next("queued", 21).await.unwrap().is_none());
 
         let canceled = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(canceled.status, "Canceled");
@@ -1939,7 +2255,7 @@ mod tests {
 
         let (canceled, claimed) = tokio::join!(
             store.cancel_queued_download("queued", 20),
-            store.claim_queued_download("queued", 21),
+            store.claim_queued_download_if_next("queued", 21),
         );
         let canceled = canceled.unwrap();
         let claimed = claimed.unwrap();
@@ -1947,6 +2263,79 @@ mod tests {
 
         let persisted = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(persisted.status, if canceled { "Canceled" } else { "Analyzing" });
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_and_dispatcher_claim_have_one_winner() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        store.save_download(queued).await.unwrap();
+
+        let (canceled, claimed) = tokio::join!(
+            store.cancel_queued_download("queued", 20),
+            store.claim_queued_download_if_next("queued", 21),
+        );
+        let canceled = canceled.unwrap();
+        let claimed = claimed.unwrap();
+        assert_ne!(canceled, claimed.is_some());
+
+        let persisted = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(persisted.status, if canceled { "Canceled" } else { "Analyzing" });
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_reorder_and_dispatcher_claim_use_one_queue_order() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        store
+            .save_downloads(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|id| {
+                        DownloadRecord::queued(
+                            id.to_owned(),
+                            format!("https://example.test/{id}"),
+                            10,
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let (moved, claimed) = tokio::join!(
+            store.move_download("first", QueueMove::Bottom),
+            store.claim_queued_download_if_next("first", 20),
+        );
+        let moved = moved.unwrap();
+        let claimed = claimed.unwrap();
+        assert_ne!(moved, claimed.is_some());
+
+        let next = store.next_queued_download().await.unwrap().unwrap();
+        assert_eq!(next.id, "second");
+        let pending_ids = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.status == "Queued")
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        if moved {
+            assert_eq!(pending_ids, ["second".to_owned(), "first".to_owned()]);
+        } else {
+            assert_eq!(pending_ids, ["second".to_owned()]);
+            let claimed = claimed.unwrap();
+            assert_eq!(claimed.id, "first");
+            assert_eq!(claimed.status, "Analyzing");
+        }
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -1961,11 +2350,11 @@ mod tests {
         );
         store.save_download(queued).await.unwrap();
 
-        let claimed = store.claim_queued_download("queued", 20).await.unwrap().unwrap();
+        let claimed = store.claim_queued_download_if_next("queued", 20).await.unwrap().unwrap();
         assert_eq!(claimed.status, "Analyzing");
         assert_eq!(claimed.updated_at, 20);
         assert!(!store.cancel_queued_download("queued", 21).await.unwrap());
-        assert!(store.claim_queued_download("queued", 22).await.unwrap().is_none());
+        assert!(store.claim_queued_download_if_next("queued", 22).await.unwrap().is_none());
 
         let persisted = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(persisted.status, "Analyzing");
@@ -1986,9 +2375,9 @@ mod tests {
         store.save_download(completed).await.unwrap();
 
         assert!(!store.cancel_queued_download("missing", 20).await.unwrap());
-        assert!(store.claim_queued_download("missing", 20).await.unwrap().is_none());
+        assert!(store.claim_queued_download_if_next("missing", 20).await.unwrap().is_none());
         assert!(!store.cancel_queued_download("completed", 21).await.unwrap());
-        assert!(store.claim_queued_download("completed", 21).await.unwrap().is_none());
+        assert!(store.claim_queued_download_if_next("completed", 21).await.unwrap().is_none());
         assert_eq!(store.list_downloads().await.unwrap()[0].status, "Completed");
         std::fs::remove_dir_all(temp_dir).unwrap();
     }

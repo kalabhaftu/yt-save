@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add configurable automatic retries for transient HTTP, rate-limit, and temporary network failures, with durable attempt/deadline state, restart recovery, and exponential backoff capped at four minutes.
+- Add an Off-to-five retry selector; pause, cancel, reorder, and priority controls include retry-waiting rows. Permanent URL, access, and dependency failures remain manual.
+- Add regression coverage for retry classification, persisted retry deadlines and counts, due-time promotion, and retry settings. CI and Windows runtime acceptance are pending.
 - Add case-insensitive local search across queue and history titles, sources, URLs, statuses, formats, output paths, and error text.
 - Add a Windows Save dialog and UTF-8 CSV export for persisted download history, with RFC 4180 quoting for commas, quotes, and line breaks.
 - Add a saved per-download fragment concurrency setting (1–8) and pass it to yt-dlp as `--concurrent-fragments` for HLS/DASH transfers.

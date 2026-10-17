@@ -31,6 +31,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Lets users cancel queued or active yt-dlp jobs, keeps partial files, and retry failed, interrupted, or canceled downloads.
 - On Windows, active cancellation invokes `taskkill.exe` with separate `/PID`, PID, `/T`, and `/F` arguments to stop the yt-dlp process tree. If tree termination cannot be confirmed, the job is marked Failed rather than falsely reported as Canceled.
 - Lets users pause queued or active jobs and resume paused jobs. Active pause stops yt-dlp and its Windows process tree, preserves partial files, and resumes through yt-dlp's `--continue` option.
+- Automatically retries classified temporary network, server, and rate-limit failures with persisted exponential backoff. The retry limit is selectable from Off to five attempts; waits survive app restarts, release download worker slots, and cap at four minutes. Unsupported media, access failures, and missing tools are left for manual correction.
 - Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
 - Lets users open completed files with the operating system's registered media handler.
 - Starts with the user's Downloads folder under `Yt Save`; the default destination can be changed in the app.

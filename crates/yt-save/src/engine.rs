@@ -21,6 +21,21 @@ const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 
+#[derive(Debug)]
+struct RetryableEngineError(String);
+
+impl std::fmt::Display for RetryableEngineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RetryableEngineError {}
+
+pub(crate) fn is_retryable_engine_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<RetryableEngineError>().is_some())
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DownloadOptions {
     mode: DownloadMode,
@@ -176,7 +191,7 @@ impl DownloadEngine {
         }
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            bail!("yt-dlp could not read this URL: {}", readable_error(&message));
+            return Err(yt_dlp_error(&message));
         }
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)
             .context("parse yt-dlp's JSON metadata response")?;
@@ -281,7 +296,7 @@ impl DownloadEngine {
         }
         if !status.success() {
             warn!(code = ?status.code(), "yt-dlp download failed");
-            bail!("{}", readable_error(stderr.trim()));
+            return Err(yt_dlp_error(stderr.trim()));
         }
         Ok(EngineOutcome::Completed(DownloadResult { output_path }))
     }
@@ -543,9 +558,44 @@ fn parse_number<T: std::str::FromStr>(value: &str) -> Option<T> {
     value.trim().parse().ok()
 }
 
+fn yt_dlp_error(value: &str) -> anyhow::Error {
+    let message = readable_error(value);
+    if is_transient_yt_dlp_error(value) {
+        anyhow::Error::new(RetryableEngineError(message))
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+fn is_transient_yt_dlp_error(value: &str) -> bool {
+    let message = value.to_ascii_lowercase();
+    message.contains("http error 408")
+        || message.contains("http error 429")
+        || message.contains("http error 5")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
+        || message.contains("temporarily unavailable")
+        || message.contains("temporary failure")
+        || message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("connection aborted")
+        || message.contains("remote end closed")
+        || message.contains("network is unreachable")
+        || message.contains("network unreachable")
+        || message.contains("temporary failure in name resolution")
+        || message.contains("getaddrinfo failed")
+        || message.contains("name or service not known")
+        || message.contains("could not resolve host")
+}
+
 fn readable_error(value: &str) -> String {
     let message = value.to_ascii_lowercase();
-    if message.contains("unsupported url") || message.contains("no suitable extractor") {
+    if is_transient_yt_dlp_error(value) {
+        "A temporary network, server, or rate limit error interrupted this media request."
+            .to_owned()
+    } else if message.contains("unsupported url") || message.contains("no suitable extractor") {
         "yt-dlp does not currently support this URL.".to_owned()
     } else if message.contains("ffmpeg not found")
         || message.contains("ffprobe not found")
@@ -1031,6 +1081,32 @@ mod tests {
             readable_error("ERROR: Unsupported URL: https://example.test/x"),
             "yt-dlp does not currently support this URL."
         );
+    }
+
+    #[test]
+    fn only_transient_network_server_and_rate_limit_errors_are_retryable() {
+        for message in [
+            "ERROR: HTTP Error 503: Service Unavailable",
+            "ERROR: HTTP Error 429: Too Many Requests",
+            "ERROR: connection reset by peer",
+            "ERROR: Temporary failure in name resolution",
+            "ERROR: [Errno 11001] getaddrinfo failed",
+            "ERROR: [Errno -2] Name or service not known",
+        ] {
+            let error = yt_dlp_error(message);
+            assert!(is_retryable_engine_error(&error), "{message}");
+            assert!(!error.to_string().contains("example.test"));
+        }
+
+        for message in [
+            "ERROR: Unsupported URL: https://example.test/watch",
+            "ERROR: HTTP Error 404: Not Found",
+            "ERROR: Sign in to confirm your age",
+            "ERROR: ffmpeg not found",
+        ] {
+            let error = yt_dlp_error(message);
+            assert!(!is_retryable_engine_error(&error), "{message}");
+        }
     }
 
     #[test]

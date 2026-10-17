@@ -1,6 +1,6 @@
 use crate::model::DownloadRecord;
 
-const HISTORY_COLUMNS: [&str; 22] = [
+const HISTORY_COLUMNS: [&str; 24] = [
     "id",
     "url",
     "queue_order",
@@ -23,6 +23,8 @@ const HISTORY_COLUMNS: [&str; 22] = [
     "error",
     "created_at_unix",
     "updated_at_unix",
+    "automatic_retry_attempts",
+    "next_retry_at_unix",
 ];
 
 pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
@@ -52,6 +54,8 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.error.clone().unwrap_or_default(),
             record.created_at.to_string(),
             record.updated_at.to_string(),
+            record.retry_attempts.to_string(),
+            optional_display(record.next_retry_at),
         ];
         append_csv_row(&mut output, fields.iter().map(String::as_str));
     }
@@ -89,7 +93,9 @@ mod tests {
         let csv = download_history_csv(&[]);
 
         assert!(csv.starts_with("\"id\",\"url\",\"queue_order\""));
-        assert!(csv.ends_with("\"created_at_unix\",\"updated_at_unix\"\r\n"));
+        assert!(csv.ends_with(
+            "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\"\r\n"
+        ));
         assert_eq!(csv.matches("\r\n").count(), 1);
     }
 
@@ -121,6 +127,10 @@ mod tests {
         assert!(csv.contains(
             "\"Example, site\",\"Completed\",\"100.00\",\"1024\",\"2048\",\"32.50\",\"5\""
         ));
-        assert!(csv.contains("\"C:\\Media\\item.mp4\",\"\",\"1700000000\",\"1700000060\"\r\n"));
+        assert!(
+            csv.contains(
+                "\"C:\\Media\\item.mp4\",\"\",\"1700000000\",\"1700000060\",\"0\",\"\"\r\n"
+            )
+        );
     }
 }

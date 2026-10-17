@@ -22,13 +22,19 @@ use crate::{
     AppTray, ClipboardPopup, DownloadRowData, MainWindow, PlaylistEntryRowData,
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
-    engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
+    engine::{
+        DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate,
+        is_retryable_engine_error,
+    },
     history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
         format_duration,
     },
-    persistence::{DEFAULT_CONCURRENT_FRAGMENTS, QueueMove, Store, TrayPreferences},
+    persistence::{
+        DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
+        QueueMove, Store, TrayPreferences,
+    },
 };
 
 enum UiEvent {
@@ -150,6 +156,7 @@ pub fn run() -> Result<()> {
     let download_presets = runtime.block_on(store.load_download_presets())?;
     let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
     let concurrent_fragments = runtime.block_on(store.load_concurrent_fragments())?;
+    let auto_retry_attempts = runtime.block_on(store.load_auto_retry_attempts())?;
     let clipboard_monitoring_enabled =
         runtime.block_on(store.load_clipboard_monitoring_enabled())?;
     let tray_preferences = runtime.block_on(store.load_tray_preferences())?;
@@ -172,6 +179,10 @@ pub fn run() -> Result<()> {
     window.set_video_quality(download_presets.video_quality.label().into());
     window.set_max_concurrent_downloads(max_concurrent_downloads.to_string().into());
     window.set_concurrent_fragments(concurrent_fragments.to_string().into());
+    window.set_auto_retry_attempts(
+        if auto_retry_attempts == 0 { "Off".to_owned() } else { auto_retry_attempts.to_string() }
+            .into(),
+    );
     window.set_clipboard_monitoring_enabled(false);
     window.set_close_to_tray_enabled(tray_preferences.close_to_tray);
     window.set_minimize_to_tray_enabled(tray_preferences.minimize_to_tray);
@@ -1107,6 +1118,66 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let retry_settings_store = store.clone();
+    let retry_settings_events = events_tx.clone();
+    let retry_settings_wake = queue_wake.clone();
+    let retry_settings_handle = handle.clone();
+    let retry_settings_generation = Arc::new(AtomicU64::new(0));
+    let retry_settings_write_lock = Arc::new(AsyncMutex::new(()));
+    let retry_settings_window = window.as_weak();
+    window.on_auto_retry_attempts_requested(move |value| {
+        let count = if value.as_str() == "Off" { Some(0) } else { value.parse::<usize>().ok() };
+        let Some(count) = count.filter(|count| *count <= MAX_AUTO_RETRY_ATTEMPTS) else {
+            return;
+        };
+        let store = retry_settings_store.clone();
+        let events = retry_settings_events.clone();
+        let queue_wake = retry_settings_wake.clone();
+        let generation_state = retry_settings_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = retry_settings_write_lock.clone();
+        let weak_window = retry_settings_window.clone();
+        retry_settings_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let previous_count =
+                store.load_auto_retry_attempts().await.unwrap_or(DEFAULT_AUTO_RETRY_ATTEMPTS);
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            match store.set_auto_retry_attempts(count, now()).await {
+                Ok(canceled_waits) => {
+                    queue_wake.notify_one();
+                    let setting_label =
+                        if count == 0 { "off".to_owned() } else { count.to_string() };
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Automatic transient-error retries set to {setting_label}; canceled {canceled_waits} scheduled retry(s)."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "save automatic retry setting");
+                    if generation_state.load(Ordering::Acquire) == generation {
+                        let previous_value = if previous_count == 0 {
+                            "Off".to_owned()
+                        } else {
+                            previous_count.to_string()
+                        };
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_auto_retry_attempts(previous_value.into());
+                            }
+                        });
+                    }
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save the automatic retry limit: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let pause_store = store.clone();
     let pause_events = events_tx.clone();
     let pause_handle = handle.clone();
@@ -1759,11 +1830,11 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
         let active_jobs = pause_active_jobs.clone();
         let events = pause_events.clone();
         pause_handle.spawn(async move {
-            match pause_all_downloads(&store, &active_jobs).await {
-                Ok((queued_count, active_count)) => {
+            match pause_all_downloads(&store, &active_jobs, true).await {
+                Ok((pending_count, active_count)) => {
                     let _ = events.send(UiEvent::Refresh);
                     let _ = events.send(UiEvent::Status(format!(
-                        "Paused {queued_count} queued item(s); requested a safe pause for {active_count} active item(s)."
+                        "Paused {pending_count} pending item(s); requested a safe pause for {active_count} active item(s)."
                     )));
                 }
                 Err(error) => {
@@ -1964,7 +2035,7 @@ fn begin_orderly_quit(
 
     handle.spawn(async move {
         let shutdown_result = async {
-            pause_all_downloads(&store, &active_jobs).await?;
+            pause_all_downloads(&store, &active_jobs, false).await?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let active_count = active_jobs
@@ -2031,24 +2102,37 @@ fn begin_orderly_quit(
     });
 }
 
-async fn pause_all_downloads(store: &Store, active_jobs: &ActiveJobs) -> Result<(usize, usize)> {
+async fn pause_all_downloads(
+    store: &Store,
+    active_jobs: &ActiveJobs,
+    pause_retry_waits: bool,
+) -> Result<(usize, usize)> {
     let records = store.list_downloads().await?;
-    let mut queued_count = 0;
+    let mut pending_count = 0;
     let mut active_count = 0;
     for record in records {
-        if record.status == "Queued" && store.pause_queued_download(&record.id, now()).await? {
-            queued_count += 1;
+        if (record.status == "Queued"
+            || (pause_retry_waits && record.status == "Waiting for retry"))
+            && store.pause_queued_download(&record.id, now()).await?
+        {
+            pending_count += 1;
             continue;
         }
         if matches!(
             record.status.as_str(),
-            "Queued" | "Analyzing" | "Downloading" | "Post-processing" | "Pausing" | "Canceling"
+            "Queued"
+                | "Waiting for retry"
+                | "Analyzing"
+                | "Downloading"
+                | "Post-processing"
+                | "Pausing"
+                | "Canceling"
         ) && request_pause_for_active_record(store, active_jobs, &record).await?
         {
             active_count += 1;
         }
     }
-    Ok((queued_count, active_count))
+    Ok((pending_count, active_count))
 }
 
 async fn request_pause_for_active_record(
@@ -2178,6 +2262,16 @@ async fn run_queue_dispatcher(
         tokio::pin!(notified);
         notified.as_mut().enable();
         let mut retry_after_error = false;
+        match store.promote_due_retries(now()).await {
+            Ok(count) if count > 0 => {
+                let _ = events.send(UiEvent::Refresh);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "promote due automatic retries");
+                retry_after_error = true;
+            }
+        }
         loop {
             if shutdown_started.load(Ordering::Acquire) {
                 break;
@@ -2262,16 +2356,35 @@ async fn run_queue_dispatcher(
         if shutdown_started.load(Ordering::Acquire) {
             continue;
         }
+        let retry_wait = match store.next_retry_at().await {
+            Ok(Some(deadline)) => Some(Duration::from_secs(
+                u64::try_from(deadline.saturating_sub(now()).max(0)).unwrap_or_default(),
+            )),
+            Ok(None) => None,
+            Err(error) => {
+                error!(%error, "read next automatic retry deadline");
+                retry_after_error = true;
+                None
+            }
+        };
+        let wait_duration = if retry_after_error {
+            Some(
+                retry_wait
+                    .map_or(Duration::from_secs(5), |delay| delay.min(Duration::from_secs(5))),
+            )
+        } else {
+            retry_wait
+        };
         if workers.is_empty() {
-            if retry_after_error {
+            if let Some(delay) = wait_duration {
                 tokio::select! {
                     _ = notified.as_mut() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = tokio::time::sleep(delay) => {},
                 }
             } else {
                 notified.await;
             }
-        } else if retry_after_error {
+        } else if let Some(delay) = wait_duration {
             tokio::select! {
                 _ = notified.as_mut() => {},
                 result = workers.join_next() => {
@@ -2279,7 +2392,7 @@ async fn run_queue_dispatcher(
                         error!(%error, "queue worker task failed");
                     }
                 },
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                _ = tokio::time::sleep(delay) => {},
             }
         } else {
             tokio::select! {
@@ -2356,6 +2469,17 @@ async fn run_download_job(
             return;
         }
         Err(error) => {
+            match schedule_automatic_retry(active.clone(), &error, &store).await {
+                Ok(Some(message)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(message));
+                    return;
+                }
+                Ok(None) => {}
+                Err(schedule_error) => {
+                    error!(%schedule_error, job_id = %active.id, "schedule automatic retry");
+                }
+            }
             active.status = "Failed".to_owned();
             active.error = Some(error.to_string());
             active.updated_at = now();
@@ -2454,6 +2578,17 @@ async fn run_download_job(
             )
         }
         Err(error) => {
+            match schedule_automatic_retry(final_record.clone(), &error, &store).await {
+                Ok(Some(message)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(message));
+                    return;
+                }
+                Ok(None) => {}
+                Err(schedule_error) => {
+                    error!(%schedule_error, job_id = %final_record.id, "schedule automatic retry");
+                }
+            }
             final_record.status = "Failed".to_owned();
             final_record.error = Some(error.to_string());
             (false, false, false, error.to_string())
@@ -2506,6 +2641,41 @@ async fn finish_failed_job(record: DownloadRecord, store: &Store) -> Result<bool
         return Ok(true);
     }
     store.fail_stopping_download(record).await
+}
+
+const AUTO_RETRY_BASE_DELAY_SECS: u64 = 15;
+const AUTO_RETRY_MAX_DELAY_SECS: u64 = 4 * 60;
+
+fn automatic_retry_delay_secs(attempts_already_scheduled: u32) -> u64 {
+    let multiplier = 1_u64.checked_shl(attempts_already_scheduled.min(63)).unwrap_or(u64::MAX);
+    AUTO_RETRY_BASE_DELAY_SECS.saturating_mul(multiplier).min(AUTO_RETRY_MAX_DELAY_SECS)
+}
+
+async fn schedule_automatic_retry(
+    mut record: DownloadRecord,
+    error: &anyhow::Error,
+    store: &Store,
+) -> Result<Option<String>> {
+    if !is_retryable_engine_error(error) {
+        return Ok(None);
+    }
+    let delay_secs = automatic_retry_delay_secs(record.retry_attempts);
+    let retry_number = record.retry_attempts.saturating_add(1);
+    record.status = "Waiting for retry".to_owned();
+    record.error = Some(error.to_string());
+    record.updated_at = now();
+    let Some(max_attempts) = store
+        .schedule_automatic_retry(
+            record.clone(),
+            record.updated_at.saturating_add(delay_secs as i64),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "Temporary issue. Retry {retry_number} of {max_attempts} is scheduled in {delay_secs} seconds."
+    )))
 }
 
 async fn finish_requested_stop(
@@ -2640,6 +2810,8 @@ fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRo
             let queue_position = if record.status == "Queued" {
                 position += 1;
                 format!("#{}", position)
+            } else if record.status == "Waiting for retry" {
+                "Retry".to_owned()
             } else if record.status == "Paused" {
                 "Paused".to_owned()
             } else {
@@ -2668,7 +2840,9 @@ fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRo
 fn queue_summary_text(records: &[DownloadRecord]) -> String {
     let pending = records
         .iter()
-        .filter(|record| matches!(record.status.as_str(), "Queued" | "Paused"))
+        .filter(|record| {
+            matches!(record.status.as_str(), "Queued" | "Waiting for retry" | "Paused")
+        })
         .collect::<Vec<_>>();
     if pending.is_empty() {
         return "No pending work".to_owned();
@@ -2677,13 +2851,19 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     let mut known_sizes = 0usize;
     let mut remaining_bytes = 0u64;
     let queued_count = pending.iter().filter(|record| record.status == "Queued").count();
+    let retry_count = pending.iter().filter(|record| record.status == "Waiting for retry").count();
     let paused_count = pending.iter().filter(|record| record.status == "Paused").count();
-    let queue_label = match (queued_count, paused_count) {
-        (0, 0) => "No pending work".to_owned(),
-        (queued, 0) => format!("{queued} queued"),
-        (0, paused) => format!("{paused} paused"),
-        (queued, paused) => format!("{queued} queued · {paused} paused"),
-    };
+    let mut queue_labels = Vec::new();
+    if queued_count > 0 {
+        queue_labels.push(format!("{queued_count} queued"));
+    }
+    if retry_count > 0 {
+        queue_labels.push(format!("{retry_count} waiting for retry"));
+    }
+    if paused_count > 0 {
+        queue_labels.push(format!("{paused_count} paused"));
+    }
+    let queue_label = queue_labels.join(" · ");
     for record in &pending {
         if let Some(total_bytes) = record.total_bytes {
             known_sizes += 1;
@@ -2707,19 +2887,34 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
 }
 
 fn row_view_with_queue_position(record: &DownloadRecord, queue_position: &str) -> DownloadRowData {
-    let details = match (
-        record.status.as_str(),
-        record.error.as_deref(),
-        record.downloaded_bytes,
-        record.total_bytes,
-    ) {
-        ("Failed" | "Canceled" | "Interrupted", Some(error), _, _) => error.to_owned(),
-        (_, _, Some(downloaded), Some(total)) => {
-            format!("{} of {}", format_bytes(Some(downloaded)), format_bytes(Some(total)))
+    let details = if record.status == "Waiting for retry" {
+        let scheduled = record
+            .next_retry_at
+            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+            .map(|timestamp| timestamp.format("%H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "soon".to_owned());
+        format!(
+            "Retry {} scheduled for {scheduled} · {}",
+            record.retry_attempts,
+            record.error.as_deref().unwrap_or("temporary network issue"),
+        )
+    } else {
+        match (
+            record.status.as_str(),
+            record.error.as_deref(),
+            record.downloaded_bytes,
+            record.total_bytes,
+        ) {
+            ("Failed" | "Canceled" | "Interrupted", Some(error), _, _) => error.to_owned(),
+            (_, _, Some(downloaded), Some(total)) => {
+                format!("{} of {}", format_bytes(Some(downloaded)), format_bytes(Some(total)))
+            }
+            (_, _, Some(downloaded), None) => {
+                format!("{} downloaded", format_bytes(Some(downloaded)))
+            }
+            (_, Some(error), _, _) => error.to_owned(),
+            _ => record.url.clone(),
         }
-        (_, _, Some(downloaded), None) => format!("{} downloaded", format_bytes(Some(downloaded))),
-        (_, Some(error), _, _) => error.to_owned(),
-        _ => record.url.clone(),
     };
     let selection = match record.download_mode {
         DownloadMode::Video => format!("Video · {}", record.video_quality.label()),
@@ -2955,6 +3150,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_retry_backoff_doubles_and_caps_at_four_minutes() {
+        assert_eq!(automatic_retry_delay_secs(0), 15);
+        assert_eq!(automatic_retry_delay_secs(1), 30);
+        assert_eq!(automatic_retry_delay_secs(2), 60);
+        assert_eq!(automatic_retry_delay_secs(4), AUTO_RETRY_MAX_DELAY_SECS);
+        assert_eq!(automatic_retry_delay_secs(20), AUTO_RETRY_MAX_DELAY_SECS);
+        assert_eq!(automatic_retry_delay_secs(u32::MAX), AUTO_RETRY_MAX_DELAY_SECS);
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_keeps_retry_waits_but_pause_all_pauses_them() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut retry = DownloadRecord::queued(
+            "retry-wait".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        retry.status = "Waiting for retry".to_owned();
+        retry.retry_attempts = 1;
+        retry.next_retry_at = Some(50);
+        retry.error = Some("A temporary network error interrupted the request.".to_owned());
+        store.save_download(retry).await.unwrap();
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        assert_eq!(pause_all_downloads(&store, &active_jobs, false).await.unwrap().0, 0);
+        let waiting = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(waiting.status, "Waiting for retry");
+        assert_eq!(waiting.next_retry_at, Some(50));
+
+        assert_eq!(pause_all_downloads(&store, &active_jobs, true).await.unwrap().0, 1);
+        let paused = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(paused.status, "Paused");
+        assert_eq!(paused.next_retry_at, None);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
     fn dispatcher_capacity_tracks_raised_and_lowered_limits_without_stopping_workers() {
         assert!(can_dispatch_more(1, 3));
         assert!(!can_dispatch_more(3, 2));
@@ -3065,6 +3298,25 @@ mod tests {
         let row = row_view_with_queue_position(&record, "");
         assert!(row.detail.as_str().contains(record.error.as_deref().unwrap()));
         assert!(row.detail.as_str().starts_with("Video · "));
+    }
+
+    #[test]
+    fn retry_wait_has_a_visible_deadline_and_counts_as_pending_work() {
+        let mut record = DownloadRecord::queued(
+            "retrying".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        record.status = "Waiting for retry".to_owned();
+        record.retry_attempts = 2;
+        record.next_retry_at = Some(1_700_000_000);
+        record.error = Some("A temporary network issue interrupted this media request.".to_owned());
+
+        let row = row_view_with_queue_position(&record, "Retry");
+        assert_eq!(row.status.as_str(), "Waiting for retry");
+        assert_eq!(row.queue_position.as_str(), "Retry");
+        assert!(row.detail.as_str().contains("Retry 2 scheduled for"));
+        assert!(queue_summary_text(&[record]).contains("1 waiting for retry"));
     }
 
     #[test]

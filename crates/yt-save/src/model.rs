@@ -389,6 +389,10 @@ pub struct DownloadRecord {
     pub eta_seconds: Option<u64>,
     pub output_path: Option<String>,
     pub error: Option<String>,
+    /// Number of automatic retries already scheduled for transient failures.
+    pub retry_attempts: u32,
+    /// Unix timestamp when a scheduled automatic retry becomes eligible.
+    pub next_retry_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -416,6 +420,8 @@ impl DownloadRecord {
             eta_seconds: None,
             output_path: None,
             error: None,
+            retry_attempts: 0,
+            next_retry_at: None,
             created_at,
             updated_at: created_at,
         }

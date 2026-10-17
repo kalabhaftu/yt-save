@@ -13,6 +13,8 @@ pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 pub const DEFAULT_CONCURRENT_FRAGMENTS: usize = 1;
 pub const MAX_CONCURRENT_FRAGMENTS: usize = 8;
+pub const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
+pub const MAX_AUTO_RETRY_ATTEMPTS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrayPreferences {
@@ -67,7 +69,9 @@ impl Store {
                     video_quality TEXT NOT NULL DEFAULT 'best',
                     download_directory TEXT NOT NULL DEFAULT '',
                     queue_rank INTEGER NOT NULL DEFAULT 0,
-                    priority INTEGER NOT NULL DEFAULT 0
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    retry_attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -95,6 +99,8 @@ impl Store {
                 ("audio_quality", "TEXT NOT NULL DEFAULT 'best'"),
                 ("video_quality", "TEXT NOT NULL DEFAULT 'best'"),
                 ("download_directory", "TEXT NOT NULL DEFAULT ''"),
+                ("retry_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_retry_at", "INTEGER"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -303,6 +309,154 @@ impl Store {
         .await
         .context("join fragment concurrency setting write")??;
         Ok(())
+    }
+
+    /// Loads the maximum number of automatic retries after the initial attempt.
+    pub async fn load_auto_retry_attempts(&self) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let parsed = setting_value(connection, "auto_retry_attempts")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value <= MAX_AUTO_RETRY_ATTEMPTS);
+                Ok(parsed.unwrap_or(DEFAULT_AUTO_RETRY_ATTEMPTS))
+            })
+        })
+        .await
+        .context("join automatic retry setting read")?
+    }
+
+    /// Saves a bounded automatic retry count, where zero disables automatic retries.
+    pub async fn set_auto_retry_attempts(&self, count: usize, updated_at: i64) -> Result<usize> {
+        let count = count.min(MAX_AUTO_RETRY_ATTEMPTS);
+        let count_text = count.to_string();
+        let store = self.clone();
+        let canceled_waits = tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('auto_retry_attempts', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": count_text, ":updated": updated_at },
+                )?;
+                let canceled_waits = transaction.execute(
+                    "UPDATE downloads
+                     SET status = 'Failed', next_retry_at = NULL,
+                         error = CASE
+                             WHEN error IS NULL OR trim(error) = '' THEN
+                                 'Automatic retry canceled because the retry limit was lowered.'
+                             ELSE error || ' Automatic retry canceled because the retry limit was lowered.'
+                         END,
+                         updated_at = :updated
+                     WHERE status = 'Waiting for retry'
+                       AND retry_attempts > :max_attempts",
+                    named_params! {
+                        ":updated": updated_at,
+                        ":max_attempts": i64::try_from(count).unwrap_or(i64::MAX),
+                    },
+                )?;
+                transaction.commit()?;
+                Ok(canceled_waits)
+            })
+        })
+        .await
+        .context("join automatic retry setting write")??;
+        Ok(canceled_waits)
+    }
+
+    /// Promotes retry waits whose persisted deadlines have elapsed.
+    pub async fn promote_due_retries(&self, timestamp: i64) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let changed = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', next_retry_at = NULL, updated_at = :now
+                     WHERE status = 'Waiting for retry'
+                       AND (next_retry_at IS NULL OR next_retry_at <= :now)",
+                    named_params! { ":now": timestamp },
+                )?;
+                Ok(changed)
+            })
+        })
+        .await
+        .context("join due retry update")?
+    }
+
+    /// Returns the earliest retry deadline for dispatcher timer scheduling.
+    pub async fn next_retry_at(&self) -> Result<Option<i64>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT min(next_retry_at) FROM downloads
+                         WHERE status = 'Waiting for retry' AND next_retry_at IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+        })
+        .await
+        .context("join next retry deadline read")?
+    }
+
+    /// Saves a retryable failure only while its worker still owns an active queue item.
+    pub async fn schedule_automatic_retry(
+        &self,
+        record: DownloadRecord,
+        retry_at: i64,
+    ) -> Result<Option<usize>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let configured_attempts = setting_value(&transaction, "auto_retry_attempts")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value <= MAX_AUTO_RETRY_ATTEMPTS)
+                    .unwrap_or(DEFAULT_AUTO_RETRY_ATTEMPTS);
+                let affected = transaction.execute(
+                    "UPDATE downloads
+                     SET title = :title, source = :source, status = 'Waiting for retry',
+                         progress = :progress, downloaded_bytes = :downloaded,
+                         total_bytes = :total, speed_bytes_per_second = NULL,
+                         eta_seconds = NULL, output_path = :output, error = :error,
+                         retry_attempts = retry_attempts + 1,
+                         next_retry_at = :retry_at,
+                         queue_rank = coalesce((
+                             SELECT max(queue_rank) FROM downloads AS existing
+                             WHERE existing.priority = downloads.priority
+                               AND existing.id <> downloads.id
+                         ), 0) + 1024,
+                         updated_at = :updated
+                     WHERE id = :id
+                       AND status IN ('Analyzing', 'Downloading', 'Post-processing')
+                       AND retry_attempts < :max_attempts",
+                    named_params! {
+                        ":id": record.id,
+                        ":title": record.title,
+                        ":source": record.source,
+                        ":progress": record.progress,
+                        ":downloaded": sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?,
+                        ":total": sqlite_integer(record.total_bytes, "total_bytes")?,
+                        ":output": record.output_path,
+                        ":error": record.error,
+                        ":retry_at": retry_at,
+                        ":updated": record.updated_at,
+                        ":max_attempts": i64::try_from(configured_attempts).unwrap_or(i64::MAX),
+                    },
+                )?;
+                transaction.commit()?;
+                Ok((affected == 1).then_some(configured_attempts))
+            })
+        })
+        .await
+        .context("join automatic retry write")?
     }
 
     /// Clipboard monitoring is off unless the user previously enabled it explicitly.
@@ -529,7 +683,7 @@ impl Store {
                 let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let selected = transaction
                     .query_row(
-                        "SELECT priority FROM downloads WHERE id = :id AND status IN ('Queued', 'Paused')",
+                    "SELECT priority FROM downloads WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
                         named_params! { ":id": id },
                         |row| row.get::<_, i32>(0),
                     )
@@ -539,7 +693,7 @@ impl Store {
                     return Ok(false);
                 };
                 let mut statement = transaction.prepare(
-                    "SELECT id FROM downloads WHERE status IN ('Queued', 'Paused') AND priority = :priority
+                    "SELECT id FROM downloads WHERE status IN ('Queued', 'Waiting for retry', 'Paused') AND priority = :priority
                      ORDER BY queue_rank ASC, rowid ASC",
                 )?;
                 let rows = statement.query_map(named_params! { ":priority": priority }, |row| row.get::<_, String>(0))?;
@@ -569,7 +723,7 @@ impl Store {
                     )?;
                     for (rank_index, item_id) in ids.iter().enumerate() {
                         transaction.execute(
-                            "UPDATE downloads SET queue_rank = :rank WHERE id = :id AND status IN ('Queued', 'Paused')",
+                            "UPDATE downloads SET queue_rank = :rank WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
                             named_params! {
                                 ":rank": base_rank + (rank_index as i64 + 1) * 1024,
                                 ":id": item_id,
@@ -603,7 +757,7 @@ impl Store {
                              WHERE existing.priority = :priority
                                AND existing.id <> downloads.id
                          ), 0) + 1024
-                     WHERE id = :id AND status IN ('Queued', 'Paused')
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')
                        AND priority <> :priority",
                     named_params! {
                         ":priority": priority.clamp(0, 1),
@@ -660,8 +814,8 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Paused', error = NULL, updated_at = :updated
-                     WHERE id = :id AND status = 'Queued'",
+                     SET status = 'Paused', next_retry_at = NULL, error = NULL, updated_at = :updated
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
@@ -679,8 +833,8 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Canceled', error = NULL, updated_at = :updated
-                     WHERE id = :id AND status IN ('Queued', 'Paused')",
+                     SET status = 'Canceled', next_retry_at = NULL, error = NULL, updated_at = :updated
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
@@ -995,7 +1149,8 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Queued', error = NULL, updated_at = :updated,
+                     SET status = 'Queued', error = NULL, retry_attempts = 0,
+                         next_retry_at = NULL, updated_at = :updated,
                          queue_rank = coalesce((
                              SELECT max(queue_rank) FROM downloads AS existing
                              WHERE existing.priority = downloads.priority
@@ -1027,7 +1182,7 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Queued', error = NULL, updated_at = :updated
+                     SET status = 'Queued', error = NULL, next_retry_at = NULL, updated_at = :updated
                      WHERE id = :id AND status = 'Paused'",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
@@ -1070,7 +1225,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             total_bytes, speed_bytes_per_second, eta_seconds, output_path,
             error, created_at, updated_at, playlist_index,
             download_mode, audio_format, audio_quality, video_quality,
-            download_directory, queue_rank, priority
+            download_directory, queue_rank, priority, retry_attempts, next_retry_at
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -1078,7 +1233,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             :video_quality, :download_directory,
             coalesce((SELECT max(queue_rank) FROM downloads
                       WHERE priority = :priority), 0) + 1024,
-            :priority
+            :priority, :retry_attempts, :next_retry_at
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -1092,7 +1247,9 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             audio_format=excluded.audio_format,
             audio_quality=excluded.audio_quality,
             video_quality=excluded.video_quality,
-            download_directory=excluded.download_directory",
+            download_directory=excluded.download_directory,
+            retry_attempts=excluded.retry_attempts,
+            next_retry_at=excluded.next_retry_at",
         named_params! {
             ":id": record.id,
             ":url": record.url,
@@ -1115,6 +1272,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":video_quality": record.video_quality.as_database_value(),
             ":download_directory": record.download_directory,
             ":priority": record.priority,
+            ":retry_attempts": i64::from(record.retry_attempts),
+            ":next_retry_at": record.next_retry_at,
         },
     )?;
     Ok(())
@@ -1137,7 +1296,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
-                priority, download_directory
+                priority, download_directory, retry_attempts, next_retry_at
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -1165,6 +1324,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 download_directory: row.get(21)?,
                 queue_order: row.get(19)?,
                 priority: row.get(20)?,
+                retry_attempts: retry_attempts_from_row(row, 22)?,
+                next_retry_at: row.get(23)?,
             })
         })
         .optional()?;
@@ -1186,12 +1347,12 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
-                priority, download_directory
+                priority, download_directory, retry_attempts, next_retry_at
          FROM downloads
-         ORDER BY CASE WHEN status IN ('Queued', 'Paused') THEN 0 ELSE 1 END,
-                  CASE WHEN status IN ('Queued', 'Paused') THEN priority ELSE 0 END DESC,
-                  CASE WHEN status IN ('Queued', 'Paused') THEN queue_rank ELSE 0 END ASC,
-                  CASE WHEN status IN ('Queued', 'Paused') THEN rowid ELSE 0 END ASC,
+        ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN 0 ELSE 1 END,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN priority ELSE 0 END DESC,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN queue_rank ELSE 0 END ASC,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN rowid ELSE 0 END ASC,
                   created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1218,6 +1379,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             download_directory: row.get(21)?,
             queue_order: row.get(19)?,
             priority: row.get(20)?,
+            retry_attempts: retry_attempts_from_row(row, 22)?,
+            next_retry_at: row.get(23)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -1252,6 +1415,20 @@ fn invalid_enum_value(index: usize, value: &str) -> rusqlite::Error {
             format!("unrecognized persisted download choice: {value}"),
         )),
     )
+}
+
+fn retry_attempts_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(index)?;
+    u32::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "automatic retry count must be a nonnegative 32-bit integer",
+            )),
+        )
+    })
 }
 
 fn optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
@@ -1341,6 +1518,167 @@ mod tests {
             reopened.load_concurrent_fragments().await.unwrap(),
             DEFAULT_CONCURRENT_FRAGMENTS
         );
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_limit_defaults_bounds_and_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+
+        assert_eq!(store.load_auto_retry_attempts().await.unwrap(), DEFAULT_AUTO_RETRY_ATTEMPTS);
+        store.set_auto_retry_attempts(5, 11).await.unwrap();
+        assert_eq!(store.load_auto_retry_attempts().await.unwrap(), 5);
+        store.set_auto_retry_attempts(usize::MAX, 12).await.unwrap();
+        assert_eq!(store.load_auto_retry_attempts().await.unwrap(), MAX_AUTO_RETRY_ATTEMPTS);
+        store.set_auto_retry_attempts(0, 13).await.unwrap();
+        assert_eq!(store.load_auto_retry_attempts().await.unwrap(), 0);
+        drop(store);
+
+        let reopened = Store::open(db_path.clone()).unwrap();
+        assert_eq!(reopened.load_auto_retry_attempts().await.unwrap(), 0);
+        reopened
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'invalid' WHERE key = 'auto_retry_attempts'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reopened.load_auto_retry_attempts().await.unwrap(), DEFAULT_AUTO_RETRY_ATTEMPTS);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lowering_retry_limit_cancels_only_waits_over_the_new_limit() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+
+        for (id, attempts) in [("within-limit", 1), ("over-limit", 2)] {
+            let mut record =
+                DownloadRecord::queued(id.to_owned(), "https://example.test/media".to_owned(), 10);
+            record.status = "Waiting for retry".to_owned();
+            record.retry_attempts = attempts;
+            record.next_retry_at = Some(50);
+            record.error = Some("A temporary network error interrupted the request.".to_owned());
+            store.save_download(record).await.unwrap();
+        }
+
+        assert_eq!(store.set_auto_retry_attempts(1, 60).await.unwrap(), 1);
+        let records = store.list_downloads().await.unwrap();
+        let within_limit = records.iter().find(|record| record.id == "within-limit").unwrap();
+        assert_eq!(within_limit.status, "Waiting for retry");
+        assert_eq!(within_limit.next_retry_at, Some(50));
+        let over_limit = records.iter().find(|record| record.id == "over-limit").unwrap();
+        assert_eq!(over_limit.status, "Failed");
+        assert_eq!(over_limit.next_retry_at, None);
+        assert!(
+            over_limit.error.as_deref().unwrap_or_default().contains("retry limit was lowered")
+        );
+
+        assert_eq!(store.set_auto_retry_attempts(0, 61).await.unwrap(), 1);
+        let records = store.list_downloads().await.unwrap();
+        assert_eq!(
+            records.iter().find(|record| record.id == "within-limit").unwrap().status,
+            "Failed"
+        );
+        drop(store);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_scheduling_observes_a_disabled_limit_atomically() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        store.set_auto_retry_attempts(0, 10).await.unwrap();
+        store
+            .save_download(DownloadRecord::queued(
+                "disabled-retry".to_owned(),
+                "https://example.test/media".to_owned(),
+                10,
+            ))
+            .await
+            .unwrap();
+        let mut active =
+            store.claim_queued_download_if_next("disabled-retry", 11).await.unwrap().unwrap();
+        active.status = "Downloading".to_owned();
+        active.error = Some("A temporary network error interrupted the request.".to_owned());
+        active.updated_at = 12;
+        assert!(store.update_active_download(active.clone()).await.unwrap());
+
+        assert_eq!(store.schedule_automatic_retry(active, 50).await.unwrap(), None);
+        let record = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(record.status, "Downloading");
+        assert_eq!(record.retry_attempts, 0);
+        assert_eq!(record.next_retry_at, None);
+        drop(store);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_deadline_and_attempt_survive_restart_and_promote_when_due() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+        store
+            .save_download(DownloadRecord::queued(
+                "retry-job".to_owned(),
+                "https://example.test/media".to_owned(),
+                10,
+            ))
+            .await
+            .unwrap();
+        let mut active =
+            store.claim_queued_download_if_next("retry-job", 11).await.unwrap().unwrap();
+        active.status = "Downloading".to_owned();
+        active.progress = 37.0;
+        active.downloaded_bytes = Some(370);
+        active.total_bytes = Some(1_000);
+        active.error = Some("A temporary network error interrupted the request.".to_owned());
+        active.updated_at = 12;
+        assert!(store.update_active_download(active.clone()).await.unwrap());
+        assert_eq!(store.schedule_automatic_retry(active, 50).await.unwrap(), Some(3));
+
+        let waiting = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "retry-job")
+            .unwrap();
+        assert_eq!(waiting.status, "Waiting for retry");
+        assert_eq!(waiting.retry_attempts, 1);
+        assert_eq!(waiting.next_retry_at, Some(50));
+        assert_eq!(waiting.progress, 37.0);
+        assert_eq!(store.next_retry_at().await.unwrap(), Some(50));
+        assert_eq!(store.promote_due_retries(49).await.unwrap(), 0);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        let still_waiting = reopened
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "retry-job")
+            .unwrap();
+        assert_eq!(still_waiting.status, "Waiting for retry");
+        assert_eq!(still_waiting.retry_attempts, 1);
+        assert_eq!(still_waiting.next_retry_at, Some(50));
+        assert_eq!(reopened.promote_due_retries(50).await.unwrap(), 1);
+        let queued = reopened
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "retry-job")
+            .unwrap();
+        assert_eq!(queued.status, "Queued");
+        assert_eq!(queued.retry_attempts, 1);
+        assert_eq!(queued.next_retry_at, None);
+        assert_eq!(reopened.next_retry_at().await.unwrap(), None);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -1809,6 +2147,8 @@ mod tests {
         assert_eq!(legacy.audio_quality, AudioQuality::Best);
         assert_eq!(legacy.video_quality, VideoQuality::Best);
         assert_eq!(legacy.download_directory, legacy_default);
+        assert_eq!(legacy.retry_attempts, 0);
+        assert_eq!(legacy.next_retry_at, None);
 
         let mut selected = DownloadRecord::queued(
             "selected-job".to_owned(),
@@ -2005,6 +2345,8 @@ mod tests {
         failed.progress = 34.5;
         failed.downloaded_bytes = Some(345);
         failed.total_bytes = Some(1_000);
+        failed.retry_attempts = 4;
+        failed.next_retry_at = Some(100);
         failed.error = Some("temporary network error".to_owned());
         failed.playlist_index = Some(5);
         failed.download_mode = DownloadMode::AudioOnly;
@@ -2032,6 +2374,8 @@ mod tests {
         assert_eq!(retried.audio_format, AudioFormat::Mp3);
         assert_eq!(retried.audio_quality, AudioQuality::K128);
         assert_eq!(retried.video_quality, VideoQuality::P1080);
+        assert_eq!(retried.retry_attempts, 0);
+        assert_eq!(retried.next_retry_at, None);
         assert!(store.retry_download("failed", 21).await.unwrap().is_none());
         assert!(store.retry_download("queued", 22).await.unwrap().is_none());
 

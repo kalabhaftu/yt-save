@@ -2,6 +2,7 @@ mod app;
 mod clipboard_monitor;
 mod dependencies;
 mod engine;
+mod history;
 mod model;
 mod persistence;
 #[cfg(windows)]

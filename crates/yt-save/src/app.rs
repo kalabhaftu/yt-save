@@ -23,6 +23,7 @@ use crate::{
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate},
+    history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
         format_duration,
@@ -1241,6 +1242,73 @@ pub fn run() -> Result<()> {
                 Err(error) => {
                     error!(%error, "clear completed download history");
                     let _ = events.send(UiEvent::Status(format!("Could not clear completed history: {error}")));
+                }
+            }
+        });
+    });
+
+    let export_store = store.clone();
+    let export_events = events_tx.clone();
+    let export_handle = handle.clone();
+    window.on_export_history_requested(move || {
+        let store = export_store.clone();
+        let events = export_events.clone();
+        let _ = events.send(UiEvent::Status("Choose a CSV file for download history…".to_owned()));
+        export_handle.spawn(async move {
+            let path = match tokio::task::spawn_blocking(pick_history_export_path).await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => {
+                    let _ = events.send(UiEvent::Status("History export canceled.".to_owned()));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not open the CSV save dialog: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "The CSV save dialog did not complete: {error}"
+                    )));
+                    return;
+                }
+            };
+            let records = match store.list_downloads().await {
+                Ok(records) => records,
+                Err(error) => {
+                    error!(%error, "load history for CSV export");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not load download history: {error}")));
+                    return;
+                }
+            };
+            let count = records.len();
+            let csv = download_history_csv(&records);
+            let write = tokio::task::spawn_blocking(move || {
+                std::fs::write(&path, csv)
+                    .with_context(|| format!("write download history to {}", path.display()))?;
+                Ok::<_, anyhow::Error>(path)
+            })
+            .await;
+            match write {
+                Ok(Ok(path)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Exported {count} history {} to {}.",
+                        if count == 1 { "entry" } else { "entries" },
+                        path.display()
+                    )));
+                }
+                Ok(Err(error)) => {
+                    error!(%error, "write download history CSV");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not write the history CSV: {error}")));
+                }
+                Err(error) => {
+                    error!(%error, "join download history CSV writer");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "The history CSV writer did not complete: {error}"
+                    )));
                 }
             }
         });
@@ -2697,6 +2765,54 @@ fn pick_download_directory() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     Ok(Some(PathBuf::from(OsString::from_wide(&selected_path[..length]))))
+}
+
+#[cfg(windows)]
+fn pick_history_export_path() -> Result<Option<PathBuf>> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let filter: Vec<u16> =
+        "CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0".encode_utf16().collect();
+    let title: Vec<u16> = "Export download history".encode_utf16().chain(Some(0)).collect();
+    let default_extension: Vec<u16> = "csv".encode_utf16().chain(Some(0)).collect();
+    let mut file: Vec<u16> = "yt-save-history.csv".encode_utf16().chain(Some(0)).collect();
+    file.resize(32_768, 0);
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: 1,
+        lpstrFile: file.as_mut_ptr(),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        lpstrDefExt: default_extension.as_ptr(),
+        Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
+        let error = unsafe { CommDlgExtendedError() };
+        if error == 0 {
+            return Ok(None);
+        }
+        anyhow::bail!("Windows save dialog error {error:#x}");
+    }
+    let length = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
+    if length == 0 {
+        return Ok(None);
+    }
+    let mut path = PathBuf::from(OsString::from_wide(&file[..length]));
+    if path.extension().is_none() {
+        path.set_extension("csv");
+    }
+    Ok(Some(path))
+}
+
+#[cfg(not(windows))]
+fn pick_history_export_path() -> Result<Option<PathBuf>> {
+    anyhow::bail!("the native CSV save dialog is available in Windows builds")
 }
 
 #[cfg(not(windows))]

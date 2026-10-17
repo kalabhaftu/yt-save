@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a Windows Save dialog and UTF-8 CSV export for persisted download history, with RFC 4180 quoting for commas, quotes, and line breaks.
 - Add a saved per-download fragment concurrency setting (1–8) and pass it to yt-dlp as `--concurrent-fragments` for HLS/DASH transfers.
 - Add a persisted parallel-download limit (1–8, default 1), queue-header selector, and dispatcher-managed workers; changing the limit applies to new launches without interrupting active jobs.
 - Persist queue rank and High/Normal priority, and add move up/down/top/bottom controls for queued and paused items.

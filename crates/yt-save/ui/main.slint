@@ -96,6 +96,7 @@ export component MainWindow inherits Window {
     callback open-download-folder();
     callback choose-download-directory-requested();
     callback clear-completed-requested();
+    callback export-history-requested();
     callback cancel-download-requested(string);
     callback pause-download-requested(string);
     callback resume-download-requested(string);
@@ -687,6 +688,10 @@ export component MainWindow inherits Window {
                             height: 36px;
                             Text { text: "Queue"; color: #e9eaf1; font-size: 16px; font-weight: 600; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
+                            ActionButton {
+                                label: "Export history";
+                                clicked => { root.export-history-requested(); }
+                            }
                             ActionButton {
                                 label: "Clear completed";
                                 clicked => { root.clear-completed-requested(); }

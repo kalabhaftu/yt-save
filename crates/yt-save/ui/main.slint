@@ -69,6 +69,7 @@ export component MainWindow inherits Window {
     in-out property <string> download-directory: "";
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> queue-summary: "No pending work";
+    in-out property <string> max-concurrent-downloads: "1";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
     in-out property <bool> close-to-tray-enabled: false;
@@ -101,12 +102,17 @@ export component MainWindow inherits Window {
     callback retry-download-requested(string);
     callback queue-move-requested(string, string);
     callback download-priority-requested(string, int);
+    callback max-concurrent-downloads-requested(string);
     callback open-output-requested(string);
 
     changed minimized => {
         if root.minimized && root.minimize-to-tray-enabled {
             root.hide();
         }
+    }
+
+    changed max-concurrent-downloads => {
+        root.max-concurrent-downloads-requested(root.max-concurrent-downloads);
     }
 
     VerticalLayout {
@@ -672,6 +678,13 @@ export component MainWindow inherits Window {
                         height: 46px;
                         Text { text: "Queue"; color: #e9eaf1; font-size: 16px; font-weight: 600; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
+                        Text { text: "Parallel downloads"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["1", "2", "3", "4", "5", "6", "7", "8"];
+                            current-value <=> root.max-concurrent-downloads;
+                            width: 74px;
+                            height: 32px;
+                        }
                         ActionButton {
                             label: "Clear completed";
                             clicked => { root.clear-completed-requested(); }

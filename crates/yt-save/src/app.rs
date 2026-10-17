@@ -11,7 +11,10 @@ use std::{
 use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, watch};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
+    task::JoinSet,
+};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -143,6 +146,7 @@ pub fn run() -> Result<()> {
     runtime
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
+    let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
     let clipboard_monitoring_enabled =
         runtime.block_on(store.load_clipboard_monitoring_enabled())?;
     let tray_preferences = runtime.block_on(store.load_tray_preferences())?;
@@ -163,6 +167,7 @@ pub fn run() -> Result<()> {
     window.set_audio_format(download_presets.audio_format.as_database_value().into());
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
+    window.set_max_concurrent_downloads(max_concurrent_downloads.to_string().into());
     window.set_clipboard_monitoring_enabled(false);
     window.set_close_to_tray_enabled(tray_preferences.close_to_tray);
     window.set_minimize_to_tray_enabled(tray_preferences.minimize_to_tray);
@@ -969,6 +974,61 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let concurrency_store = store.clone();
+    let concurrency_events = events_tx.clone();
+    let concurrency_wake = queue_wake.clone();
+    let concurrency_handle = handle.clone();
+    let concurrency_generation = Arc::new(AtomicU64::new(0));
+    let concurrency_write_lock = Arc::new(AsyncMutex::new(()));
+    let concurrency_window = window.as_weak();
+    window.on_max_concurrent_downloads_requested(move |value| {
+        let Ok(limit) = value.parse::<usize>() else {
+            return;
+        };
+        if !(1..=8).contains(&limit) {
+            return;
+        }
+        let store = concurrency_store.clone();
+        let events = concurrency_events.clone();
+        let queue_wake = concurrency_wake.clone();
+        let generation_state = concurrency_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = concurrency_write_lock.clone();
+        let weak_window = concurrency_window.clone();
+        concurrency_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let previous_limit = store.load_max_concurrent_downloads().await.unwrap_or(1);
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            match store.set_max_concurrent_downloads(limit, now()).await {
+                Ok(()) => {
+                    queue_wake.notify_one();
+                    let _ = events.send(UiEvent::Status(format!(
+                        "The queue can now run up to {limit} downloads at once."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "save maximum concurrent downloads");
+                    if generation_state.load(Ordering::Acquire) == generation {
+                        let previous_value = previous_limit.to_string().into();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_max_concurrent_downloads(previous_value);
+                            }
+                        });
+                    }
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save the parallel download limit: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let pause_store = store.clone();
     let pause_events = events_tx.clone();
     let pause_handle = handle.clone();
@@ -1605,6 +1665,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     let quit_handle = handle.clone();
     let quit_events = events.clone();
     let quit_active_jobs = active_jobs.clone();
+    let quit_queue_wake = queue_wake.clone();
     let quit_window = window.as_weak();
     let quit_guard = shutdown_started.clone();
     tray.on_quit_requested(move || {
@@ -1612,6 +1673,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
             quit_handle.clone(),
             quit_store.clone(),
             quit_active_jobs.clone(),
+            quit_queue_wake.clone(),
             quit_events.clone(),
             quit_window.clone(),
             quit_guard.clone(),
@@ -1666,6 +1728,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     let close_handle = handle;
     let close_events = events;
     let close_active_jobs = active_jobs;
+    let close_queue_wake = queue_wake;
     let close_window = window.as_weak();
     let close_guard = shutdown_started;
     window.window().on_close_requested(move || {
@@ -1678,6 +1741,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
                 close_handle.clone(),
                 close_store.clone(),
                 close_active_jobs.clone(),
+                close_queue_wake.clone(),
                 close_events.clone(),
                 close_window.clone(),
                 close_guard.clone(),
@@ -1738,6 +1802,7 @@ fn begin_orderly_quit(
     handle: tokio::runtime::Handle,
     store: Store,
     active_jobs: ActiveJobs,
+    queue_wake: Arc<Notify>,
     events: mpsc::UnboundedSender<UiEvent>,
     window: slint::Weak<MainWindow>,
     shutdown_started: Arc<AtomicBool>,
@@ -1745,6 +1810,7 @@ fn begin_orderly_quit(
     if shutdown_started.swap(true, Ordering::AcqRel) {
         return;
     }
+    queue_wake.notify_one();
     if let Some(window) = window.upgrade() {
         window.set_status_message(
             "Pausing queue work safely before quitting. Partial files are being preserved.".into(),
@@ -1896,6 +1962,10 @@ fn is_active_status(status: &str) -> bool {
     matches!(status, "Analyzing" | "Downloading" | "Post-processing" | "Pausing" | "Canceling")
 }
 
+fn can_dispatch_more(active_workers: usize, max_concurrent_downloads: usize) -> bool {
+    active_workers < max_concurrent_downloads
+}
+
 fn tray_tooltip(active_count: usize, paused_count: usize) -> String {
     if active_count == 0 && paused_count == 0 {
         "Yt Save".to_owned()
@@ -1945,81 +2015,148 @@ async fn run_queue_dispatcher(
     active_jobs: ActiveJobs,
     shutdown_started: Arc<AtomicBool>,
 ) {
+    let mut workers = JoinSet::new();
     loop {
         if shutdown_started.load(Ordering::Acquire) {
-            return;
+            while let Some(result) = workers.join_next().await {
+                if let Err(error) = result {
+                    error!(%error, "queue worker task failed while shutting down");
+                }
+            }
+            if shutdown_started.load(Ordering::Acquire) {
+                return;
+            }
+            continue;
         }
+
         let notified = queue_wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        match store.next_queued_download().await {
-            Ok(Some(pending)) => {
-                if shutdown_started.load(Ordering::Acquire) {
-                    return;
+        let mut retry_after_error = false;
+        loop {
+            if shutdown_started.load(Ordering::Acquire) {
+                break;
+            }
+            let limit = match store.load_max_concurrent_downloads().await {
+                Ok(limit) => limit,
+                Err(error) => {
+                    error!(%error, "read maximum concurrent downloads; using one worker");
+                    retry_after_error = true;
+                    1
                 }
+            };
+            if !can_dispatch_more(workers.len(), limit) {
+                break;
+            }
+            let pending = match store.next_queued_download().await {
+                Ok(Some(pending)) => pending,
+                Ok(None) => break,
+                Err(error) => {
+                    error!(%error, "read next queue item");
+                    retry_after_error = true;
+                    break;
+                }
+            };
+            let (signal_sender, signal_receiver) = watch::channel(JobSignal::Continue);
+            let signal_sender = Arc::new(signal_sender);
+            match active_jobs.lock() {
+                Ok(mut jobs) => {
+                    jobs.insert(pending.id.clone(), signal_sender.clone());
+                }
+                Err(_) => {
+                    let _ = events.send(UiEvent::Status(
+                        "Could not register controls for this queue item.".to_owned(),
+                    ));
+                    retry_after_error = true;
+                    break;
+                }
+            }
+            let registration = ActiveJobRegistration {
+                id: pending.id.clone(),
+                jobs: active_jobs.clone(),
+                sender: signal_sender,
+            };
+            if shutdown_started.load(Ordering::Acquire) {
+                drop(registration);
+                break;
+            }
+            let active = match store.claim_queued_download_if_next(&pending.id, now()).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    drop(registration);
+                    let _ = events.send(UiEvent::Refresh);
+                    continue;
+                }
+                Err(error) => {
+                    drop(registration);
+                    error!(%error, job_id = %pending.id, "claim queued download");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not start queued item: {error}")));
+                    retry_after_error = true;
+                    break;
+                }
+            };
+            let job_store = store.clone();
+            let job_engine = engine.clone();
+            let job_events = events.clone();
+            let job_wake = queue_wake.clone();
+            workers.spawn(async move {
                 run_download_job(
-                    pending,
-                    store.clone(),
-                    engine.clone(),
-                    events.clone(),
-                    active_jobs.clone(),
-                    shutdown_started.clone(),
+                    active,
+                    job_store,
+                    job_engine,
+                    job_events,
+                    signal_receiver,
+                    registration,
                 )
                 .await;
-            }
-            Ok(None) => notified.await,
-            Err(error) => {
-                error!(%error, "read next queue item");
+                job_wake.notify_one();
+            });
+        }
+
+        if shutdown_started.load(Ordering::Acquire) {
+            continue;
+        }
+        if workers.is_empty() {
+            if retry_after_error {
                 tokio::select! {
                     _ = notified.as_mut() => {},
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                 }
+            } else {
+                notified.await;
+            }
+        } else if retry_after_error {
+            tokio::select! {
+                _ = notified.as_mut() => {},
+                result = workers.join_next() => {
+                    if let Some(Err(error)) = result {
+                        error!(%error, "queue worker task failed");
+                    }
+                },
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            }
+        } else {
+            tokio::select! {
+                _ = notified.as_mut() => {},
+                result = workers.join_next() => {
+                    if let Some(Err(error)) = result {
+                        error!(%error, "queue worker task failed");
+                    }
+                },
             }
         }
     }
 }
 
 async fn run_download_job(
-    pending: DownloadRecord,
+    mut active: DownloadRecord,
     store: Store,
     engine: DownloadEngine,
     events: mpsc::UnboundedSender<UiEvent>,
-    active_jobs: ActiveJobs,
-    shutdown_started: Arc<AtomicBool>,
+    mut signal_receiver: watch::Receiver<JobSignal>,
+    _registration: ActiveJobRegistration,
 ) {
-    let (signal_sender, mut signal_receiver) = watch::channel(JobSignal::Continue);
-    let signal_sender = Arc::new(signal_sender);
-    match active_jobs.lock() {
-        Ok(mut jobs) => {
-            jobs.insert(pending.id.clone(), signal_sender.clone());
-        }
-        Err(_) => {
-            let _ = events.send(UiEvent::Status(
-                "Could not register controls for this queue item.".to_owned(),
-            ));
-            return;
-        }
-    }
-    let _registration =
-        ActiveJobRegistration { id: pending.id.clone(), jobs: active_jobs, sender: signal_sender };
-
-    if shutdown_started.load(Ordering::Acquire) {
-        let _ = events.send(UiEvent::Refresh);
-        return;
-    }
-
-    let mut active = match store.claim_queued_download_if_next(&pending.id, now()).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            let _ = events.send(UiEvent::Refresh);
-            return;
-        }
-        Err(error) => {
-            error!(%error, job_id = %pending.id, "claim queued download");
-            let _ = events.send(UiEvent::Status(format!("Could not start queued item: {error}")));
-            return;
-        }
-    };
     let _ = events.send(UiEvent::Refresh);
 
     match engine
@@ -2594,6 +2731,15 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatcher_capacity_tracks_raised_and_lowered_limits_without_stopping_workers() {
+        assert!(can_dispatch_more(1, 3));
+        assert!(!can_dispatch_more(3, 2));
+        assert!(!can_dispatch_more(2, 2));
+        assert!(can_dispatch_more(1, 2));
+        assert!(!can_dispatch_more(1, 1));
+    }
     use crate::model::{AudioFormat, AudioQuality, VideoQuality};
 
     #[test]

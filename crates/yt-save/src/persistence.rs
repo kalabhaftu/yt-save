@@ -9,6 +9,9 @@ use crate::model::{
     AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, VideoQuality,
 };
 
+pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
+pub const MAX_CONCURRENT_DOWNLOADS: usize = 8;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrayPreferences {
     pub close_to_tray: bool,
@@ -226,6 +229,42 @@ impl Store {
         })
         .await
         .context("join preset read")?
+    }
+
+    /// Loads the persisted queue concurrency limit; invalid or missing values use one worker.
+    pub async fn load_max_concurrent_downloads(&self) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let parsed = setting_value(connection, "max_concurrent_downloads")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| (1..=MAX_CONCURRENT_DOWNLOADS).contains(value));
+                Ok(parsed.unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS))
+            })
+        })
+        .await
+        .context("join concurrency setting read")?
+    }
+
+    /// Saves the bounded queue concurrency limit for subsequent dispatches.
+    pub async fn set_max_concurrent_downloads(&self, limit: usize, updated_at: i64) -> Result<()> {
+        let limit = limit.clamp(1, MAX_CONCURRENT_DOWNLOADS).to_string();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('max_concurrent_downloads', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": limit, ":updated": updated_at },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join concurrency setting write")??;
+        Ok(())
     }
 
     /// Clipboard monitoring is off unless the user previously enabled it explicitly.
@@ -1197,6 +1236,37 @@ fn optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn max_concurrent_downloads_defaults_bounds_and_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+
+        assert_eq!(store.load_max_concurrent_downloads().await.unwrap(), 1);
+        store.set_max_concurrent_downloads(6, 11).await.unwrap();
+        assert_eq!(store.load_max_concurrent_downloads().await.unwrap(), 6);
+        store.set_max_concurrent_downloads(usize::MAX, 12).await.unwrap();
+        assert_eq!(store.load_max_concurrent_downloads().await.unwrap(), MAX_CONCURRENT_DOWNLOADS);
+        store.set_max_concurrent_downloads(0, 13).await.unwrap();
+        assert_eq!(store.load_max_concurrent_downloads().await.unwrap(), 1);
+        store.set_max_concurrent_downloads(5, 14).await.unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'invalid' WHERE key = 'max_concurrent_downloads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.load_max_concurrent_downloads().await.unwrap(), 1);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(reopened.load_max_concurrent_downloads().await.unwrap(), 1);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn download_state_survives_reopening_the_database() {

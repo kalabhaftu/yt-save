@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a persisted parallel-download limit (1–8, default 1), queue-header selector, and dispatcher-managed workers; changing the limit applies to new launches without interrupting active jobs.
 - Persist queue rank and High/Normal priority, and add move up/down/top/bottom controls for queued and paused items.
 - Replace competing per-item waiters with a single dispatcher that claims the next row in the current persisted order; save selected playlist entries as one atomic batch.
 - Add backward-compatible queue schema migration and coverage for rank migration, queue order, priority, reordering, and conditional claims. CI and Windows UI acceptance are pending.

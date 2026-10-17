@@ -11,6 +11,8 @@ use crate::model::{
 
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 8;
+pub const DEFAULT_CONCURRENT_FRAGMENTS: usize = 1;
+pub const MAX_CONCURRENT_FRAGMENTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrayPreferences {
@@ -264,6 +266,42 @@ impl Store {
         })
         .await
         .context("join concurrency setting write")??;
+        Ok(())
+    }
+
+    /// Loads yt-dlp's per-download fragment worker count; invalid or missing values use one.
+    pub async fn load_concurrent_fragments(&self) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let parsed = setting_value(connection, "concurrent_fragments")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| (1..=MAX_CONCURRENT_FRAGMENTS).contains(value));
+                Ok(parsed.unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS))
+            })
+        })
+        .await
+        .context("join fragment concurrency setting read")?
+    }
+
+    /// Saves yt-dlp's bounded per-download fragment worker count.
+    pub async fn set_concurrent_fragments(&self, count: usize, updated_at: i64) -> Result<()> {
+        let count = count.clamp(1, MAX_CONCURRENT_FRAGMENTS).to_string();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('concurrent_fragments', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": count, ":updated": updated_at },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join fragment concurrency setting write")??;
         Ok(())
     }
 
@@ -1265,6 +1303,44 @@ mod tests {
 
         let reopened = Store::open(db_path).unwrap();
         assert_eq!(reopened.load_max_concurrent_downloads().await.unwrap(), 1);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_fragments_defaults_bounds_and_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), DEFAULT_CONCURRENT_FRAGMENTS);
+        store.set_concurrent_fragments(6, 11).await.unwrap();
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), 6);
+        store.set_concurrent_fragments(usize::MAX, 12).await.unwrap();
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), MAX_CONCURRENT_FRAGMENTS);
+        store.set_concurrent_fragments(0, 13).await.unwrap();
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), DEFAULT_CONCURRENT_FRAGMENTS);
+        store.set_concurrent_fragments(5, 14).await.unwrap();
+        drop(store);
+
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), 5);
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'invalid' WHERE key = 'concurrent_fragments'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.load_concurrent_fragments().await.unwrap(), DEFAULT_CONCURRENT_FRAGMENTS);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(
+            reopened.load_concurrent_fragments().await.unwrap(),
+            DEFAULT_CONCURRENT_FRAGMENTS
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

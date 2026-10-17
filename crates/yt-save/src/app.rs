@@ -27,7 +27,7 @@ use crate::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
         format_duration,
     },
-    persistence::{QueueMove, Store, TrayPreferences},
+    persistence::{DEFAULT_CONCURRENT_FRAGMENTS, QueueMove, Store, TrayPreferences},
 };
 
 enum UiEvent {
@@ -147,6 +147,7 @@ pub fn run() -> Result<()> {
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
     let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
+    let concurrent_fragments = runtime.block_on(store.load_concurrent_fragments())?;
     let clipboard_monitoring_enabled =
         runtime.block_on(store.load_clipboard_monitoring_enabled())?;
     let tray_preferences = runtime.block_on(store.load_tray_preferences())?;
@@ -168,6 +169,7 @@ pub fn run() -> Result<()> {
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
     window.set_max_concurrent_downloads(max_concurrent_downloads.to_string().into());
+    window.set_concurrent_fragments(concurrent_fragments.to_string().into());
     window.set_clipboard_monitoring_enabled(false);
     window.set_close_to_tray_enabled(tray_preferences.close_to_tray);
     window.set_minimize_to_tray_enabled(tray_preferences.minimize_to_tray);
@@ -1023,6 +1025,59 @@ pub fn run() -> Result<()> {
                     }
                     let _ = events.send(UiEvent::Status(format!(
                         "Could not save the parallel download limit: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
+    let fragments_store = store.clone();
+    let fragments_events = events_tx.clone();
+    let fragments_handle = handle.clone();
+    let fragments_generation = Arc::new(AtomicU64::new(0));
+    let fragments_write_lock = Arc::new(AsyncMutex::new(()));
+    let fragments_window = window.as_weak();
+    window.on_concurrent_fragments_requested(move |value| {
+        let Ok(count) = value.parse::<usize>() else {
+            return;
+        };
+        if !(1..=8).contains(&count) {
+            return;
+        }
+        let store = fragments_store.clone();
+        let events = fragments_events.clone();
+        let generation_state = fragments_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = fragments_write_lock.clone();
+        let weak_window = fragments_window.clone();
+        fragments_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let previous_count =
+                store.load_concurrent_fragments().await.unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS);
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            match store.set_concurrent_fragments(count, now()).await {
+                Ok(()) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "New downloads can now use up to {count} fragments per download."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "save concurrent fragments setting");
+                    if generation_state.load(Ordering::Acquire) == generation {
+                        let previous_value = previous_count.to_string().into();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_concurrent_fragments(previous_value);
+                            }
+                        });
+                    }
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save the fragment concurrency limit: {error}"
                     )));
                 }
             }
@@ -2263,12 +2318,20 @@ async fn run_download_job(
         progress_record
     });
 
+    let concurrent_fragments = match store.load_concurrent_fragments().await {
+        Ok(count) => count,
+        Err(error) => {
+            error!(%error, job_id = %active.id, "read fragment concurrency setting; using one fragment");
+            DEFAULT_CONCURRENT_FRAGMENTS
+        }
+    };
     let download_result = engine
         .download_with_playlist_index_cancellable(
             &active.url,
             active.playlist_index,
             DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
                 .with_video_quality(active.video_quality)
+                .with_concurrent_fragments(concurrent_fragments)
                 .with_output_directory(PathBuf::from(&active.download_directory)),
             &mut signal_receiver,
             move |progress| {

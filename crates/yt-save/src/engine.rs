@@ -27,6 +27,7 @@ pub(crate) struct DownloadOptions {
     audio_format: AudioFormat,
     audio_quality: AudioQuality,
     video_quality: VideoQuality,
+    concurrent_fragments: usize,
     output_directory: Option<PathBuf>,
 }
 
@@ -41,6 +42,7 @@ impl DownloadOptions {
             audio_format,
             audio_quality,
             video_quality: VideoQuality::Best,
+            concurrent_fragments: 1,
             output_directory: None,
         }
     }
@@ -52,6 +54,11 @@ impl DownloadOptions {
 
     pub(crate) fn with_output_directory(mut self, output_directory: PathBuf) -> Self {
         self.output_directory = Some(output_directory);
+        self
+    }
+
+    pub(crate) fn with_concurrent_fragments(mut self, concurrent_fragments: usize) -> Self {
+        self.concurrent_fragments = concurrent_fragments.clamp(1, 8);
         self
     }
 }
@@ -311,6 +318,8 @@ impl DownloadEngine {
             .arg("--no-warnings")
             .arg("--continue")
             .arg("--newline")
+            .arg("--concurrent-fragments")
+            .arg(options.concurrent_fragments.to_string())
             .arg("--no-color")
             .arg("--progress")
             .arg("--progress-template")
@@ -676,7 +685,11 @@ mod tests {
         let engine = DownloadEngine::new(dependencies, output_directory.clone());
         std::fs::create_dir_all(&output_directory).unwrap();
         let arguments = engine
-            .download_command("https://example.test/watch/123", None, DownloadOptions::default())
+            .download_command(
+                "https://example.test/watch/123",
+                None,
+                DownloadOptions::default().with_concurrent_fragments(4),
+            )
             .unwrap()
             .as_std()
             .get_args()
@@ -684,6 +697,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!arguments.iter().any(|argument| argument == "--playlist-items"));
         assert!(arguments.iter().any(|argument| argument == "--continue"));
+        let fragment_flag =
+            arguments.iter().position(|argument| argument == "--concurrent-fragments").unwrap();
+        assert_eq!(arguments.get(fragment_flag + 1).map(String::as_str), Some("4"));
 
         let output_flag = arguments.iter().position(|argument| argument == "--output").unwrap();
         assert_eq!(arguments.get(output_flag + 1).map(String::as_str), Some(OUTPUT_TEMPLATE));

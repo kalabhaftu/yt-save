@@ -70,6 +70,7 @@ export component MainWindow inherits Window {
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> queue-summary: "No pending work";
     in-out property <string> max-concurrent-downloads: "1";
+    in-out property <string> concurrent-fragments: "1";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
     in-out property <bool> close-to-tray-enabled: false;
@@ -103,6 +104,7 @@ export component MainWindow inherits Window {
     callback queue-move-requested(string, string);
     callback download-priority-requested(string, int);
     callback max-concurrent-downloads-requested(string);
+    callback concurrent-fragments-requested(string);
     callback open-output-requested(string);
 
     changed minimized => {
@@ -113,6 +115,10 @@ export component MainWindow inherits Window {
 
     changed max-concurrent-downloads => {
         root.max-concurrent-downloads-requested(root.max-concurrent-downloads);
+    }
+
+    changed concurrent-fragments => {
+        root.concurrent-fragments-requested(root.concurrent-fragments);
     }
 
     VerticalLayout {
@@ -674,22 +680,37 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    HorizontalLayout {
-                        height: 46px;
-                        Text { text: "Queue"; color: #e9eaf1; font-size: 16px; font-weight: 600; vertical-alignment: center; }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text { text: "Parallel downloads"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
-                        ComboBox {
-                            model: ["1", "2", "3", "4", "5", "6", "7", "8"];
-                            current-value <=> root.max-concurrent-downloads;
-                            width: 74px;
-                            height: 32px;
+                    VerticalLayout {
+                        height: 78px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            height: 36px;
+                            Text { text: "Queue"; color: #e9eaf1; font-size: 16px; font-weight: 600; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            ActionButton {
+                                label: "Clear completed";
+                                clicked => { root.clear-completed-requested(); }
+                            }
+                            Text { text: root.queue-summary; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
                         }
-                        ActionButton {
-                            label: "Clear completed";
-                            clicked => { root.clear-completed-requested(); }
+                        HorizontalLayout {
+                            height: 36px;
+                            Text { text: "Parallel downloads"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                            ComboBox {
+                                model: ["1", "2", "3", "4", "5", "6", "7", "8"];
+                                current-value <=> root.max-concurrent-downloads;
+                                width: 74px;
+                                height: 32px;
+                            }
+                            Text { text: "Fragments per download"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                            ComboBox {
+                                model: ["1", "2", "3", "4", "5", "6", "7", "8"];
+                                current-value <=> root.concurrent-fragments;
+                                width: 64px;
+                                height: 32px;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
                         }
-                        Text { text: root.queue-summary; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
                     }
 
                     Rectangle {

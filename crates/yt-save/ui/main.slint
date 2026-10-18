@@ -21,6 +21,19 @@ struct PlaylistEntryRowData {
     selected: bool,
 }
 
+struct LibraryRowData {
+    id: string,
+    title: string,
+    source: string,
+    kind: string,
+    file-format: string,
+    file-path: string,
+    file-status: string,
+    size-label: string,
+    downloaded-at: string,
+    path-available: bool,
+}
+
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
@@ -74,6 +87,10 @@ export component MainWindow inherits Window {
     in-out property <string> concurrent-fragments: "1";
     in-out property <string> auto-retry-attempts: "3";
     in-out property <string> history-search: "";
+    in-out property <bool> show-library: false;
+    in-out property <string> library-search: "";
+    in-out property <string> library-filter: "All files";
+    in-out property <string> library-sort: "Newest first";
     in-out property <bool> clipboard-monitoring-enabled: false;
     in-out property <string> clipboard-candidate: "";
     in-out property <bool> close-to-tray-enabled: false;
@@ -87,6 +104,7 @@ export component MainWindow inherits Window {
     in-out property <int> selectable-playlist-count: 0;
     in-out property <string> playlist-selection-summary: "";
     in property <[DownloadRowData]> downloads: [];
+    in property <[LibraryRowData]> library-entries: [];
 
     callback analyze-requested(string);
     callback enqueue-requested(string);
@@ -101,6 +119,11 @@ export component MainWindow inherits Window {
     callback clear-completed-requested();
     callback export-history-requested();
     callback history-search-requested(string);
+    callback library-search-requested(string);
+    callback library-filter-requested(string);
+    callback library-sort-requested(string);
+    callback library-view-requested(bool);
+    callback library-refresh-requested();
     callback cancel-download-requested(string);
     callback pause-download-requested(string);
     callback resume-download-requested(string);
@@ -112,6 +135,8 @@ export component MainWindow inherits Window {
     callback concurrent-fragments-requested(string);
     callback auto-retry-attempts-requested(string);
     callback open-output-requested(string);
+    callback reveal-output-requested(string);
+    callback locate-library-file-requested(string);
 
     changed minimized => {
         if root.minimized && root.minimize-to-tray-enabled {
@@ -133,6 +158,22 @@ export component MainWindow inherits Window {
 
     changed history-search => {
         root.history-search-requested(root.history-search);
+    }
+
+    changed library-search => {
+        root.library-search-requested(root.library-search);
+    }
+
+    changed library-filter => {
+        root.library-filter-requested(root.library-filter);
+    }
+
+    changed library-sort => {
+        root.library-sort-requested(root.library-sort);
+    }
+
+    changed show-library => {
+        root.library-view-requested(root.show-library);
     }
 
     VerticalLayout {
@@ -212,13 +253,27 @@ export component MainWindow inherits Window {
                     Rectangle {
                         height: 42px;
                         border-radius: 9px;
-                        background: #23243a;
+                        background: root.show-library ? #171b28 : #23243a;
                         HorizontalLayout {
                             padding-left: 12px;
                             spacing: 10px;
                             Text { text: "↓"; color: #a79aff; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "Downloads"; color: #f4f2ff; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                            Text { text: "Downloads"; color: root.show-library ? #aab2c8 : #f4f2ff; font-size: 14px; font-weight: 600; vertical-alignment: center; }
                         }
+                        TouchArea { clicked => { root.show-library = false; } }
+                    }
+
+                    Rectangle {
+                        height: 42px;
+                        border-radius: 9px;
+                        background: root.show-library ? #23243a : #171b28;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 10px;
+                            Text { text: "▣"; color: #a79aff; font-size: 16px; vertical-alignment: center; }
+                            Text { text: "Library"; color: root.show-library ? #f4f2ff : #aab2c8; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                        }
+                        TouchArea { clicked => { root.show-library = true; } }
                     }
 
                     Rectangle { vertical-stretch: 1; }
@@ -316,7 +371,157 @@ export component MainWindow inherits Window {
 
             Rectangle {
                 background: #0c0e15;
-                VerticalLayout {
+                if root.show-library : VerticalLayout {
+                    padding-top: 24px;
+                    padding-bottom: 24px;
+                    padding-left: 36px;
+                    padding-right: 36px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+                            spacing: 4px;
+                            Text { text: "Library"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
+                            Text {
+                                text: "Completed downloads, linked to their original files. Nothing is copied into a separate library.";
+                                color: #8c94aa;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
+                        ActionButton { label: "Refresh files"; clicked => { root.library-refresh-requested(); } }
+                        ActionButton { label: "Open download folder"; clicked => { root.open-download-folder(); } }
+                    }
+
+                    HorizontalLayout {
+                        height: 38px;
+                        spacing: 10px;
+                        Rectangle {
+                            border-radius: 8px;
+                            background: #0e111a;
+                            border-width: 1px;
+                            border-color: #343a4e;
+                            horizontal-stretch: 1;
+                            TextInput {
+                                text <=> root.library-search;
+                                x: 10px;
+                                width: parent.width - 20px;
+                                height: parent.height;
+                                accessible-placeholder-text: "Search title, source, or file path";
+                                color: #ecedf4;
+                                font-size: 12px;
+                                selection-background-color: #5751a3;
+                                vertical-alignment: center;
+                            }
+                            if root.library-search == "" : Text {
+                                x: 10px;
+                                width: parent.width - 20px;
+                                height: parent.height;
+                                text: "Search title, source, or file path";
+                                color: #727b92;
+                                font-size: 12px;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                        }
+                        ComboBox {
+                            model: ["All files", "Video", "Audio", "Missing files"];
+                            current-value <=> root.library-filter;
+                            width: 136px;
+                            height: 34px;
+                        }
+                        ComboBox {
+                            model: ["Newest first", "Oldest first", "Title A–Z", "Largest first"];
+                            current-value <=> root.library-sort;
+                            width: 150px;
+                            height: 34px;
+                        }
+                    }
+
+                    Rectangle {
+                        background: #10131c;
+                        border-width: 1px;
+                        border-color: #252a3a;
+                        border-radius: 13px;
+                        vertical-stretch: 1;
+                        if root.library-entries.length == 0 : VerticalLayout {
+                            x: 8px;
+                            y: 8px;
+                            width: parent.width - 16px;
+                            height: parent.height - 16px;
+                            alignment: center;
+                            spacing: 8px;
+                            Text { text: root.library-search == "" && root.library-filter == "All files" ? "No completed media yet" : "No matching files"; color: #d9dce7; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
+                            Text { text: root.library-search == "" ? "Completed downloads appear here and stay in their saved locations." : "Try another title, source, path, or file filter."; color: #778099; font-size: 12px; horizontal-alignment: center; }
+                        }
+                        if root.library-entries.length > 0 : ListView {
+                            x: 8px;
+                            y: 8px;
+                            width: parent.width - 16px;
+                            height: parent.height - 16px;
+                            for entry in root.library-entries : Rectangle {
+                                height: 92px;
+                                background: #10131c;
+                                border-color: #202536;
+                                border-width: 0px;
+                                HorizontalLayout {
+                                    padding-top: 10px;
+                                    padding-bottom: 10px;
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 12px;
+                                    Rectangle {
+                                        width: 48px;
+                                        height: 48px;
+                                        border-radius: 10px;
+                                        background: #22263a;
+                                        Text { text: entry.kind == "Audio" ? "♫" : "▶"; color: #aaa0ff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 3px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text { text: entry.title; color: #e4e6ef; font-size: 13px; font-weight: 600; overflow: elide; horizontal-stretch: 1; }
+                                            Text { text: entry.file-status; color: entry.path-available ? #74d6ae : #dfb86f; font-size: 11px; }
+                                        }
+                                        Text { text: entry.source + " · " + entry.kind + " · " + entry.file-format + " · " + entry.size-label + " · " + entry.downloaded-at; color: #9aa2b8; font-size: 10px; overflow: elide; }
+                                        Text { text: entry.file-path; color: #757e97; font-size: 10px; overflow: elide; }
+                                    }
+                                    if entry.path-available : ActionButton {
+                                        label: "Open";
+                                        button-height: 30px;
+                                        button-min-width: 60px;
+                                        clicked => { root.open-output-requested(entry.file-path); }
+                                    }
+                                    if entry.path-available : ActionButton {
+                                        label: "Show";
+                                        button-height: 30px;
+                                        button-min-width: 60px;
+                                        clicked => { root.reveal-output-requested(entry.file-path); }
+                                    }
+                                    if !entry.path-available : ActionButton {
+                                        label: "Locate file";
+                                        button-height: 30px;
+                                        button-min-width: 86px;
+                                        clicked => { root.locate-library-file-requested(entry.id); }
+                                    }
+                                    ActionButton {
+                                        label: "Remove";
+                                        button-height: 30px;
+                                        button-min-width: 64px;
+                                        clicked => { root.remove-download-requested(entry.id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.show-library : VerticalLayout {
                     padding-top: 20px;
                     padding-bottom: 20px;
                     padding-left: 36px;

@@ -792,6 +792,29 @@ impl Store {
         .context("join database write")?
     }
 
+    /// Reattaches a completed history record to a media file that was moved on disk.
+    pub async fn update_completed_output_path(
+        &self,
+        id: &str,
+        output_path: String,
+    ) -> Result<bool> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let affected = connection.execute(
+                    "UPDATE downloads
+                     SET output_path = :path
+                     WHERE id = :id AND status = 'Completed'",
+                    named_params! { ":path": output_path, ":id": id },
+                )?;
+                Ok(affected == 1)
+            })
+        })
+        .await
+        .context("join completed output path update")?
+    }
+
     /// Removes completed history records from the database without touching output files.
     pub async fn clear_completed_downloads(&self) -> Result<usize> {
         let store = self.clone();
@@ -2277,6 +2300,43 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "active");
         assert!(output_path.exists());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moved_library_file_can_be_relinked_only_for_completed_downloads() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        completed.status = "Completed".to_owned();
+        completed.output_path = Some("C:\\old-location\\media.mp4".to_owned());
+        store.save_download(completed).await.unwrap();
+        let active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/active".to_owned(),
+            11,
+        );
+        store.save_download(active).await.unwrap();
+
+        assert!(
+            store
+                .update_completed_output_path("completed", "D:\\Media\\moved.mp4".to_owned())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_completed_output_path("active", "D:\\Media\\active.mp4".to_owned())
+                .await
+                .unwrap()
+        );
+        let records = store.list_downloads().await.unwrap();
+        let completed = records.iter().find(|record| record.id == "completed").unwrap();
+        assert_eq!(completed.output_path.as_deref(), Some("D:\\Media\\moved.mp4"));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

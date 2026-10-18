@@ -19,7 +19,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    AppTray, ClipboardPopup, DownloadRowData, MainWindow, PlaylistEntryRowData,
+    AppTray, ClipboardPopup, DownloadRowData, LibraryRowData, MainWindow, PlaylistEntryRowData,
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{
@@ -40,14 +40,45 @@ use crate::{
 enum UiEvent {
     Refresh,
     FilterHistory(String),
+    FilterLibrary(String),
+    LibraryFilter(String),
+    LibrarySort(String),
+    LibraryView(bool),
+    RefreshLibrary,
+    LibraryScanComplete {
+        generation: u64,
+        signature: LibraryCacheSignature,
+        result: std::result::Result<Vec<LibraryCacheEntry>, String>,
+    },
     Status(String),
-    ClipboardCandidate { generation: u64, candidate: ClipboardCandidate },
+    ClipboardCandidate {
+        generation: u64,
+        candidate: ClipboardCandidate,
+    },
     DependencyStatus(String),
-    ClearPreview { request_id: u64 },
-    Metadata { request_id: u64, source_url: String, metadata: MediaMetadata },
+    ClearPreview {
+        request_id: u64,
+    },
+    Metadata {
+        request_id: u64,
+        source_url: String,
+        metadata: MediaMetadata,
+    },
 }
 
 type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<JobSignal>>>>>;
+
+type LibraryCacheSignature =
+    Vec<(String, String, String, String, Option<String>, String, Option<u64>, i64)>;
+
+#[derive(Clone)]
+struct LibraryCacheEntry {
+    row: LibraryRowData,
+    searchable_text: String,
+    title_sort_key: String,
+    downloaded_at: i64,
+    size_for_sort: Option<u64>,
+}
 
 struct TrayContext {
     store: Store,
@@ -216,14 +247,25 @@ pub fn run() -> Result<()> {
     let event_popup = popup.as_weak();
     let event_popup_generation = clipboard_popup_generation.clone();
     let event_popup_work_area = clipboard_popup_work_area.clone();
+    let event_library_events = events_tx.clone();
     runtime.spawn(async move {
         let mut latest_analysis_id = 0;
         let mut history_search = String::new();
+        let mut library_search = String::new();
+        let mut library_filter = "All files".to_owned();
+        let mut library_sort = "Newest first".to_owned();
         let mut cached_downloads = event_initial_records;
+        let mut library_visible = false;
+        let mut library_cache: Vec<LibraryCacheEntry> = Vec::new();
+        let mut library_cache_signature: LibraryCacheSignature = Vec::new();
+        let mut pending_library_signature = None;
+        let mut library_scan_generation = 0;
+        let library_events = event_library_events;
         while let Some(event) = events_rx.recv().await {
             match event {
                 UiEvent::Refresh => match event_store.list_downloads().await {
                     Ok(records) => {
+                        let records_signature = library_cache_signature_for(&records);
                         cached_downloads = records;
                         let active_count = cached_downloads
                             .iter()
@@ -234,6 +276,18 @@ pub fn run() -> Result<()> {
                             .filter(|record| record.status == "Paused")
                             .count();
                         let rows = row_views_filtered(&cached_downloads, &history_search);
+                        if library_visible
+                            && records_signature != library_cache_signature
+                            && pending_library_signature.as_ref() != Some(&records_signature)
+                        {
+                            request_library_scan(
+                                library_events.clone(),
+                                &mut library_scan_generation,
+                                &mut pending_library_signature,
+                                cached_downloads.clone(),
+                                records_signature,
+                            );
+                        }
                         let summary = queue_summary_text(&cached_downloads);
                         let weak = weak_window.clone();
                         let weak_tray = weak_tray.clone();
@@ -261,6 +315,104 @@ pub fn run() -> Result<()> {
                             window.set_downloads(ModelRc::new(VecModel::from(rows)));
                         }
                     });
+                }
+                UiEvent::FilterLibrary(query) => {
+                    library_search = query;
+                    let rows = library_row_views_from_cache(
+                        &library_cache,
+                        &library_search,
+                        &library_filter,
+                        &library_sort,
+                    );
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_library_entries(ModelRc::new(VecModel::from(rows)));
+                        }
+                    });
+                }
+                UiEvent::LibraryFilter(filter) => {
+                    library_filter = filter;
+                    let rows = library_row_views_from_cache(
+                        &library_cache,
+                        &library_search,
+                        &library_filter,
+                        &library_sort,
+                    );
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_library_entries(ModelRc::new(VecModel::from(rows)));
+                        }
+                    });
+                }
+                UiEvent::LibrarySort(sort) => {
+                    library_sort = sort;
+                    let rows = library_row_views_from_cache(
+                        &library_cache,
+                        &library_search,
+                        &library_filter,
+                        &library_sort,
+                    );
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_library_entries(ModelRc::new(VecModel::from(rows)));
+                        }
+                    });
+                }
+                UiEvent::LibraryView(visible) => {
+                    library_visible = visible;
+                    if visible {
+                        let signature = library_cache_signature_for(&cached_downloads);
+                        request_library_scan(
+                            library_events.clone(),
+                            &mut library_scan_generation,
+                            &mut pending_library_signature,
+                            cached_downloads.clone(),
+                            signature,
+                        );
+                    }
+                }
+                UiEvent::RefreshLibrary => {
+                    if library_visible {
+                        let signature = library_cache_signature_for(&cached_downloads);
+                        request_library_scan(
+                            library_events.clone(),
+                            &mut library_scan_generation,
+                            &mut pending_library_signature,
+                            cached_downloads.clone(),
+                            signature,
+                        );
+                    }
+                }
+                UiEvent::LibraryScanComplete { generation, signature, result } => {
+                    if generation != library_scan_generation {
+                        continue;
+                    }
+                    pending_library_signature = None;
+                    if !library_visible {
+                        continue;
+                    }
+                    match result {
+                        Ok(entries) => {
+                            library_cache_signature = signature;
+                            library_cache = entries;
+                            let rows = library_row_views_from_cache(
+                                &library_cache,
+                                &library_search,
+                                &library_filter,
+                                &library_sort,
+                            );
+                            let weak = weak_window.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(window) = weak.upgrade() {
+                                    window.set_library_entries(ModelRc::new(VecModel::from(rows)));
+                                }
+                            });
+                        }
+                        Err(message) => error!(%message, "scan completed media for library view"),
+                    }
                 }
                 UiEvent::Status(message) => {
                     let weak = weak_window.clone();
@@ -602,6 +754,31 @@ pub fn run() -> Result<()> {
     let history_search_events = events_tx.clone();
     window.on_history_search_requested(move |query| {
         let _ = history_search_events.send(UiEvent::FilterHistory(query.to_string()));
+    });
+
+    let library_search_events = events_tx.clone();
+    window.on_library_search_requested(move |query| {
+        let _ = library_search_events.send(UiEvent::FilterLibrary(query.to_string()));
+    });
+
+    let library_filter_events = events_tx.clone();
+    window.on_library_filter_requested(move |filter| {
+        let _ = library_filter_events.send(UiEvent::LibraryFilter(filter.to_string()));
+    });
+
+    let library_sort_events = events_tx.clone();
+    window.on_library_sort_requested(move |sort| {
+        let _ = library_sort_events.send(UiEvent::LibrarySort(sort.to_string()));
+    });
+
+    let library_view_events = events_tx.clone();
+    window.on_library_view_requested(move |visible| {
+        let _ = library_view_events.send(UiEvent::LibraryView(visible));
+    });
+
+    let refresh_library_events = events_tx.clone();
+    window.on_library_refresh_requested(move || {
+        let _ = refresh_library_events.send(UiEvent::RefreshLibrary);
     });
 
     window.on_enqueue_requested(move |submitted_url| {
@@ -1507,6 +1684,100 @@ pub fn run() -> Result<()> {
             if let Err(error) = open_file(&path) {
                 let _ = events
                     .send(UiEvent::Status(format!("Could not open downloaded file: {error}")));
+            }
+        });
+    });
+
+    let reveal_events = events_tx.clone();
+    let reveal_handle = handle.clone();
+    window.on_reveal_output_requested(move |output_path| {
+        let path = PathBuf::from(output_path.as_str());
+        let events = reveal_events.clone();
+        reveal_handle.spawn_blocking(move || {
+            if let Err(error) = reveal_file(&path) {
+                let _ = events.send(UiEvent::Status(format!(
+                    "Could not show the downloaded file in its folder: {error}"
+                )));
+            }
+        });
+    });
+
+    let locate_store = store.clone();
+    let locate_events = events_tx.clone();
+    let locate_handle = handle.clone();
+    window.on_locate_library_file_requested(move |id| {
+        let id = id.to_string();
+        let store = locate_store.clone();
+        let events = locate_events.clone();
+        let handle = locate_handle.clone();
+        let _ =
+            events.send(UiEvent::Status("Choose the moved media file to relink it.".to_owned()));
+        handle.spawn(async move {
+            let selected = match tokio::task::spawn_blocking(pick_library_media_file).await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => {
+                    let _ = events.send(UiEvent::Status("Library relink canceled.".to_owned()));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not open the media file picker: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "The media file picker did not complete: {error}"
+                    )));
+                    return;
+                }
+            };
+            if !has_supported_media_extension(&selected) {
+                let _ = events
+                    .send(UiEvent::Status("Choose a supported audio or video file.".to_owned()));
+                return;
+            }
+            let canonical = match tokio::task::spawn_blocking(move || {
+                validate_output_file(&selected)?;
+                std::fs::canonicalize(&selected)
+                    .with_context(|| format!("resolve moved media file {}", selected.display()))
+            })
+            .await
+            {
+                Ok(Ok(path)) => path,
+                Ok(Err(error)) => {
+                    let _ = events
+                        .send(UiEvent::Status(format!("Choose an existing media file: {error}")));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not validate the selected media file: {error}"
+                    )));
+                    return;
+                }
+            };
+            match store
+                .update_completed_output_path(&id, canonical.to_string_lossy().into_owned())
+                .await
+            {
+                Ok(true) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "Updated the library path. The selected file was left in place.".to_owned(),
+                    ));
+                }
+                Ok(false) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(
+                        "This item is no longer a completed download.".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    error!(%error, job_id = %id, "relink moved library file");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not relink the media file: {error}")));
+                }
             }
         });
     });
@@ -2837,6 +3108,191 @@ fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRo
         .collect()
 }
 
+#[cfg(test)]
+fn library_row_views(
+    records: &[DownloadRecord],
+    query: &str,
+    filter: &str,
+    sort: &str,
+) -> Vec<LibraryRowData> {
+    let cache = scan_library_entries(records);
+    library_row_views_from_cache(&cache, query, filter, sort)
+}
+
+fn library_cache_signature_for(records: &[DownloadRecord]) -> LibraryCacheSignature {
+    records
+        .iter()
+        .filter(|record| record.status == "Completed")
+        .map(|record| {
+            (
+                record.id.clone(),
+                record.url.clone(),
+                record.title.clone(),
+                record.source.clone(),
+                record.output_path.clone(),
+                record.download_mode.as_database_value().to_owned(),
+                record.total_bytes,
+                record.updated_at,
+            )
+        })
+        .collect()
+}
+
+fn request_library_scan(
+    events: mpsc::UnboundedSender<UiEvent>,
+    generation: &mut u64,
+    pending_signature: &mut Option<LibraryCacheSignature>,
+    records: Vec<DownloadRecord>,
+    signature: LibraryCacheSignature,
+) {
+    *generation = generation.wrapping_add(1);
+    let request_generation = *generation;
+    *pending_signature = Some(signature.clone());
+    tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(move || scan_library_entries(&records)).await
+        {
+            Ok(entries) => Ok(entries),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = events.send(UiEvent::LibraryScanComplete {
+            generation: request_generation,
+            signature,
+            result,
+        });
+    });
+}
+
+fn scan_library_entries(records: &[DownloadRecord]) -> Vec<LibraryCacheEntry> {
+    records
+        .iter()
+        .filter(|record| record.status == "Completed")
+        .map(|record| {
+            let path = record.output_path.as_deref().unwrap_or_default();
+            let metadata = if path.is_empty() {
+                None
+            } else {
+                std::fs::metadata(path).ok().filter(|metadata| metadata.is_file())
+            };
+            let path_available = metadata.is_some();
+            let kind = match record.download_mode {
+                DownloadMode::Video => "Video",
+                DownloadMode::AudioOnly => "Audio",
+            };
+            let file_format = Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| extension.to_ascii_uppercase())
+                .unwrap_or_else(|| "UNKNOWN".to_owned());
+            let source = if record.source.trim().is_empty() {
+                url::Url::parse(&record.url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .unwrap_or_else(|| "Web media".to_owned())
+            } else {
+                record.source.clone()
+            };
+            let actual_size = metadata.as_ref().map(std::fs::Metadata::len);
+            let size_for_sort = actual_size.or(record.total_bytes);
+            let size_label = match actual_size {
+                Some(bytes) => format!("{} on disk", format_bytes(Some(bytes))),
+                None => record.total_bytes.map_or_else(
+                    || "Size unknown".to_owned(),
+                    |bytes| format!("Last known {}", format_bytes(Some(bytes))),
+                ),
+            };
+            let downloaded_at = chrono::DateTime::from_timestamp(record.updated_at, 0)
+                .map(|timestamp| timestamp.format("%b %d, %Y").to_string())
+                .unwrap_or_else(|| "Unknown date".to_owned());
+            let file_status =
+                if path_available { "Available" } else { "Unavailable · locate moved file" };
+            let searchable_text = [
+                record.title.as_str(),
+                source.as_str(),
+                kind,
+                file_format.as_str(),
+                path,
+                record.url.as_str(),
+            ]
+            .iter()
+            .map(|value| value.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+            LibraryCacheEntry {
+                row: LibraryRowData {
+                    id: SharedString::from(record.id.as_str()),
+                    title: SharedString::from(record.title.as_str()),
+                    source: SharedString::from(source),
+                    kind: SharedString::from(kind),
+                    file_format: SharedString::from(file_format),
+                    file_path: SharedString::from(path),
+                    file_status: SharedString::from(file_status),
+                    size_label: SharedString::from(size_label),
+                    downloaded_at: SharedString::from(downloaded_at),
+                    path_available,
+                },
+                searchable_text,
+                title_sort_key: record.title.to_lowercase(),
+                downloaded_at: record.updated_at,
+                size_for_sort,
+            }
+        })
+        .collect()
+}
+
+fn library_row_views_from_cache(
+    cache: &[LibraryCacheEntry],
+    query: &str,
+    filter: &str,
+    sort: &str,
+) -> Vec<LibraryRowData> {
+    let query = query.trim().to_lowercase();
+    let mut rows = cache
+        .iter()
+        .filter(|entry| match filter {
+            "Video" => entry.row.kind.as_str() == "Video",
+            "Audio" => entry.row.kind.as_str() == "Audio",
+            "Missing files" => !entry.row.path_available,
+            _ => true,
+        })
+        .filter(|entry| query.is_empty() || entry.searchable_text.contains(&query))
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| match sort {
+        "Oldest first" => left
+            .downloaded_at
+            .cmp(&right.downloaded_at)
+            .then_with(|| left.row.id.as_str().cmp(right.row.id.as_str())),
+        "Title A–Z" => left
+            .title_sort_key
+            .cmp(&right.title_sort_key)
+            .then_with(|| left.row.id.as_str().cmp(right.row.id.as_str())),
+        "Largest first" => right
+            .size_for_sort
+            .cmp(&left.size_for_sort)
+            .then_with(|| right.downloaded_at.cmp(&left.downloaded_at))
+            .then_with(|| left.row.id.as_str().cmp(right.row.id.as_str())),
+        _ => right
+            .downloaded_at
+            .cmp(&left.downloaded_at)
+            .then_with(|| left.row.id.as_str().cmp(right.row.id.as_str())),
+    });
+    rows.into_iter()
+        .map(|entry| LibraryRowData {
+            id: entry.row.id.clone(),
+            title: entry.row.title.clone(),
+            source: entry.row.source.clone(),
+            kind: entry.row.kind.clone(),
+            file_format: entry.row.file_format.clone(),
+            file_path: entry.row.file_path.clone(),
+            file_status: entry.row.file_status.clone(),
+            size_label: entry.row.size_label.clone(),
+            downloaded_at: entry.row.downloaded_at.clone(),
+            path_available: entry.row.path_available,
+        })
+        .collect()
+}
+
 fn queue_summary_text(records: &[DownloadRecord]) -> String {
     let pending = records
         .iter()
@@ -3048,6 +3504,51 @@ fn pick_history_export_path() -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+#[cfg(windows)]
+fn pick_library_media_file() -> Result<Option<PathBuf>> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let filter: Vec<u16> = concat!(
+        "Media files\0",
+        "*.3g2;*.3gp;*.aac;*.ac3;*.aif;*.aiff;*.alac;*.amr;*.ape;*.asf;*.au;*.avi;*.caf;*.flac;*.flv;*.m2ts;*.m4a;*.m4b;*.m4v;*.mka;*.mkv;*.mov;*.mp2;*.mp3;*.mp4;*.mpeg;*.mpg;*.oga;*.ogg;*.ogv;*.opus;*.ra;*.rm;*.ts;*.wav;*.webm;*.wma;*.wmv\0\0"
+    )
+    .encode_utf16()
+    .collect();
+    let title: Vec<u16> = "Locate moved media file".encode_utf16().chain(Some(0)).collect();
+    let mut file = vec![0u16; 32_768];
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: 1,
+        lpstrFile: file.as_mut_ptr(),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        let error = unsafe { CommDlgExtendedError() };
+        if error == 0 {
+            return Ok(None);
+        }
+        anyhow::bail!("Windows media file dialog error {error:#x}");
+    }
+    let length = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
+    if length == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(OsString::from_wide(&file[..length]))))
+}
+
+#[cfg(not(windows))]
+fn pick_library_media_file() -> Result<Option<PathBuf>> {
+    anyhow::bail!("the native media file picker is available in Windows builds")
+}
+
 #[cfg(not(windows))]
 fn pick_history_export_path() -> Result<Option<PathBuf>> {
     anyhow::bail!("the native CSV save dialog is available in Windows builds")
@@ -3083,10 +3584,79 @@ fn validate_output_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn has_supported_media_extension(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "3g2"
+            | "3gp"
+            | "aac"
+            | "ac3"
+            | "aif"
+            | "aiff"
+            | "alac"
+            | "amr"
+            | "ape"
+            | "asf"
+            | "au"
+            | "avi"
+            | "caf"
+            | "flac"
+            | "flv"
+            | "m2ts"
+            | "m4a"
+            | "m4b"
+            | "m4v"
+            | "mka"
+            | "mkv"
+            | "mov"
+            | "mp2"
+            | "mp3"
+            | "mp4"
+            | "mpeg"
+            | "mpg"
+            | "oga"
+            | "ogg"
+            | "ogv"
+            | "opus"
+            | "ra"
+            | "rm"
+            | "ts"
+            | "wav"
+            | "webm"
+            | "wma"
+            | "wmv"
+    )
+}
+
 fn open_file(path: &Path) -> Result<()> {
     validate_output_file(path)?;
 
     open_with_platform_handler(path)
+}
+
+fn reveal_file(path: &Path) -> Result<()> {
+    validate_output_file(path)?;
+    reveal_with_platform_file_manager(path)
+}
+
+#[cfg(windows)]
+fn reveal_with_platform_file_manager(path: &Path) -> Result<()> {
+    let selection = format!("/select,{}", path.display());
+    Command::new("explorer.exe")
+        .arg(selection)
+        .spawn()
+        .context("launch Explorer for the selected media file")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reveal_with_platform_file_manager(path: &Path) -> Result<()> {
+    let parent =
+        path.parent().ok_or_else(|| anyhow::anyhow!("media file has no containing folder"))?;
+    open_folder(&parent.to_path_buf())
 }
 
 #[cfg(windows)]
@@ -3259,6 +3829,104 @@ mod tests {
         assert_eq!(rows[0].url.as_str(), "https://media.example.test/featured");
         assert_eq!(rows[0].queue_position.as_str(), "#2");
         assert!(row_views_filtered(&[], "no match").is_empty());
+    }
+
+    #[test]
+    fn media_library_filters_real_files_and_surfaces_missing_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let video_path = temp_dir.join("tutorial.mp4");
+        let audio_path = temp_dir.join("track.mp3");
+        std::fs::write(&video_path, b"video-bytes").unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+
+        let mut video = DownloadRecord::queued(
+            "video".to_owned(),
+            "https://video.example/watch/1".to_owned(),
+            10,
+        );
+        video.title = "Rust tutorial".to_owned();
+        video.source = "Video Example".to_owned();
+        video.status = "Completed".to_owned();
+        video.output_path = Some(video_path.to_string_lossy().into_owned());
+        video.updated_at = 20;
+
+        let mut audio = DownloadRecord::queued(
+            "audio".to_owned(),
+            "https://audio.example/track/2".to_owned(),
+            11,
+        );
+        audio.title = "Quiet track".to_owned();
+        audio.source = "Audio Example".to_owned();
+        audio.status = "Completed".to_owned();
+        audio.download_mode = DownloadMode::AudioOnly;
+        audio.output_path = Some(audio_path.to_string_lossy().into_owned());
+        audio.updated_at = 10;
+
+        let mut missing = DownloadRecord::queued(
+            "missing".to_owned(),
+            "https://video.example/watch/3".to_owned(),
+            12,
+        );
+        missing.title = "Moved tutorial".to_owned();
+        missing.status = "Completed".to_owned();
+        missing.output_path = Some(temp_dir.join("moved.mp4").to_string_lossy().into_owned());
+        missing.updated_at = 30;
+
+        let records = [video, audio, missing];
+        let all = library_row_views(&records, "", "All files", "Newest first");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id.as_str(), "missing");
+        assert!(!all[0].path_available);
+        assert_eq!(all[0].file_status.as_str(), "Unavailable · locate moved file");
+        assert_eq!(all[1].id.as_str(), "video");
+        assert!(all[1].path_available);
+        assert!(all[1].size_label.as_str().contains("on disk"));
+
+        let audio_only = library_row_views(&records, "audio.example", "Audio", "Title A–Z");
+        assert_eq!(audio_only.len(), 1);
+        assert_eq!(audio_only[0].id.as_str(), "audio");
+        let missing_only = library_row_views(&records, "", "Missing files", "Newest first");
+        assert_eq!(missing_only.len(), 1);
+        assert_eq!(missing_only[0].id.as_str(), "missing");
+
+        let largest_first = library_row_views(&records, "", "All files", "Largest first");
+        assert_eq!(largest_first[0].id.as_str(), "video");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn library_relink_accepts_media_extensions_and_rejects_unrelated_files() {
+        assert!(has_supported_media_extension(Path::new("lesson.MP4")));
+        assert!(has_supported_media_extension(Path::new("recording.opus")));
+        assert!(!has_supported_media_extension(Path::new("notes.txt")));
+        assert!(!has_supported_media_extension(Path::new("extensionless")));
+    }
+
+    #[test]
+    fn library_cache_signature_ignores_queue_progress_but_tracks_completed_paths() {
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        completed.status = "Completed".to_owned();
+        completed.output_path = Some("C:/Media/old.mp4".to_owned());
+        let mut queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/queued".to_owned(),
+            11,
+        );
+        let baseline = library_cache_signature_for(&[completed.clone(), queued.clone()]);
+
+        queued.progress = 0.5;
+        completed.progress = 1.0;
+        assert_eq!(baseline, library_cache_signature_for(&[completed.clone(), queued.clone()]));
+
+        completed.output_path = Some("C:/Media/moved.mp4".to_owned());
+        assert_ne!(baseline, library_cache_signature_for(&[completed.clone(), queued.clone()]));
+        completed.status = "Failed".to_owned();
+        assert_ne!(baseline, library_cache_signature_for(&[completed, queued]));
     }
 
     #[test]

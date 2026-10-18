@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a file-backed Library view for completed downloads, with search, media/missing-file filters, date/title/size sorting, Open and Show actions, and relinking for moved files without copying or deleting media.
+- Add regression coverage for library search/filter/sort and missing paths; Windows file-picker and Explorer runtime acceptance remains pending.
 - Add configurable automatic retries for transient HTTP, rate-limit, and temporary network failures, with durable attempt/deadline state, restart recovery, and exponential backoff capped at four minutes.
 - Add an Off-to-five retry selector; pause, cancel, reorder, and priority controls include retry-waiting rows. Permanent URL, access, and dependency failures remain manual.
 - Add regression coverage for retry classification, persisted retry deadlines and counts, due-time promotion, and retry settings. CI and Windows runtime acceptance are pending.

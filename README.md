@@ -2,7 +2,7 @@
 
 Yt Save is a native Rust desktop media downloader for Windows 10 and 11. It coordinates the official [yt-dlp](https://github.com/yt-dlp/yt-dlp) executable, so supported sites are determined by yt-dlp's extractors rather than a YouTube-only URL allowlist. YouTube's full format support is handled by the separately bundled Deno runtime and yt-dlp's bundled `yt-dlp-ejs` component.
 
-The repository is in active development. This build provides URL analysis, a persisted download queue with a user-set concurrency limit, progress reporting, searchable completed history, a file-backed library view, and a custom Slint interface. Playlist preview and selection, per-job pause/resume, a persistent download-folder preference, opt-in clipboard review and a non-activating popup, and system-tray controls are also available; sync subscriptions, advanced library organization, and installed-app acceptance remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
+The repository is in active development. This build provides URL analysis, a persisted download queue with a user-set concurrency limit, progress reporting, searchable completed history, a file-backed library view, and a custom Slint interface. Playlist preview and selection with durable group pause/resume, per-job pause/resume, a persistent download-folder preference, opt-in clipboard review and a non-activating popup, and system-tray controls are also available; sync subscriptions, advanced library organization, and installed-app acceptance remain tracked in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ## Screenshots
 
@@ -15,7 +15,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Native Rust application with a Slint UI and Tokio background work.
 - Accepts HTTP and HTTPS media URLs from any site yt-dlp can extract.
 - Reads media metadata and available format counts through yt-dlp JSON output.
-- Previews up to the first 50 playlist entries. Select all, clear the selection, select an inclusive playlist-index range, or toggle entries individually; entries are selectable only when yt-dlp returns a positive playlist index. Selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
+- Previews up to the first 50 playlist entries. Select all, clear the selection, select an inclusive playlist-index range, or toggle entries individually; entries are selectable only when yt-dlp returns a positive playlist index. Selected entries become separate durable queue jobs with a shared playlist group, so the queue can pause or resume the selected batch together; Add to queue still downloads the whole playlist.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Searches visible queue and history rows locally by title, source, URL, status, format, output path, or error text.
 - Exports the saved history as UTF-8 CSV with queue, media, progress, output, error, and timestamp fields; the Windows Save dialog asks before replacing an existing file.

@@ -373,6 +373,10 @@ pub struct DownloadRecord {
     /// A value of 1 runs ahead of normal priority (0) items.
     pub priority: i32,
     pub playlist_index: Option<i64>,
+    /// Shared durable identifier for entries queued from the same playlist selection.
+    pub playlist_group_id: Option<String>,
+    /// Playlist title shown in queue controls for this selection group.
+    pub playlist_group_title: Option<String>,
     pub download_mode: DownloadMode,
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
@@ -405,6 +409,8 @@ impl DownloadRecord {
             queue_order: 0,
             priority: 0,
             playlist_index: None,
+            playlist_group_id: None,
+            playlist_group_title: None,
             download_mode: DownloadMode::Video,
             audio_format: AudioFormat::Original,
             audio_quality: AudioQuality::Best,

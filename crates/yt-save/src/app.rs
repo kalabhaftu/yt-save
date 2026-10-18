@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -110,6 +111,7 @@ impl Drop for ActiveJobRegistration {
 struct PlaylistSelectionState {
     source_url: String,
     source: String,
+    title: String,
     entries: Vec<PlaylistEntry>,
     selected: Vec<bool>,
 }
@@ -558,6 +560,7 @@ pub fn run() -> Result<()> {
                         Some(PlaylistSelectionState {
                             source_url,
                             source: metadata.source,
+                            title: title.clone(),
                             selected: vec![false; entries.len()],
                             entries,
                         })
@@ -1112,6 +1115,8 @@ pub fn run() -> Result<()> {
                 }
             };
             let destination = destination.to_string_lossy().into_owned();
+            let playlist_group_id = Uuid::new_v4().to_string();
+            let playlist_group_title = selection.title.clone();
             let mut records = Vec::with_capacity(selected_entries.len());
             for (title, playlist_index) in selected_entries {
                 let mut record = DownloadRecord::queued(
@@ -1122,6 +1127,8 @@ pub fn run() -> Result<()> {
                 record.title = title;
                 record.source = selection.source.clone();
                 record.playlist_index = Some(playlist_index);
+                record.playlist_group_id = Some(playlist_group_id.clone());
+                record.playlist_group_title = Some(playlist_group_title.clone());
                 record.download_mode = download_presets.mode;
                 record.audio_format = download_presets.audio_format;
                 record.audio_quality = download_presets.audio_quality;
@@ -1502,6 +1509,62 @@ pub fn run() -> Result<()> {
                     let _ = events
                         .send(UiEvent::Status(format!("Could not pause that download: {error}")));
                 }
+            }
+        });
+    });
+
+    let group_store = store.clone();
+    let group_events = events_tx.clone();
+    let group_wake = queue_wake.clone();
+    let group_active_jobs = active_jobs.clone();
+    let group_handle = handle.clone();
+    let group_shutdown_started = shutdown_started.clone();
+    window.on_playlist_group_action_requested(move |group_id, action| {
+        if group_shutdown_started.load(Ordering::Acquire) {
+            let _ = group_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
+        let group_id = group_id.to_string();
+        let action = action.to_string();
+        let store = group_store.clone();
+        let events = group_events.clone();
+        let active_jobs = group_active_jobs.clone();
+        let queue_wake = group_wake.clone();
+        group_handle.spawn(async move {
+            match action.as_str() {
+                "pause" => match pause_playlist_group(&store, &active_jobs, &group_id).await {
+                    Ok((queued, active)) => {
+                        let _ = events.send(UiEvent::Refresh);
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Paused {queued} queued playlist items and requested pauses for {active} active items."
+                        )));
+                    }
+                    Err(error) => {
+                        error!(%error, playlist_group_id = %group_id, "pause playlist group");
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Could not pause the playlist group: {error}"
+                        )));
+                    }
+                },
+                "resume" => match resume_playlist_group(&store, &group_id).await {
+                    Ok(resumed) => {
+                        let _ = events.send(UiEvent::Refresh);
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Resumed {resumed} paused playlist items."
+                        )));
+                        if resumed > 0 {
+                            queue_wake.notify_one();
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, playlist_group_id = %group_id, "resume playlist group");
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Could not resume the playlist group: {error}"
+                        )));
+                    }
+                },
+                _ => {}
             }
         });
     });
@@ -2502,6 +2565,47 @@ async fn pause_all_downloads(
     Ok((pending_count, active_count))
 }
 
+async fn pause_playlist_group(
+    store: &Store,
+    active_jobs: &ActiveJobs,
+    group_id: &str,
+) -> Result<(usize, usize)> {
+    let records = store.list_downloads().await?;
+    let mut pending_count = 0;
+    let mut active_count = 0;
+    for record in
+        records.into_iter().filter(|record| record.playlist_group_id.as_deref() == Some(group_id))
+    {
+        if matches!(record.status.as_str(), "Queued" | "Waiting for retry")
+            && store.pause_queued_download(&record.id, now()).await?
+        {
+            pending_count += 1;
+            continue;
+        }
+        if matches!(
+            record.status.as_str(),
+            "Analyzing" | "Downloading" | "Post-processing" | "Pausing"
+        ) && request_pause_for_active_record(store, active_jobs, &record).await?
+        {
+            active_count += 1;
+        }
+    }
+    Ok((pending_count, active_count))
+}
+
+async fn resume_playlist_group(store: &Store, group_id: &str) -> Result<usize> {
+    let records = store.list_downloads().await?;
+    let mut resumed_count = 0;
+    for record in records.into_iter().filter(|record| {
+        record.playlist_group_id.as_deref() == Some(group_id) && record.status == "Paused"
+    }) {
+        if store.resume_download(&record.id, now()).await?.is_some() {
+            resumed_count += 1;
+        }
+    }
+    Ok(resumed_count)
+}
+
 async fn request_pause_for_active_record(
     store: &Store,
     active_jobs: &ActiveJobs,
@@ -3171,6 +3275,7 @@ fn row_views(records: &[DownloadRecord]) -> Vec<DownloadRowData> {
 fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRowData> {
     let query = query.trim().to_lowercase();
     let mut position = 0usize;
+    let mut displayed_groups = HashSet::new();
     records
         .iter()
         .filter_map(|record| {
@@ -3196,12 +3301,52 @@ fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRo
                     record.audio_format.as_database_value(),
                     record.audio_quality.as_database_value(),
                     record.video_quality.as_database_value(),
+                    record.playlist_group_title.as_deref().unwrap_or_default(),
                 ]
                 .iter()
                 .any(|value| value.to_lowercase().contains(&query));
-            matches_query.then(|| row_view_with_queue_position(record, &queue_position))
+            if !matches_query {
+                return None;
+            }
+            let group_action = record.playlist_group_id.as_deref().and_then(|group_id| {
+                displayed_groups
+                    .insert(group_id.to_owned())
+                    .then(|| playlist_group_action_label(records, group_id))
+                    .flatten()
+            });
+            Some(row_view_with_queue_position(
+                record,
+                &queue_position,
+                group_action.map_or("", |(action, _)| action),
+                group_action.map_or("", |(_, group_id)| group_id),
+            ))
         })
         .collect()
+}
+
+fn playlist_group_action_label<'a>(
+    records: &'a [DownloadRecord],
+    group_id: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    let mut has_pending = false;
+    let mut has_paused = false;
+    for record in
+        records.iter().filter(|record| record.playlist_group_id.as_deref() == Some(group_id))
+    {
+        match record.status.as_str() {
+            "Queued" | "Waiting for retry" | "Analyzing" | "Downloading" | "Post-processing"
+            | "Pausing" => has_pending = true,
+            "Paused" => has_paused = true,
+            _ => {}
+        }
+    }
+    if has_pending {
+        Some(("Pause group", group_id))
+    } else if has_paused {
+        Some(("Resume group", group_id))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3438,7 +3583,12 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     }
 }
 
-fn row_view_with_queue_position(record: &DownloadRecord, queue_position: &str) -> DownloadRowData {
+fn row_view_with_queue_position(
+    record: &DownloadRecord,
+    queue_position: &str,
+    group_action: &str,
+    group_id: &str,
+) -> DownloadRowData {
     let details = if record.status == "Waiting for retry" {
         let scheduled = record
             .next_retry_at
@@ -3475,7 +3625,13 @@ fn row_view_with_queue_position(record: &DownloadRecord, queue_position: &str) -
         }
         DownloadMode::AudioOnly => format!("Audio · {}", record.audio_format.label()),
     };
-    let details = format!("{selection} · {details}");
+    let playlist_group = record
+        .playlist_group_title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+        .map(|title| format!("Playlist · {title} · "))
+        .unwrap_or_default();
+    let details = format!("{playlist_group}{selection} · {details}");
     DownloadRowData {
         id: SharedString::from(record.id.as_str()),
         title: SharedString::from(record.title.as_str()),
@@ -3487,6 +3643,8 @@ fn row_view_with_queue_position(record: &DownloadRecord, queue_position: &str) -
         output_path: SharedString::from(record.output_path.as_deref().unwrap_or_default()),
         queue_position: SharedString::from(queue_position),
         priority: record.priority,
+        playlist_group_id: SharedString::from(group_id),
+        playlist_group_action: SharedString::from(group_action),
     }
 }
 
@@ -3830,6 +3988,7 @@ mod tests {
         let mut selection = PlaylistSelectionState {
             source_url: "https://example.test/playlist".to_owned(),
             source: "Example".to_owned(),
+            title: "Example playlist".to_owned(),
             entries: vec![
                 PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
                 PlaylistEntry { playlist_index: None, title: "Unavailable".to_owned() },
@@ -3853,6 +4012,7 @@ mod tests {
         let mut selection = PlaylistSelectionState {
             source_url: "https://example.test/playlist".to_owned(),
             source: "Example".to_owned(),
+            title: "Example playlist".to_owned(),
             entries: vec![
                 PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
                 PlaylistEntry { playlist_index: Some(2), title: "Second".to_owned() },
@@ -4104,9 +4264,103 @@ mod tests {
         record.downloaded_bytes = Some(22);
         record.total_bytes = Some(100);
 
-        let row = row_view_with_queue_position(&record, "");
+        let row = row_view_with_queue_position(&record, "", "", "");
         assert!(row.detail.as_str().contains(record.error.as_deref().unwrap()));
         assert!(row.detail.as_str().starts_with("Video · "));
+    }
+
+    #[test]
+    fn playlist_group_controls_reflect_all_members_and_survive_queue_filtering() {
+        let group_id = "playlist-group";
+        let mut queued = DownloadRecord::queued(
+            "queued-entry".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            10,
+        );
+        queued.title = "First entry".to_owned();
+        queued.status = "Queued".to_owned();
+        queued.playlist_group_id = Some(group_id.to_owned());
+        queued.playlist_group_title = Some("Example playlist".to_owned());
+        let mut paused = DownloadRecord::queued(
+            "paused-entry".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            11,
+        );
+        paused.title = "Second entry".to_owned();
+        paused.status = "Paused".to_owned();
+        paused.playlist_group_id = Some(group_id.to_owned());
+        paused.playlist_group_title = Some("Example playlist".to_owned());
+
+        let rows = row_views_filtered(&[queued.clone(), paused.clone()], "Second entry");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].playlist_group_id.as_str(), group_id);
+        assert_eq!(rows[0].playlist_group_action.as_str(), "Pause group");
+        assert!(rows[0].detail.as_str().contains("Playlist · Example playlist"));
+
+        queued.status = "Completed".to_owned();
+        let rows = row_views_filtered(&[queued.clone(), paused.clone()], "Second entry");
+        assert_eq!(rows[0].playlist_group_action.as_str(), "Resume group");
+
+        paused.status = "Completed".to_owned();
+        let rows = row_views_filtered(&[queued, paused], "Second entry");
+        assert!(rows[0].playlist_group_action.is_empty());
+        assert!(rows[0].playlist_group_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_group_pause_and_resume_transitions_waiting_items_and_signals_active_jobs() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut queued = DownloadRecord::queued(
+            "group-queued".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            10,
+        );
+        queued.playlist_group_id = Some("group-1".to_owned());
+        let mut retry = DownloadRecord::queued(
+            "group-retry".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            11,
+        );
+        retry.status = "Waiting for retry".to_owned();
+        retry.playlist_group_id = Some("group-1".to_owned());
+        let mut active = DownloadRecord::queued(
+            "group-active".to_owned(),
+            "https://example.test/playlist".to_owned(),
+            12,
+        );
+        active.status = "Downloading".to_owned();
+        active.playlist_group_id = Some("group-1".to_owned());
+        let unrelated = DownloadRecord::queued(
+            "other-queued".to_owned(),
+            "https://example.test/other".to_owned(),
+            13,
+        );
+        store.save_downloads(vec![queued, retry, active, unrelated]).await.unwrap();
+
+        let (active_sender, active_signal) = watch::channel(JobSignal::Continue);
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            "group-active".to_owned(),
+            Arc::new(active_sender),
+        )])));
+        assert_eq!(pause_playlist_group(&store, &active_jobs, "group-1").await.unwrap(), (2, 1));
+        assert_eq!(*active_signal.borrow(), JobSignal::Pause);
+
+        let rows = store.list_downloads().await.unwrap();
+        for id in ["group-queued", "group-retry"] {
+            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Paused");
+        }
+        assert_eq!(rows.iter().find(|row| row.id == "group-active").unwrap().status, "Pausing");
+        assert_eq!(rows.iter().find(|row| row.id == "other-queued").unwrap().status, "Queued");
+
+        assert_eq!(resume_playlist_group(&store, "group-1").await.unwrap(), 2);
+        let rows = store.list_downloads().await.unwrap();
+        for id in ["group-queued", "group-retry"] {
+            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Queued");
+        }
+        assert_eq!(rows.iter().find(|row| row.id == "group-active").unwrap().status, "Pausing");
+        assert_eq!(rows.iter().find(|row| row.id == "other-queued").unwrap().status, "Queued");
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
@@ -4121,7 +4375,7 @@ mod tests {
         record.next_retry_at = Some(1_700_000_000);
         record.error = Some("A temporary network issue interrupted this media request.".to_owned());
 
-        let row = row_view_with_queue_position(&record, "Retry");
+        let row = row_view_with_queue_position(&record, "Retry", "", "");
         assert_eq!(row.status.as_str(), "Waiting for retry");
         assert_eq!(row.queue_position.as_str(), "Retry");
         assert!(row.detail.as_str().contains("Retry 2 scheduled for"));
@@ -4138,7 +4392,7 @@ mod tests {
         record.download_mode = DownloadMode::AudioOnly;
         record.audio_format = AudioFormat::Mp3;
 
-        let row = row_view_with_queue_position(&record, "");
+        let row = row_view_with_queue_position(&record, "", "", "");
 
         assert!(row.detail.as_str().starts_with("Audio · MP3 · Best · "));
     }

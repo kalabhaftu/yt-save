@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add durable playlist-group identity and queue actions to pause or resume all selected entries together, including active jobs while preserving partial files.
+- Add SQLite migration and queue-view coverage for playlist group persistence, mixed group states, and filtered queue views.
 - Add Select all, Select none, and inclusive index-range selection to playlist previews; entries without valid playlist indexes remain unselectable.
 - Add a file-backed Library view for completed downloads, with search, media/missing-file filters, date/title/size sorting, Open and Show actions, and relinking for moved files without copying or deleting media.
 - Add regression coverage for library search/filter/sort and missing paths; Windows file-picker and Explorer runtime acceptance remains pending.

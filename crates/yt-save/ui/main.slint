@@ -11,6 +11,8 @@ struct DownloadRowData {
     output-path: string,
     queue-position: string,
     priority: int,
+    playlist-group-id: string,
+    playlist-group-action: string,
 }
 
 struct PlaylistEntryRowData {
@@ -135,6 +137,7 @@ export component MainWindow inherits Window {
     callback remove-download-requested(string);
     callback retry-download-requested(string);
     callback queue-move-requested(string, string);
+    callback playlist-group-action-requested(string, string);
     callback download-priority-requested(string, int);
     callback max-concurrent-downloads-requested(string);
     callback concurrent-fragments-requested(string);
@@ -1161,6 +1164,21 @@ export component MainWindow inherits Window {
                                         HorizontalLayout {
                                             spacing: 5px;
                                             Text { text: row.detail; color: #757e97; font-size: 10px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                            if row.playlist-group-action != "" : Rectangle {
+                                                width: 96px;
+                                                height: 22px;
+                                                border-radius: 6px;
+                                                background: #252a39;
+                                                Text { text: row.playlist-group-action; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea {
+                                                    clicked => {
+                                                        root.playlist-group-action-requested(
+                                                            row.playlist-group-id,
+                                                            row.playlist-group-action == "Pause group" ? "pause" : "resume"
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             if row.queue-position != "" : HorizontalLayout {
                                                 spacing: 4px;
                                                 Text { text: row.queue-position; color: #a9b0c4; font-size: 10px; vertical-alignment: center; }

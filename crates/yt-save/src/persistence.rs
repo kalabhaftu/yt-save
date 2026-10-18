@@ -63,6 +63,8 @@ impl Store {
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     playlist_index INTEGER,
+                    playlist_group_id TEXT,
+                    playlist_group_title TEXT,
                     download_mode TEXT NOT NULL DEFAULT 'video',
                     audio_format TEXT NOT NULL DEFAULT 'original',
                     audio_quality TEXT NOT NULL DEFAULT 'best',
@@ -101,6 +103,8 @@ impl Store {
                 ("download_directory", "TEXT NOT NULL DEFAULT ''"),
                 ("retry_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("next_retry_at", "INTEGER"),
+                ("playlist_group_id", "TEXT"),
+                ("playlist_group_title", "TEXT"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -1247,13 +1251,15 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             id, url, title, source, status, progress, downloaded_bytes,
             total_bytes, speed_bytes_per_second, eta_seconds, output_path,
             error, created_at, updated_at, playlist_index,
+            playlist_group_id, playlist_group_title,
             download_mode, audio_format, audio_quality, video_quality,
             download_directory, queue_rank, priority, retry_attempts, next_retry_at
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
-            :playlist_index, :download_mode, :audio_format, :audio_quality,
-            :video_quality, :download_directory,
+            :playlist_index, :playlist_group_id, :playlist_group_title,
+            :download_mode, :audio_format, :audio_quality, :video_quality,
+            :download_directory,
             coalesce((SELECT max(queue_rank) FROM downloads
                       WHERE priority = :priority), 0) + 1024,
             :priority, :retry_attempts, :next_retry_at
@@ -1266,6 +1272,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             eta_seconds=excluded.eta_seconds, output_path=excluded.output_path,
             error=excluded.error, updated_at=excluded.updated_at,
             playlist_index=excluded.playlist_index,
+            playlist_group_id=excluded.playlist_group_id,
+            playlist_group_title=excluded.playlist_group_title,
             download_mode=excluded.download_mode,
             audio_format=excluded.audio_format,
             audio_quality=excluded.audio_quality,
@@ -1289,6 +1297,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":created": record.created_at,
             ":updated": record.updated_at,
             ":playlist_index": record.playlist_index,
+            ":playlist_group_id": record.playlist_group_id,
+            ":playlist_group_title": record.playlist_group_title,
             ":download_mode": record.download_mode.as_database_value(),
             ":audio_format": record.audio_format.as_database_value(),
             ":audio_quality": record.audio_quality.as_database_value(),
@@ -1318,6 +1328,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
+                playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at
          FROM downloads WHERE id = :id",
@@ -1340,15 +1351,17 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
                 playlist_index: row.get(14)?,
-                download_mode: download_mode_from_row(row, 15)?,
-                audio_format: audio_format_from_row(row, 16)?,
-                audio_quality: audio_quality_from_row(row, 17)?,
-                video_quality: video_quality_from_row(row, 18)?,
-                download_directory: row.get(21)?,
-                queue_order: row.get(19)?,
-                priority: row.get(20)?,
-                retry_attempts: retry_attempts_from_row(row, 22)?,
-                next_retry_at: row.get(23)?,
+                playlist_group_id: row.get(15)?,
+                playlist_group_title: row.get(16)?,
+                download_mode: download_mode_from_row(row, 17)?,
+                audio_format: audio_format_from_row(row, 18)?,
+                audio_quality: audio_quality_from_row(row, 19)?,
+                video_quality: video_quality_from_row(row, 20)?,
+                download_directory: row.get(23)?,
+                queue_order: row.get(21)?,
+                priority: row.get(22)?,
+                retry_attempts: retry_attempts_from_row(row, 24)?,
+                next_retry_at: row.get(25)?,
             })
         })
         .optional()?;
@@ -1369,6 +1382,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
         "SELECT id, url, title, source, status, progress, downloaded_bytes,
                 total_bytes, speed_bytes_per_second, eta_seconds, output_path,
                 error, created_at, updated_at, playlist_index,
+                playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at
          FROM downloads
@@ -1395,15 +1409,17 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
             playlist_index: row.get(14)?,
-            download_mode: download_mode_from_row(row, 15)?,
-            audio_format: audio_format_from_row(row, 16)?,
-            audio_quality: audio_quality_from_row(row, 17)?,
-            video_quality: video_quality_from_row(row, 18)?,
-            download_directory: row.get(21)?,
-            queue_order: row.get(19)?,
-            priority: row.get(20)?,
-            retry_attempts: retry_attempts_from_row(row, 22)?,
-            next_retry_at: row.get(23)?,
+            playlist_group_id: row.get(15)?,
+            playlist_group_title: row.get(16)?,
+            download_mode: download_mode_from_row(row, 17)?,
+            audio_format: audio_format_from_row(row, 18)?,
+            audio_quality: audio_quality_from_row(row, 19)?,
+            video_quality: video_quality_from_row(row, 20)?,
+            download_directory: row.get(23)?,
+            queue_order: row.get(21)?,
+            priority: row.get(22)?,
+            retry_attempts: retry_attempts_from_row(row, 24)?,
+            next_retry_at: row.get(25)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -2165,6 +2181,8 @@ mod tests {
         assert_eq!(legacy.queue_order, 1024);
         assert_eq!(legacy.priority, 0);
         assert_eq!(legacy.playlist_index, None);
+        assert_eq!(legacy.playlist_group_id, None);
+        assert_eq!(legacy.playlist_group_title, None);
         assert_eq!(legacy.download_mode, DownloadMode::Video);
         assert_eq!(legacy.audio_format, AudioFormat::Original);
         assert_eq!(legacy.audio_quality, AudioQuality::Best);
@@ -2179,6 +2197,8 @@ mod tests {
             30,
         );
         selected.playlist_index = Some(7);
+        selected.playlist_group_id = Some("playlist-group-1".to_owned());
+        selected.playlist_group_title = Some("Selected playlist".to_owned());
         selected.download_mode = DownloadMode::AudioOnly;
         selected.audio_format = AudioFormat::M4a;
         selected.audio_quality = AudioQuality::K192;
@@ -2197,6 +2217,8 @@ mod tests {
             .unwrap();
         assert_eq!(selected.url, "https://example.test/list");
         assert_eq!(selected.playlist_index, Some(7));
+        assert_eq!(selected.playlist_group_id.as_deref(), Some("playlist-group-1"));
+        assert_eq!(selected.playlist_group_title.as_deref(), Some("Selected playlist"));
         assert_eq!(selected.download_mode, DownloadMode::AudioOnly);
         assert_eq!(selected.audio_format, AudioFormat::M4a);
         assert_eq!(selected.audio_quality, AudioQuality::K192);

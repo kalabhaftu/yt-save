@@ -109,6 +109,7 @@ export component MainWindow inherits Window {
     callback analyze-requested(string);
     callback enqueue-requested(string);
     callback playlist-entry-toggle-requested(int);
+    callback playlist-selection-set-requested(bool);
     callback enqueue-selected-playlist-entries-requested();
     callback clipboard-monitoring-requested(bool);
     callback clipboard-candidate-dismissed();
@@ -853,7 +854,22 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 ActionButton {
+                                    label: "Select all";
+                                    button-height: 30px;
+                                    button-min-width: 82px;
+                                    is-enabled: root.selectable-playlist-count > root.selected-playlist-count;
+                                    clicked => { root.playlist-selection-set-requested(true); }
+                                }
+                                ActionButton {
+                                    label: "Select none";
+                                    button-height: 30px;
+                                    button-min-width: 90px;
+                                    is-enabled: root.selected-playlist-count > 0;
+                                    clicked => { root.playlist-selection-set-requested(false); }
+                                }
+                                ActionButton {
                                     label: "Add selected";
+                                    button-height: 30px;
                                     min-width: 170px;
                                     primary: true;
                                     is-enabled: root.selected-playlist-count > 0;

@@ -124,6 +124,12 @@ impl PlaylistSelectionState {
     }
 }
 
+fn set_playlist_selection(selection: &mut PlaylistSelectionState, selected: bool) {
+    for (entry, selected_entry) in selection.entries.iter().zip(selection.selected.iter_mut()) {
+        *selected_entry = selected && entry.playlist_index.is_some();
+    }
+}
+
 fn playlist_entry_rows(selection: &PlaylistSelectionState) -> Vec<PlaylistEntryRowData> {
     selection
         .entries
@@ -917,6 +923,26 @@ pub fn run() -> Result<()> {
         let selected_count = selection.selected_count();
         let selectable_count = selection.selectable_count();
         if let Some(window) = toggle_window.upgrade() {
+            window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
+            window.set_selected_playlist_count(selected_count as i32);
+            window.set_selectable_playlist_count(selectable_count as i32);
+            window.set_playlist_selection_summary(selection_summary(
+                selected_count,
+                selectable_count,
+            ));
+        }
+    });
+
+    let set_selection_state = playlist_selection.clone();
+    let set_selection_window = window.as_weak();
+    window.on_playlist_selection_set_requested(move |selected| {
+        let Ok(mut state) = set_selection_state.lock() else { return };
+        let Some(selection) = state.as_mut() else { return };
+        set_playlist_selection(selection, selected);
+        let rows = playlist_entry_rows(selection);
+        let selected_count = selection.selected_count();
+        let selectable_count = selection.selectable_count();
+        if let Some(window) = set_selection_window.upgrade() {
             window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
             window.set_selected_playlist_count(selected_count as i32);
             window.set_selectable_playlist_count(selectable_count as i32);
@@ -3727,6 +3753,29 @@ mod tests {
         assert_eq!(automatic_retry_delay_secs(4), AUTO_RETRY_MAX_DELAY_SECS);
         assert_eq!(automatic_retry_delay_secs(20), AUTO_RETRY_MAX_DELAY_SECS);
         assert_eq!(automatic_retry_delay_secs(u32::MAX), AUTO_RETRY_MAX_DELAY_SECS);
+    }
+
+    #[test]
+    fn playlist_select_all_and_none_ignore_entries_without_indexes() {
+        let mut selection = PlaylistSelectionState {
+            source_url: "https://example.test/playlist".to_owned(),
+            source: "Example".to_owned(),
+            entries: vec![
+                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
+                PlaylistEntry { playlist_index: None, title: "Unavailable".to_owned() },
+                PlaylistEntry { playlist_index: Some(3), title: "Third".to_owned() },
+            ],
+            selected: vec![false, false, false],
+        };
+
+        set_playlist_selection(&mut selection, true);
+        assert_eq!(selection.selected, [true, false, true]);
+        assert_eq!(selection.selected_count(), 2);
+        assert_eq!(selection.selectable_count(), 2);
+
+        set_playlist_selection(&mut selection, false);
+        assert_eq!(selection.selected, [false, false, false]);
+        assert_eq!(selection.selected_count(), 0);
     }
 
     #[tokio::test]

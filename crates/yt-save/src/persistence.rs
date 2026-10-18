@@ -77,7 +77,8 @@ impl Store {
                     next_retry_at INTEGER,
                     subtitle_languages TEXT NOT NULL DEFAULT 'en',
                     subtitle_format TEXT NOT NULL DEFAULT 'vtt',
-                    include_auto_subtitles INTEGER NOT NULL DEFAULT 0
+                    include_auto_subtitles INTEGER NOT NULL DEFAULT 0,
+                    scheduled_at INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -112,6 +113,7 @@ impl Store {
                 ("subtitle_languages", "TEXT NOT NULL DEFAULT 'en'"),
                 ("subtitle_format", "TEXT NOT NULL DEFAULT 'vtt'"),
                 ("include_auto_subtitles", "INTEGER NOT NULL DEFAULT 0"),
+                ("scheduled_at", "INTEGER"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -416,6 +418,46 @@ impl Store {
         .context("join next retry deadline read")?
     }
 
+    /// Promotes scheduled jobs whose one-time run time has arrived.
+    /// Paused jobs are left alone so their schedule remains available on resume.
+    pub async fn promote_due_scheduled_downloads(&self, timestamp: i64) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let promoted = connection.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', scheduled_at = NULL, updated_at = :now
+                     WHERE status = 'Waiting for schedule'
+                       AND scheduled_at IS NOT NULL
+                       AND scheduled_at <= :now",
+                    named_params! { ":now": timestamp },
+                )?;
+                Ok(promoted)
+            })
+        })
+        .await
+        .context("join due scheduled download update")?
+    }
+
+    /// Returns the next active scheduled-job deadline for dispatcher timer scheduling.
+    pub async fn next_scheduled_at(&self) -> Result<Option<i64>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT min(scheduled_at) FROM downloads
+                         WHERE status = 'Waiting for schedule' AND scheduled_at IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+        })
+        .await
+        .context("join next scheduled download read")?
+    }
+
     /// Saves a retryable failure only while its worker still owns an active queue item.
     pub async fn schedule_automatic_retry(
         &self,
@@ -658,6 +700,14 @@ impl Store {
             store.with_connection_mut(|connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', scheduled_at = NULL, updated_at = :now
+                     WHERE status = 'Waiting for schedule'
+                       AND scheduled_at IS NOT NULL
+                       AND scheduled_at <= :now",
+                    named_params! { ":now": updated_at },
+                )?;
                 let next_id = transaction
                     .query_row(
                         "SELECT id FROM downloads WHERE status = 'Queued'
@@ -694,7 +744,7 @@ impl Store {
                 let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let selected = transaction
                     .query_row(
-                    "SELECT priority FROM downloads WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
+                        "SELECT priority FROM downloads WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule')",
                         named_params! { ":id": id },
                         |row| row.get::<_, i32>(0),
                     )
@@ -704,7 +754,7 @@ impl Store {
                     return Ok(false);
                 };
                 let mut statement = transaction.prepare(
-                    "SELECT id FROM downloads WHERE status IN ('Queued', 'Waiting for retry', 'Paused') AND priority = :priority
+                    "SELECT id FROM downloads WHERE status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') AND priority = :priority
                      ORDER BY queue_rank ASC, rowid ASC",
                 )?;
                 let rows = statement.query_map(named_params! { ":priority": priority }, |row| row.get::<_, String>(0))?;
@@ -734,7 +784,7 @@ impl Store {
                     )?;
                     for (rank_index, item_id) in ids.iter().enumerate() {
                         transaction.execute(
-                            "UPDATE downloads SET queue_rank = :rank WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
+                            "UPDATE downloads SET queue_rank = :rank WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule')",
                             named_params! {
                                 ":rank": base_rank + (rank_index as i64 + 1) * 1024,
                                 ":id": item_id,
@@ -768,7 +818,7 @@ impl Store {
                              WHERE existing.priority = :priority
                                AND existing.id <> downloads.id
                          ), 0) + 1024
-                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule')
                        AND priority <> :priority",
                     named_params! {
                         ":priority": priority.clamp(0, 1),
@@ -849,7 +899,7 @@ impl Store {
                 let affected = connection.execute(
                     "UPDATE downloads
                      SET status = 'Paused', next_retry_at = NULL, error = NULL, updated_at = :updated
-                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry')",
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Waiting for schedule')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
@@ -867,8 +917,9 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Canceled', next_retry_at = NULL, error = NULL, updated_at = :updated
-                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused')",
+                     SET status = 'Canceled', next_retry_at = NULL, scheduled_at = NULL,
+                         error = NULL, updated_at = :updated
+                     WHERE id = :id AND status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule')",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
                 Ok(affected > 0)
@@ -1184,7 +1235,7 @@ impl Store {
                 let affected = connection.execute(
                     "UPDATE downloads
                      SET status = 'Queued', error = NULL, retry_attempts = 0,
-                         next_retry_at = NULL, updated_at = :updated,
+                         next_retry_at = NULL, scheduled_at = NULL, updated_at = :updated,
                          queue_rank = coalesce((
                              SELECT max(queue_rank) FROM downloads AS existing
                              WHERE existing.priority = downloads.priority
@@ -1216,7 +1267,17 @@ impl Store {
             store.with_connection(|connection| {
                 let affected = connection.execute(
                     "UPDATE downloads
-                     SET status = 'Queued', error = NULL, next_retry_at = NULL, updated_at = :updated
+                     SET status = CASE
+                             WHEN scheduled_at IS NOT NULL AND scheduled_at > :updated
+                                 THEN 'Waiting for schedule'
+                             ELSE 'Queued'
+                         END,
+                         scheduled_at = CASE
+                             WHEN scheduled_at IS NOT NULL AND scheduled_at > :updated
+                                 THEN scheduled_at
+                             ELSE NULL
+                         END,
+                         error = NULL, next_retry_at = NULL, updated_at = :updated
                      WHERE id = :id AND status = 'Paused'",
                     named_params! { ":id": id, ":updated": updated_at },
                 )?;
@@ -1261,7 +1322,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             playlist_group_id, playlist_group_title,
             download_mode, audio_format, audio_quality, video_quality,
             download_directory, queue_rank, priority, retry_attempts, next_retry_at,
-            subtitle_languages, subtitle_format, include_auto_subtitles
+            subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -1271,7 +1332,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             coalesce((SELECT max(queue_rank) FROM downloads
                       WHERE priority = :priority), 0) + 1024,
             :priority, :retry_attempts, :next_retry_at,
-            :subtitle_languages, :subtitle_format, :include_auto_subtitles
+            :subtitle_languages, :subtitle_format, :include_auto_subtitles, :scheduled_at
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -1292,7 +1353,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             next_retry_at=excluded.next_retry_at,
             subtitle_languages=excluded.subtitle_languages,
             subtitle_format=excluded.subtitle_format,
-            include_auto_subtitles=excluded.include_auto_subtitles",
+            include_auto_subtitles=excluded.include_auto_subtitles,
+            scheduled_at=excluded.scheduled_at",
         named_params! {
             ":id": record.id,
             ":url": record.url,
@@ -1322,6 +1384,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":subtitle_languages": record.subtitle_languages,
             ":subtitle_format": record.subtitle_format.as_database_value(),
             ":include_auto_subtitles": record.include_auto_subtitles,
+            ":scheduled_at": record.scheduled_at,
         },
     )?;
     Ok(())
@@ -1346,7 +1409,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
-                subtitle_languages, subtitle_format, include_auto_subtitles
+                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -1381,6 +1444,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 subtitle_languages: row.get(26)?,
                 subtitle_format: subtitle_format_from_row(row, 27)?,
                 include_auto_subtitles: row.get(28)?,
+                scheduled_at: row.get(29)?,
             })
         })
         .optional()?;
@@ -1404,12 +1468,12 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
-                subtitle_languages, subtitle_format, include_auto_subtitles
+                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
          FROM downloads
-        ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN 0 ELSE 1 END,
-                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN priority ELSE 0 END DESC,
-                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN queue_rank ELSE 0 END ASC,
-                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN rowid ELSE 0 END ASC,
+        ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN 0 ELSE 1 END,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN priority ELSE 0 END DESC,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN queue_rank ELSE 0 END ASC,
+                  CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN rowid ELSE 0 END ASC,
                   created_at DESC, rowid DESC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1443,6 +1507,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             subtitle_languages: row.get(26)?,
             subtitle_format: subtitle_format_from_row(row, 27)?,
             include_auto_subtitles: row.get(28)?,
+            scheduled_at: row.get(29)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -2227,6 +2292,7 @@ mod tests {
         assert_eq!(legacy.download_directory, legacy_default);
         assert_eq!(legacy.retry_attempts, 0);
         assert_eq!(legacy.next_retry_at, None);
+        assert_eq!(legacy.scheduled_at, None);
 
         let mut selected = DownloadRecord::queued(
             "selected-job".to_owned(),
@@ -2466,6 +2532,7 @@ mod tests {
         failed.total_bytes = Some(1_000);
         failed.retry_attempts = 4;
         failed.next_retry_at = Some(100);
+        failed.scheduled_at = Some(200);
         failed.error = Some("temporary network error".to_owned());
         failed.playlist_index = Some(5);
         failed.download_mode = DownloadMode::AudioOnly;
@@ -2495,8 +2562,111 @@ mod tests {
         assert_eq!(retried.video_quality, VideoQuality::P1080);
         assert_eq!(retried.retry_attempts, 0);
         assert_eq!(retried.next_retry_at, None);
+        assert_eq!(retried.scheduled_at, None);
         assert!(store.retry_download("failed", 21).await.unwrap().is_none());
         assert!(store.retry_download("queued", 22).await.unwrap().is_none());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_rows_survive_reopen_and_only_become_claimable_when_due() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+        for (id, scheduled_at) in [("future", 101), ("due", 100)] {
+            let mut scheduled = DownloadRecord::queued(
+                id.to_owned(),
+                "https://example.test/media".to_owned(),
+                scheduled_at - 90,
+            );
+            scheduled.status = "Waiting for schedule".to_owned();
+            scheduled.scheduled_at = Some(scheduled_at);
+            store.save_download(scheduled).await.unwrap();
+        }
+        assert!(store.next_queued_download().await.unwrap().is_none());
+        assert_eq!(store.next_scheduled_at().await.unwrap(), Some(100));
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        let restored = reopened.list_downloads().await.unwrap();
+        for (id, scheduled_at) in [("future", 101), ("due", 100)] {
+            let row = restored.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.status, "Waiting for schedule");
+            assert!(row.scheduled_at.is_some());
+            assert_eq!(row.scheduled_at, Some(scheduled_at));
+        }
+        assert_eq!(reopened.promote_due_scheduled_downloads(99).await.unwrap(), 0);
+        assert!(reopened.claim_queued_download_if_next("due", 99).await.unwrap().is_none());
+
+        assert_eq!(reopened.promote_due_scheduled_downloads(100).await.unwrap(), 1);
+        let claimed_due =
+            reopened.claim_queued_download_if_next("due", 100).await.unwrap().unwrap();
+        assert_eq!(claimed_due.status, "Analyzing");
+        assert_eq!(claimed_due.scheduled_at, None);
+        assert!(reopened.claim_queued_download_if_next("future", 100).await.unwrap().is_none());
+
+        assert_eq!(reopened.promote_due_scheduled_downloads(101).await.unwrap(), 1);
+        let claimed_future =
+            reopened.claim_queued_download_if_next("future", 101).await.unwrap().unwrap();
+        assert_eq!(claimed_future.status, "Analyzing");
+        assert_eq!(claimed_future.scheduled_at, None);
+        assert_eq!(reopened.next_scheduled_at().await.unwrap(), None);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_pause_preserves_deadline_until_resume_and_cancel_clears_it() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        for (id, scheduled_at) in [("resumable", 200), ("overdue", 200), ("cancel-me", 300)] {
+            let mut scheduled =
+                DownloadRecord::queued(id.to_owned(), "https://example.test/media".to_owned(), 10);
+            scheduled.status = "Waiting for schedule".to_owned();
+            scheduled.scheduled_at = Some(scheduled_at);
+            store.save_download(scheduled).await.unwrap();
+        }
+
+        assert!(store.pause_queued_download("resumable", 20).await.unwrap());
+        let paused = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "resumable")
+            .unwrap();
+        assert_eq!(paused.status, "Paused");
+        assert_eq!(paused.scheduled_at, Some(200));
+        assert_eq!(store.promote_due_scheduled_downloads(250).await.unwrap(), 1);
+        let still_paused = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "resumable")
+            .unwrap();
+        assert_eq!(still_paused.status, "Paused");
+        assert_eq!(still_paused.scheduled_at, Some(200));
+
+        let resumed_before_due = store.resume_download("resumable", 100).await.unwrap().unwrap();
+        assert_eq!(resumed_before_due.status, "Waiting for schedule");
+        assert_eq!(resumed_before_due.scheduled_at, Some(200));
+        assert!(store.pause_queued_download("resumable", 101).await.unwrap());
+        let resumed_after_due = store.resume_download("resumable", 201).await.unwrap().unwrap();
+        assert_eq!(resumed_after_due.status, "Queued");
+        assert_eq!(resumed_after_due.scheduled_at, None);
+
+        assert!(store.pause_queued_download("cancel-me", 30).await.unwrap());
+        assert!(store.cancel_queued_download("cancel-me", 31).await.unwrap());
+        let canceled = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "cancel-me")
+            .unwrap();
+        assert_eq!(canceled.status, "Canceled");
+        assert_eq!(canceled.scheduled_at, None);
 
         std::fs::remove_dir_all(temp_dir).unwrap();
     }

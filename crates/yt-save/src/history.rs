@@ -1,6 +1,6 @@
 use crate::model::DownloadRecord;
 
-const HISTORY_COLUMNS: [&str; 27] = [
+const HISTORY_COLUMNS: [&str; 28] = [
     "id",
     "url",
     "queue_order",
@@ -28,6 +28,7 @@ const HISTORY_COLUMNS: [&str; 27] = [
     "updated_at_unix",
     "automatic_retry_attempts",
     "next_retry_at_unix",
+    "scheduled_at_unix",
 ];
 
 pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
@@ -62,6 +63,7 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.updated_at.to_string(),
             record.retry_attempts.to_string(),
             optional_display(record.next_retry_at),
+            optional_display(record.scheduled_at),
         ];
         append_csv_row(&mut output, fields.iter().map(String::as_str));
     }
@@ -100,7 +102,7 @@ mod tests {
 
         assert!(csv.starts_with("\"id\",\"url\",\"queue_order\""));
         assert!(csv.ends_with(
-            "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\"\r\n"
+            "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\",\"scheduled_at_unix\"\r\n"
         ));
         assert_eq!(csv.matches("\r\n").count(), 1);
     }
@@ -123,6 +125,7 @@ mod tests {
         record.total_bytes = Some(2048);
         record.speed_bytes_per_second = Some(32.5);
         record.eta_seconds = Some(5);
+        record.scheduled_at = Some(1_700_000_030);
         record.output_path = Some("C:\\Media\\item.mp4".to_owned());
         record.updated_at = 1_700_000_060;
 
@@ -135,7 +138,7 @@ mod tests {
         ));
         assert!(
             csv.contains(
-                "\"C:\\Media\\item.mp4\",\"\",\"1700000000\",\"1700000060\",\"0\",\"\"\r\n"
+                "\"C:\\Media\\item.mp4\",\"\",\"1700000000\",\"1700000060\",\"0\",\"\",\"1700000030\"\r\n"
             )
         );
     }

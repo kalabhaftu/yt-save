@@ -83,6 +83,8 @@ export component MainWindow inherits Window {
     in-out property <string> subtitle-languages: "en";
     in-out property <string> subtitle-format: "vtt";
     in-out property <bool> include-auto-subtitles: false;
+    in-out property <bool> schedule-download: false;
+    in-out property <string> schedule-local-time: "";
     in-out property <string> audio-format: "original";
     in-out property <string> audio-quality: "best";
     in-out property <string> video-quality: "Best";
@@ -575,7 +577,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 350px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px);
+                        height: 388px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 38px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -845,6 +847,51 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "When"; color: #a9b0c4; font-size: 11px; width: 92px; vertical-alignment: center; }
+                                ActionButton {
+                                    label: "Start now";
+                                    primary: !root.schedule-download;
+                                    button-height: 28px;
+                                    button-min-width: 92px;
+                                    clicked => { root.schedule-download = false; }
+                                }
+                                ActionButton {
+                                    label: "Schedule";
+                                    primary: root.schedule-download;
+                                    button-height: 28px;
+                                    button-min-width: 92px;
+                                    clicked => { root.schedule-download = true; }
+                                }
+                                Text { text: root.schedule-download ? "One time · local time" : ""; color: #727b92; font-size: 10px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            if root.schedule-download : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Local date/time"; color: #a9b0c4; font-size: 11px; width: 92px; vertical-alignment: center; }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    border-radius: 8px;
+                                    TextInput {
+                                        text <=> root.schedule-local-time;
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: parent.height;
+                                        accessible-placeholder-text: "YYYY-MM-DD HH:MM";
+                                        color: #ecedf4;
+                                        font-size: 12px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Text { text: "Format: YYYY-MM-DD HH:MM"; color: #727b92; font-size: 10px; vertical-alignment: center; }
+                            }
                             if root.subtitle-only : HorizontalLayout {
                                 height: 30px;
                                 spacing: 8px;
@@ -898,7 +945,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 height: 12px;
-                                text: root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                text: root.schedule-download ? (root.subtitle-only ? "Yt Save must be running at the scheduled time. Captions are external sidecars." : "Yt Save must be running at the scheduled local time.") : root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
                                 color: #747d96;
                                 font-size: 10px;
                                 overflow: elide;
@@ -1232,7 +1279,7 @@ export component MainWindow inherits Window {
                                         HorizontalLayout {
                                             spacing: 8px;
                                             Text { text: row.title; color: #e4e6ef; font-size: 13px; font-weight: 600; overflow: elide; horizontal-stretch: 1; }
-                                            Text { text: row.status; color: row.status == "Completed" ? #74d6ae : row.status == "Waiting for retry" ? #dfb86f : #9aa2b8; font-size: 11px; }
+                                            Text { text: row.status; color: row.status == "Completed" ? #74d6ae : row.status == "Waiting for retry" || row.status == "Waiting for schedule" ? #dfb86f : #9aa2b8; font-size: 11px; }
                                             if row.status == "Completed" && row.output-path != "" : Rectangle {
                                                 width: 48px;
                                                 height: 24px;
@@ -1257,7 +1304,7 @@ export component MainWindow inherits Window {
                                                 Text { text: "Resume"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.resume-download-requested(row.id); } }
                                             }
-                                            if row.status == "Queued" || row.status == "Waiting for retry" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" : Rectangle {
+                                            if row.status == "Queued" || row.status == "Waiting for retry" || row.status == "Waiting for schedule" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" : Rectangle {
                                                 width: 54px;
                                                 height: 24px;
                                                 border-radius: 6px;
@@ -1265,7 +1312,7 @@ export component MainWindow inherits Window {
                                                 Text { text: "Pause"; color: #c4c9d7; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
                                                 TouchArea { clicked => { root.pause-download-requested(row.id); } }
                                             }
-                                            if row.status == "Queued" || row.status == "Waiting for retry" || row.status == "Paused" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" || row.status == "Pausing" : Rectangle {
+                                            if row.status == "Queued" || row.status == "Waiting for retry" || row.status == "Waiting for schedule" || row.status == "Paused" || row.status == "Analyzing" || row.status == "Downloading" || row.status == "Post-processing" || row.status == "Pausing" : Rectangle {
                                                 width: 54px;
                                                 height: 24px;
                                                 border-radius: 6px;

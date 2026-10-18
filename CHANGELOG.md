@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add one-time local date/time scheduling for single downloads and selected playlist entries; scheduled queue rows persist across restart and remain outside worker slots until due.
+- Add scheduled-job pause, resume, cancel, reorder, queue summaries, and history export fields; the app must be running at the scheduled time and does not configure Windows auto-launch.
+- Cover due-time promotion, claim ordering, pause/cancel, schema migration, restart persistence, local-time validation, and scheduled queue presentation. Installed-app timer acceptance remains pending.
 - Add single-media subtitle-only downloads with language selection, optional automatic captions, and SRT/VTT sidecars; queued choices survive retries, restart recovery, and history export.
 - Show manual and automatic caption languages from Analyze, validate requested languages before queueing, reject playlist subtitle requests clearly, and fail completion if yt-dlp reports no output sidecar.
 - Extend the Library filters and relinking picker to include SRT/VTT files; add deterministic queue-worker, parser, command, migration, and library coverage. Live subtitle download and Windows UI acceptance remain pending.

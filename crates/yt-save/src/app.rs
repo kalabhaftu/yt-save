@@ -878,6 +878,8 @@ pub fn run() -> Result<()> {
             selected_quality,
             selected_video_quality,
             selected_directory,
+            schedule_enabled,
+            schedule_local_time,
         ) = enqueue_window
             .upgrade()
             .map(|window| {
@@ -891,9 +893,22 @@ pub fn run() -> Result<()> {
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
                     window.get_download_directory().to_string(),
+                    window.get_schedule_download(),
+                    window.get_schedule_local_time().to_string(),
                 )
             })
             .unwrap_or_default();
+        let scheduled_at = if schedule_enabled {
+            match parse_local_schedule(&schedule_local_time, now()) {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    let _ = queue_events.send(UiEvent::Status(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let normalized_subtitle_languages = if subtitle_only {
             match normalize_subtitle_languages(&selected_subtitle_languages) {
                 Some(languages) => languages,
@@ -927,6 +942,10 @@ pub fn run() -> Result<()> {
         record.subtitle_format = SubtitleFormat::from_database_value(&selected_subtitle_format)
             .unwrap_or_default();
         record.include_auto_subtitles = include_auto_subtitles;
+        record.scheduled_at = scheduled_at;
+        if scheduled_at.is_some() {
+            record.status = "Waiting for schedule".to_owned();
+        }
         let store = queue_store.clone();
         let engine = queue_engine.clone();
         let events = queue_events.clone();
@@ -972,9 +991,9 @@ pub fn run() -> Result<()> {
                             }));
                             return;
                         }
-                        record.title = metadata.title;
-                        record.source = metadata.source;
                     }
+                    record.title = metadata.title;
+                    record.source = metadata.source;
                 }
                 Err(error) => {
                     error!(%error, "inspect media link before queueing");
@@ -1009,11 +1028,17 @@ pub fn run() -> Result<()> {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
                 return;
             }
+            let schedule_status = scheduled_at.map_or_else(
+                || "Added to the download queue.".to_owned(),
+                |timestamp| {
+                    format!("Scheduled for {} local time.", format_local_schedule(timestamp))
+                },
+            );
             let preset_status = match store.set_download_presets(download_presets, now()).await {
-                Ok(()) => "Added to the download queue.".to_owned(),
-                Err(error) => format!(
-                    "Added to the queue, but could not save the New download presets: {error}"
-                ),
+                Ok(()) => schedule_status,
+                Err(error) => {
+                    format!("{schedule_status} Could not save the New download presets: {error}")
+                }
             };
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status(preset_status));
@@ -1168,6 +1193,8 @@ pub fn run() -> Result<()> {
             selected_quality,
             selected_video_quality,
             selected_directory,
+            schedule_enabled,
+            schedule_local_time,
         ) = selected_queue_window
             .upgrade()
             .map(|window| {
@@ -1177,9 +1204,22 @@ pub fn run() -> Result<()> {
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
                     window.get_download_directory().to_string(),
+                    window.get_schedule_download(),
+                    window.get_schedule_local_time().to_string(),
                 )
             })
             .unwrap_or_default();
+        let scheduled_at = if schedule_enabled {
+            match parse_local_schedule(&schedule_local_time, now()) {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    let _ = selected_queue_events.send(UiEvent::Status(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let download_presets = DownloadPresets::from_ui_values(
             audio_only,
             &selected_format,
@@ -1232,6 +1272,10 @@ pub fn run() -> Result<()> {
                 record.audio_format = download_presets.audio_format;
                 record.audio_quality = download_presets.audio_quality;
                 record.video_quality = download_presets.video_quality;
+                record.scheduled_at = scheduled_at;
+                if scheduled_at.is_some() {
+                    record.status = "Waiting for schedule".to_owned();
+                }
                 record.download_directory = destination.clone();
                 records.push(record);
             }
@@ -1246,8 +1290,11 @@ pub fn run() -> Result<()> {
             }
             let preset_save_error = store.set_download_presets(download_presets, now()).await.err();
             let _ = events.send(UiEvent::Refresh);
-            let mut status = format!(
-                "Queued {selected_count} selected playlist entries. Each item will download separately."
+            let mut status = scheduled_at.map_or_else(
+                || format!("Queued {selected_count} selected playlist entries. Each item will download separately."),
+                |timestamp| {
+                    format!("Scheduled {selected_count} playlist entries for {} local time.", format_local_schedule(timestamp))
+                },
             );
             if let Some(error) = preset_save_error {
                 status.push_str(&format!(" New download presets could not be saved: {error}"));
@@ -2762,7 +2809,8 @@ async fn pause_all_downloads(
     let mut active_count = 0;
     for record in records {
         if (record.status == "Queued"
-            || (pause_retry_waits && record.status == "Waiting for retry"))
+            || (pause_retry_waits
+                && matches!(record.status.as_str(), "Waiting for retry" | "Waiting for schedule")))
             && store.pause_queued_download(&record.id, now()).await?
         {
             pending_count += 1;
@@ -2770,13 +2818,7 @@ async fn pause_all_downloads(
         }
         if matches!(
             record.status.as_str(),
-            "Queued"
-                | "Waiting for retry"
-                | "Analyzing"
-                | "Downloading"
-                | "Post-processing"
-                | "Pausing"
-                | "Canceling"
+            "Analyzing" | "Downloading" | "Post-processing" | "Pausing" | "Canceling"
         ) && request_pause_for_active_record(store, active_jobs, &record).await?
         {
             active_count += 1;
@@ -2790,8 +2832,10 @@ async fn cancel_all_downloads(store: &Store, active_jobs: &ActiveJobs) -> Result
     let mut pending_count = 0;
     let mut active_count = 0;
     for record in records {
-        if matches!(record.status.as_str(), "Queued" | "Waiting for retry" | "Paused")
-            && store.cancel_queued_download(&record.id, now()).await?
+        if matches!(
+            record.status.as_str(),
+            "Queued" | "Waiting for retry" | "Paused" | "Waiting for schedule"
+        ) && store.cancel_queued_download(&record.id, now()).await?
         {
             pending_count += 1;
             continue;
@@ -2836,7 +2880,7 @@ async fn pause_playlist_group(
     for record in
         records.into_iter().filter(|record| record.playlist_group_id.as_deref() == Some(group_id))
     {
-        if matches!(record.status.as_str(), "Queued" | "Waiting for retry")
+        if matches!(record.status.as_str(), "Queued" | "Waiting for retry" | "Waiting for schedule")
             && store.pause_queued_download(&record.id, now()).await?
         {
             pending_count += 1;
@@ -3017,6 +3061,16 @@ async fn run_queue_dispatcher(
                 retry_after_error = true;
             }
         }
+        match store.promote_due_scheduled_downloads(now()).await {
+            Ok(count) if count > 0 => {
+                let _ = events.send(UiEvent::Refresh);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "promote due scheduled downloads");
+                retry_after_error = true;
+            }
+        }
         loop {
             if shutdown_started.load(Ordering::Acquire) {
                 break;
@@ -3101,17 +3155,28 @@ async fn run_queue_dispatcher(
         if shutdown_started.load(Ordering::Acquire) {
             continue;
         }
-        let retry_wait = match store.next_retry_at().await {
-            Ok(Some(deadline)) => Some(Duration::from_secs(
-                u64::try_from(deadline.saturating_sub(now()).max(0)).unwrap_or_default(),
-            )),
-            Ok(None) => None,
+        let retry_deadline = match store.next_retry_at().await {
+            Ok(deadline) => deadline,
             Err(error) => {
                 error!(%error, "read next automatic retry deadline");
                 retry_after_error = true;
                 None
             }
         };
+        let schedule_deadline = match store.next_scheduled_at().await {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                error!(%error, "read next scheduled download deadline");
+                retry_after_error = true;
+                None
+            }
+        };
+        let next_deadline = [retry_deadline, schedule_deadline].into_iter().flatten().min();
+        let retry_wait = next_deadline.map(|deadline| {
+            Duration::from_secs(
+                u64::try_from(deadline.saturating_sub(now()).max(0)).unwrap_or_default(),
+            )
+        });
         let wait_duration = if retry_after_error {
             Some(
                 retry_wait
@@ -3568,6 +3633,8 @@ fn row_views_filtered(records: &[DownloadRecord], query: &str) -> Vec<DownloadRo
                 format!("#{}", position)
             } else if record.status == "Waiting for retry" {
                 "Retry".to_owned()
+            } else if record.status == "Waiting for schedule" {
+                "Scheduled".to_owned()
             } else if record.status == "Paused" {
                 "Paused".to_owned()
             } else {
@@ -3618,7 +3685,12 @@ fn playlist_group_action_label<'a>(
         records.iter().filter(|record| record.playlist_group_id.as_deref() == Some(group_id))
     {
         match record.status.as_str() {
-            "Queued" | "Waiting for retry" | "Analyzing" | "Downloading" | "Post-processing"
+            "Queued"
+            | "Waiting for retry"
+            | "Waiting for schedule"
+            | "Analyzing"
+            | "Downloading"
+            | "Post-processing"
             | "Pausing" => has_pending = true,
             "Paused" => has_paused = true,
             _ => {}
@@ -3824,7 +3896,10 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     let pending = records
         .iter()
         .filter(|record| {
-            matches!(record.status.as_str(), "Queued" | "Waiting for retry" | "Paused")
+            matches!(
+                record.status.as_str(),
+                "Queued" | "Waiting for retry" | "Waiting for schedule" | "Paused"
+            )
         })
         .collect::<Vec<_>>();
     if pending.is_empty() {
@@ -3835,6 +3910,8 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     let mut remaining_bytes = 0u64;
     let queued_count = pending.iter().filter(|record| record.status == "Queued").count();
     let retry_count = pending.iter().filter(|record| record.status == "Waiting for retry").count();
+    let scheduled_count =
+        pending.iter().filter(|record| record.status == "Waiting for schedule").count();
     let paused_count = pending.iter().filter(|record| record.status == "Paused").count();
     let mut queue_labels = Vec::new();
     if queued_count > 0 {
@@ -3842,6 +3919,9 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     }
     if retry_count > 0 {
         queue_labels.push(format!("{retry_count} waiting for retry"));
+    }
+    if scheduled_count > 0 {
+        queue_labels.push(format!("{scheduled_count} scheduled"));
     }
     if paused_count > 0 {
         queue_labels.push(format!("{paused_count} paused"));
@@ -3873,7 +3953,7 @@ fn queue_action_state(records: &[DownloadRecord]) -> QueueActionState {
     let mut state = QueueActionState::default();
     for record in records {
         match record.status.as_str() {
-            "Queued" | "Waiting for retry" => {
+            "Queued" | "Waiting for retry" | "Waiting for schedule" => {
                 state.can_pause_all = true;
                 state.can_cancel_all = true;
             }
@@ -3899,7 +3979,15 @@ fn row_view_with_queue_position(
     group_action: &str,
     group_id: &str,
 ) -> DownloadRowData {
-    let details = if record.status == "Waiting for retry" {
+    let details = if record.status == "Paused" && record.scheduled_at.is_some() {
+        let scheduled = record.scheduled_at.map(format_local_schedule).unwrap_or_default();
+        format!("Paused · planned for {scheduled} local time; resume manually")
+    } else if record.status == "Waiting for schedule" && record.scheduled_at.is_some() {
+        let scheduled = record.scheduled_at.map(format_local_schedule).unwrap_or_default();
+        format!("Starts {scheduled} local time · The app must be running")
+    } else if record.status == "Waiting for schedule" {
+        "Scheduled time unavailable".to_owned()
+    } else if record.status == "Waiting for retry" {
         let scheduled = record
             .next_retry_at
             .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
@@ -3966,6 +4054,37 @@ fn row_view_with_queue_position(
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn parse_local_schedule(value: &str, current_timestamp: i64) -> Result<i64> {
+    let local_datetime = chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M")
+        .context("Enter a local date and time as YYYY-MM-DD HH:MM.")?;
+    let local_datetime = match local_datetime.and_local_timezone(chrono::Local) {
+        chrono::LocalResult::Single(datetime) => datetime,
+        chrono::LocalResult::Ambiguous(_, _) => {
+            anyhow::bail!(
+                "That local time occurs twice during a daylight-saving change; choose another time."
+            );
+        }
+        chrono::LocalResult::None => {
+            anyhow::bail!(
+                "That local time does not exist during a daylight-saving change; choose another time."
+            );
+        }
+    };
+    let timestamp = local_datetime.timestamp();
+    if timestamp <= current_timestamp {
+        anyhow::bail!("Choose a future local date and time.");
+    }
+    Ok(timestamp)
+}
+
+fn format_local_schedule(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|datetime| {
+            datetime.with_timezone(&chrono::Local).format("%b %d, %Y %H:%M").to_string()
+        })
+        .unwrap_or_else(|| "an unknown time".to_owned())
 }
 
 fn validate_download_directory(path: &Path) -> Result<PathBuf> {
@@ -4373,6 +4492,37 @@ mod tests {
         let paused = store.list_downloads().await.unwrap().remove(0);
         assert_eq!(paused.status, "Paused");
         assert_eq!(paused.next_retry_at, None);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_items_stay_waiting_on_shutdown_and_pause_explicitly() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let deadline = now() + 3600;
+        let mut scheduled = DownloadRecord::queued(
+            "scheduled-job".to_owned(),
+            "https://example.test/media".to_owned(),
+            now(),
+        );
+        scheduled.status = "Waiting for schedule".to_owned();
+        scheduled.scheduled_at = Some(deadline);
+        store.save_download(scheduled).await.unwrap();
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        assert_eq!(pause_all_downloads(&store, &active_jobs, false).await.unwrap().0, 0);
+        let waiting = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(waiting.status, "Waiting for schedule");
+        assert_eq!(waiting.scheduled_at, Some(deadline));
+
+        assert_eq!(pause_all_downloads(&store, &active_jobs, true).await.unwrap().0, 1);
+        let paused = store.list_downloads().await.unwrap().remove(0);
+        assert_eq!(paused.status, "Paused");
+        assert_eq!(paused.scheduled_at, Some(deadline));
+
+        let resumed = store.resume_download("scheduled-job", now()).await.unwrap().unwrap();
+        assert_eq!(resumed.status, "Waiting for schedule");
+        assert_eq!(resumed.scheduled_at, Some(deadline));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -5077,6 +5227,50 @@ mod tests {
         assert_eq!(row.queue_position.as_str(), "Retry");
         assert!(row.detail.as_str().contains("Retry 2 scheduled for"));
         assert!(queue_summary_text(&[record]).contains("1 waiting for retry"));
+    }
+
+    #[test]
+    fn local_schedule_requires_a_valid_future_time() {
+        let current_timestamp = now();
+        let future_local = (chrono::Local::now() + chrono::Duration::hours(4))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let scheduled_at = parse_local_schedule(&future_local, current_timestamp).unwrap();
+        assert!(scheduled_at > current_timestamp);
+        assert!(parse_local_schedule("next Tuesday", current_timestamp).is_err());
+
+        let past_local = (chrono::Local::now() - chrono::Duration::hours(4))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert!(parse_local_schedule(&past_local, current_timestamp).is_err());
+    }
+
+    #[test]
+    fn scheduled_queue_rows_show_local_start_time_and_bulk_actions() {
+        let mut record = DownloadRecord::queued(
+            "scheduled".to_owned(),
+            "https://example.test/media".to_owned(),
+            now(),
+        );
+        record.title = "Example media title".to_owned();
+        record.status = "Waiting for schedule".to_owned();
+        record.scheduled_at = Some(now() + 3600);
+
+        let row = row_view_with_queue_position(&record, "Scheduled", "", "");
+        assert_eq!(row.title.as_str(), "Example media title");
+        assert_eq!(row.status.as_str(), "Waiting for schedule");
+        assert_eq!(row.queue_position.as_str(), "Scheduled");
+        assert!(row.detail.as_str().contains("local time"));
+        assert!(row.detail.as_str().contains("app must be running"));
+        assert!(queue_summary_text(&[record.clone()]).contains("1 scheduled"));
+        let actions = queue_action_state(&[record.clone()]);
+        assert!(actions.can_pause_all);
+        assert!(actions.can_cancel_all);
+        record.status = "Paused".to_owned();
+        let paused_row = row_view_with_queue_position(&record, "Paused", "", "");
+        assert!(paused_row.detail.as_str().contains("Paused · planned for"));
+        assert!(paused_row.detail.as_str().contains("resume manually"));
+        assert!(!paused_row.detail.as_str().contains("Resumes"));
     }
 
     #[test]

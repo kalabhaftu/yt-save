@@ -477,6 +477,9 @@ pub struct DownloadRecord {
     pub retry_attempts: u32,
     /// Unix timestamp when a scheduled automatic retry becomes eligible.
     pub next_retry_at: Option<i64>,
+    /// Unix timestamp when a one-time scheduled download becomes eligible.
+    /// Present only while the scheduled item is waiting or paused before its run time.
+    pub scheduled_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -511,6 +514,7 @@ impl DownloadRecord {
             error: None,
             retry_attempts: 0,
             next_retry_at: None,
+            scheduled_at: None,
             created_at,
             updated_at: created_at,
         }

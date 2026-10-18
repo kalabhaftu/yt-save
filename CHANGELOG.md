@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add Select all and Select none actions to playlist previews; entries without valid playlist indexes remain unselectable.
+- Add Select all, Select none, and inclusive index-range selection to playlist previews; entries without valid playlist indexes remain unselectable.
 - Add a file-backed Library view for completed downloads, with search, media/missing-file filters, date/title/size sorting, Open and Show actions, and relinking for moved files without copying or deleting media.
 - Add regression coverage for library search/filter/sort and missing paths; Windows file-picker and Explorer runtime acceptance remains pending.
 - Add configurable automatic retries for transient HTTP, rate-limit, and temporary network failures, with durable attempt/deadline state, restart recovery, and exponential backoff capped at four minutes.

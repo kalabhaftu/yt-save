@@ -130,6 +130,24 @@ fn set_playlist_selection(selection: &mut PlaylistSelectionState, selected: bool
     }
 }
 
+fn select_playlist_range(
+    selection: &mut PlaylistSelectionState,
+    first_index: i64,
+    last_index: i64,
+) -> bool {
+    if first_index < 1 || last_index < first_index {
+        return false;
+    }
+    let mut matched = false;
+    for (entry, selected_entry) in selection.entries.iter().zip(selection.selected.iter_mut()) {
+        if entry.playlist_index.is_some_and(|index| (first_index..=last_index).contains(&index)) {
+            *selected_entry = true;
+            matched = true;
+        }
+    }
+    matched
+}
+
 fn playlist_entry_rows(selection: &PlaylistSelectionState) -> Vec<PlaylistEntryRowData> {
     selection
         .entries
@@ -509,6 +527,7 @@ pub fn run() -> Result<()> {
                             window.set_selected_playlist_count(0);
                             window.set_selectable_playlist_count(0);
                             window.set_playlist_selection_summary(SharedString::default());
+                            window.set_show_playlist_range_controls(false);
                         }
                     });
                 }
@@ -560,6 +579,7 @@ pub fn run() -> Result<()> {
                             window.set_playlist_entries(ModelRc::new(VecModel::from(preview_rows)));
                             window.set_selected_playlist_count(0);
                             window.set_selectable_playlist_count(selectable_count as i32);
+                            window.set_show_playlist_range_controls(false);
                             window.set_playlist_selection_summary(selection_summary(
                                 0,
                                 selectable_count,
@@ -951,6 +971,56 @@ pub fn run() -> Result<()> {
                 selectable_count,
             ));
         }
+    });
+
+    let range_selection_state = playlist_selection.clone();
+    let range_selection_window = window.as_weak();
+    let range_selection_events = events_tx.clone();
+    window.on_playlist_range_selection_requested(move |first, last| {
+        let first_index = match first.as_str().parse::<i64>() {
+            Ok(index) if index > 0 => index,
+            _ => {
+                let _ = range_selection_events
+                    .send(UiEvent::Status("Enter a positive starting playlist index.".to_owned()));
+                return;
+            }
+        };
+        let last_index = match last.as_str().parse::<i64>() {
+            Ok(index) if index >= first_index => index,
+            _ => {
+                let _ = range_selection_events.send(UiEvent::Status(
+                    "The ending index must be a number at or after the starting index.".to_owned(),
+                ));
+                return;
+            }
+        };
+        let Ok(mut state) = range_selection_state.lock() else { return };
+        let Some(selection) = state.as_mut() else {
+            let _ = range_selection_events
+                .send(UiEvent::Status("Analyze a playlist before selecting a range.".to_owned()));
+            return;
+        };
+        if !select_playlist_range(selection, first_index, last_index) {
+            let _ = range_selection_events.send(UiEvent::Status(
+                "That range contains no selectable entries in the visible preview.".to_owned(),
+            ));
+            return;
+        }
+        let rows = playlist_entry_rows(selection);
+        let selected_count = selection.selected_count();
+        let selectable_count = selection.selectable_count();
+        if let Some(window) = range_selection_window.upgrade() {
+            window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
+            window.set_selected_playlist_count(selected_count as i32);
+            window.set_selectable_playlist_count(selectable_count as i32);
+            window.set_playlist_selection_summary(selection_summary(
+                selected_count,
+                selectable_count,
+            ));
+        }
+        let _ = range_selection_events.send(UiEvent::Status(format!(
+            "Selected available entries from playlist index {first_index} to {last_index}."
+        )));
     });
 
     let selected_queue_store = store.clone();
@@ -3776,6 +3846,28 @@ mod tests {
         set_playlist_selection(&mut selection, false);
         assert_eq!(selection.selected, [false, false, false]);
         assert_eq!(selection.selected_count(), 0);
+    }
+
+    #[test]
+    fn playlist_range_selection_adds_only_available_indexes_inclusive() {
+        let mut selection = PlaylistSelectionState {
+            source_url: "https://example.test/playlist".to_owned(),
+            source: "Example".to_owned(),
+            entries: vec![
+                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
+                PlaylistEntry { playlist_index: Some(2), title: "Second".to_owned() },
+                PlaylistEntry { playlist_index: None, title: "Unavailable".to_owned() },
+                PlaylistEntry { playlist_index: Some(4), title: "Fourth".to_owned() },
+                PlaylistEntry { playlist_index: Some(5), title: "Fifth".to_owned() },
+            ],
+            selected: vec![true, false, false, false, false],
+        };
+
+        assert!(select_playlist_range(&mut selection, 2, 4));
+        assert_eq!(selection.selected, [true, true, false, true, false]);
+        assert!(!select_playlist_range(&mut selection, 0, 2));
+        assert!(!select_playlist_range(&mut selection, 5, 4));
+        assert!(!select_playlist_range(&mut selection, 7, 9));
     }
 
     #[tokio::test]

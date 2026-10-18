@@ -103,6 +103,9 @@ export component MainWindow inherits Window {
     in-out property <int> selected-playlist-count: 0;
     in-out property <int> selectable-playlist-count: 0;
     in-out property <string> playlist-selection-summary: "";
+    in-out property <bool> show-playlist-range-controls: false;
+    in-out property <string> playlist-range-start: "1";
+    in-out property <string> playlist-range-end: "50";
     in property <[DownloadRowData]> downloads: [];
     in property <[LibraryRowData]> library-entries: [];
 
@@ -110,6 +113,7 @@ export component MainWindow inherits Window {
     callback enqueue-requested(string);
     callback playlist-entry-toggle-requested(int);
     callback playlist-selection-set-requested(bool);
+    callback playlist-range-selection-requested(string, string);
     callback enqueue-selected-playlist-entries-requested();
     callback clipboard-monitoring-requested(bool);
     callback clipboard-candidate-dismissed();
@@ -830,7 +834,7 @@ export component MainWindow inherits Window {
                     }
 
                     if root.analyzed-title != "" : Rectangle {
-                        height: root.analyzed-is-playlist ? 250px : 92px;
+                        height: root.analyzed-is-playlist ? (root.show-playlist-range-controls ? 284px : 250px) : 92px;
                         background: #121722;
                         border-width: 1px;
                         border-color: #2a3041;
@@ -868,6 +872,12 @@ export component MainWindow inherits Window {
                                     clicked => { root.playlist-selection-set-requested(false); }
                                 }
                                 ActionButton {
+                                    label: root.show-playlist-range-controls ? "Hide range" : "Range…";
+                                    button-height: 30px;
+                                    button-min-width: 78px;
+                                    clicked => { root.show-playlist-range-controls = !root.show-playlist-range-controls; }
+                                }
+                                ActionButton {
                                     label: "Add selected";
                                     button-height: 30px;
                                     min-width: 170px;
@@ -876,8 +886,57 @@ export component MainWindow inherits Window {
                                     clicked => { root.enqueue-selected-playlist-entries-requested(); }
                                 }
                             }
+                            if root.analyzed-is-playlist && root.show-playlist-range-controls : HorizontalLayout {
+                                height: 30px;
+                                spacing: 6px;
+                                Text { text: "Indexes"; color: #8c95ad; font-size: 10px; vertical-alignment: center; }
+                                Rectangle {
+                                    width: 58px;
+                                    height: 28px;
+                                    border-radius: 6px;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    TextInput {
+                                        text <=> root.playlist-range-start;
+                                        x: 6px;
+                                        width: parent.width - 12px;
+                                        height: parent.height;
+                                        color: #ecedf4;
+                                        font-size: 11px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Text { text: "to"; color: #8c95ad; font-size: 10px; vertical-alignment: center; }
+                                Rectangle {
+                                    width: 58px;
+                                    height: 28px;
+                                    border-radius: 6px;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    TextInput {
+                                        text <=> root.playlist-range-end;
+                                        x: 6px;
+                                        width: parent.width - 12px;
+                                        height: parent.height;
+                                        color: #ecedf4;
+                                        font-size: 11px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Text { text: "Select a range within the visible playlist preview."; color: #747d96; font-size: 10px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                ActionButton {
+                                    label: "Select range";
+                                    button-height: 28px;
+                                    button-min-width: 98px;
+                                    clicked => { root.playlist-range-selection-requested(root.playlist-range-start, root.playlist-range-end); }
+                                }
+                            }
                             if root.analyzed-is-playlist : ListView {
-                                height: 145px;
+                                height: root.show-playlist-range-controls ? 111px : 145px;
                                 for entry in root.playlist-entries: Rectangle {
                                     height: 30px;
                                     background: entry.selected ? #22243a : #121722;

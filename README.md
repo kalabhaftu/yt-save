@@ -15,7 +15,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Native Rust application with a Slint UI and Tokio background work.
 - Accepts HTTP and HTTPS media URLs from any site yt-dlp can extract.
 - Reads media metadata and available format counts through yt-dlp JSON output.
-- Previews up to the first 50 playlist entries. Select all, clear the selection, or toggle entries individually; entries are selectable only when yt-dlp returns a positive playlist index. Selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
+- Previews up to the first 50 playlist entries. Select all, clear the selection, select an inclusive playlist-index range, or toggle entries individually; entries are selectable only when yt-dlp returns a positive playlist index. Selected entries become separate durable queue jobs, while Add to queue still downloads the whole playlist.
 - Persists queued items, progress, completion, and failure records in SQLite.
 - Searches visible queue and history rows locally by title, source, URL, status, format, output path, or error text.
 - Exports the saved history as UTF-8 CSV with queue, media, progress, output, error, and timestamp fields; the Windows Save dialog asks before replacing an existing file.

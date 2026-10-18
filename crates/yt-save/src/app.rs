@@ -81,6 +81,14 @@ struct LibraryCacheEntry {
     size_for_sort: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct QueueActionState {
+    can_pause_all: bool,
+    can_resume_all: bool,
+    can_cancel_all: bool,
+    can_retry_failed: bool,
+}
+
 struct TrayContext {
     store: Store,
     handle: tokio::runtime::Handle,
@@ -253,6 +261,11 @@ pub fn run() -> Result<()> {
     tray.set_paused_count(saved_paused_count as i32);
     tray.set_tray_tooltip(tray_tooltip(saved_active_count, saved_paused_count).into());
     let saved_rows = row_views(&saved_downloads);
+    let saved_queue_actions = queue_action_state(&saved_downloads);
+    window.set_can_pause_all(saved_queue_actions.can_pause_all);
+    window.set_can_resume_all(saved_queue_actions.can_resume_all);
+    window.set_can_cancel_all(saved_queue_actions.can_cancel_all);
+    window.set_can_retry_failed(saved_queue_actions.can_retry_failed);
     window.set_downloads(ModelRc::new(VecModel::from(saved_rows)));
     let event_initial_records = saved_downloads;
 
@@ -301,6 +314,7 @@ pub fn run() -> Result<()> {
                             .iter()
                             .filter(|record| record.status == "Paused")
                             .count();
+                        let queue_actions = queue_action_state(&cached_downloads);
                         let rows = row_views_filtered(&cached_downloads, &history_search);
                         if library_visible
                             && records_signature != library_cache_signature
@@ -322,6 +336,10 @@ pub fn run() -> Result<()> {
                             if let Some(window) = weak.upgrade() {
                                 window.set_downloads(ModelRc::new(VecModel::from(rows)));
                                 window.set_queue_summary(summary.into());
+                                window.set_can_pause_all(queue_actions.can_pause_all);
+                                window.set_can_resume_all(queue_actions.can_resume_all);
+                                window.set_can_cancel_all(queue_actions.can_cancel_all);
+                                window.set_can_retry_failed(queue_actions.can_retry_failed);
                             }
                             if let Some(tray) = weak_tray.upgrade() {
                                 tray.set_active_count(active_count as i32);
@@ -1676,6 +1694,126 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let main_pause_store = store.clone();
+    let main_pause_active_jobs = active_jobs.clone();
+    let main_pause_events = events_tx.clone();
+    let main_pause_handle = handle.clone();
+    let main_pause_shutdown = shutdown_started.clone();
+    window.on_pause_all_requested(move || {
+        if main_pause_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let store = main_pause_store.clone();
+        let active_jobs = main_pause_active_jobs.clone();
+        let events = main_pause_events.clone();
+        main_pause_handle.spawn(async move {
+            match pause_all_downloads(&store, &active_jobs, true).await {
+                Ok((pending, active)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Paused {pending} queued item(s) and requested a safe pause for {active} active item(s)."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "pause all downloads from queue");
+                    let _ = events.send(UiEvent::Status(format!("Could not pause all downloads: {error}")));
+                }
+            }
+        });
+    });
+
+    let main_resume_store = store.clone();
+    let main_resume_events = events_tx.clone();
+    let main_resume_wake = queue_wake.clone();
+    let main_resume_handle = handle.clone();
+    let main_resume_shutdown = shutdown_started.clone();
+    window.on_resume_all_requested(move || {
+        if main_resume_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let store = main_resume_store.clone();
+        let events = main_resume_events.clone();
+        let queue_wake = main_resume_wake.clone();
+        main_resume_handle.spawn(async move {
+            match resume_all_downloads(store).await {
+                Ok(count) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ =
+                        events.send(UiEvent::Status(format!("Resumed {count} paused item(s).")));
+                    if count > 0 {
+                        queue_wake.notify_one();
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "resume all downloads from queue");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not resume downloads: {error}")));
+                }
+            }
+        });
+    });
+
+    let main_cancel_store = store.clone();
+    let main_cancel_active_jobs = active_jobs.clone();
+    let main_cancel_events = events_tx.clone();
+    let main_cancel_handle = handle.clone();
+    let main_cancel_shutdown = shutdown_started.clone();
+    window.on_cancel_all_requested(move || {
+        if main_cancel_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let store = main_cancel_store.clone();
+        let active_jobs = main_cancel_active_jobs.clone();
+        let events = main_cancel_events.clone();
+        main_cancel_handle.spawn(async move {
+            match cancel_all_downloads(&store, &active_jobs).await {
+                Ok((queued, active)) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Canceled {queued} queued or paused item(s) and requested cancellation for {active} active item(s). Partial files were kept."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "cancel all downloads");
+                    let _ = events.send(UiEvent::Status(format!("Could not cancel all downloads: {error}")));
+                }
+            }
+        });
+    });
+
+    let retry_all_store = store.clone();
+    let retry_all_events = events_tx.clone();
+    let retry_all_wake = queue_wake.clone();
+    let retry_all_handle = handle.clone();
+    let retry_all_shutdown = shutdown_started.clone();
+    window.on_retry_all_failed_requested(move || {
+        if retry_all_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let store = retry_all_store.clone();
+        let events = retry_all_events.clone();
+        let queue_wake = retry_all_wake.clone();
+        retry_all_handle.spawn(async move {
+            match retry_all_failed_downloads(&store).await {
+                Ok(count) => {
+                    let _ = events.send(UiEvent::Refresh);
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Queued {count} failed or interrupted item(s) for retry."
+                    )));
+                    if count > 0 {
+                        queue_wake.notify_one();
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "retry all failed downloads");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not retry failed downloads: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let export_store = store.clone();
     let export_events = events_tx.clone();
     let export_handle = handle.clone();
@@ -2565,6 +2703,46 @@ async fn pause_all_downloads(
     Ok((pending_count, active_count))
 }
 
+async fn cancel_all_downloads(store: &Store, active_jobs: &ActiveJobs) -> Result<(usize, usize)> {
+    let records = store.list_downloads().await?;
+    let mut pending_count = 0;
+    let mut active_count = 0;
+    for record in records {
+        if matches!(record.status.as_str(), "Queued" | "Waiting for retry" | "Paused")
+            && store.cancel_queued_download(&record.id, now()).await?
+        {
+            pending_count += 1;
+            continue;
+        }
+        if !matches!(
+            record.status.as_str(),
+            "Queued"
+                | "Waiting for retry"
+                | "Analyzing"
+                | "Downloading"
+                | "Post-processing"
+                | "Pausing"
+                | "Canceling"
+        ) {
+            continue;
+        }
+        let control = active_jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
+            .get(&record.id)
+            .cloned();
+        let Some(control) = control else { continue };
+        if record.status == "Canceling"
+            || store.request_active_cancel(&record.id, now()).await?
+            || store.is_canceling(&record.id).await?
+        {
+            control.send_replace(JobSignal::Cancel);
+            active_count += 1;
+        }
+    }
+    Ok((pending_count, active_count))
+}
+
 async fn pause_playlist_group(
     store: &Store,
     active_jobs: &ActiveJobs,
@@ -2656,6 +2834,20 @@ async fn resume_all_downloads(store: Store) -> Result<usize> {
         }
     }
     Ok(resumed_count)
+}
+
+async fn retry_all_failed_downloads(store: &Store) -> Result<usize> {
+    let records = store.list_downloads().await?;
+    let mut retried_count = 0;
+    for record in records
+        .into_iter()
+        .filter(|record| matches!(record.status.as_str(), "Failed" | "Interrupted"))
+    {
+        if store.retry_download(&record.id, now()).await?.is_some() {
+            retried_count += 1;
+        }
+    }
+    Ok(retried_count)
 }
 
 fn is_active_status(status: &str) -> bool {
@@ -3583,6 +3775,30 @@ fn queue_summary_text(records: &[DownloadRecord]) -> String {
     }
 }
 
+fn queue_action_state(records: &[DownloadRecord]) -> QueueActionState {
+    let mut state = QueueActionState::default();
+    for record in records {
+        match record.status.as_str() {
+            "Queued" | "Waiting for retry" => {
+                state.can_pause_all = true;
+                state.can_cancel_all = true;
+            }
+            "Analyzing" | "Downloading" | "Post-processing" | "Pausing" => {
+                state.can_pause_all = true;
+                state.can_cancel_all = true;
+            }
+            "Canceling" => state.can_cancel_all = true,
+            "Paused" => {
+                state.can_resume_all = true;
+                state.can_cancel_all = true;
+            }
+            "Failed" | "Interrupted" => state.can_retry_failed = true,
+            _ => {}
+        }
+    }
+    state
+}
+
 fn row_view_with_queue_position(
     record: &DownloadRecord,
     queue_position: &str,
@@ -4058,6 +4274,111 @@ mod tests {
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn cancel_all_cancels_pending_rows_and_signals_active_workers() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/queued".to_owned(),
+            10,
+        );
+        let mut retry_wait = DownloadRecord::queued(
+            "retry-wait".to_owned(),
+            "https://example.test/retry".to_owned(),
+            11,
+        );
+        retry_wait.status = "Waiting for retry".to_owned();
+        let mut paused = DownloadRecord::queued(
+            "paused".to_owned(),
+            "https://example.test/paused".to_owned(),
+            12,
+        );
+        paused.status = "Paused".to_owned();
+        let mut active = DownloadRecord::queued(
+            "active".to_owned(),
+            "https://example.test/active".to_owned(),
+            13,
+        );
+        active.status = "Downloading".to_owned();
+        let mut failed = DownloadRecord::queued(
+            "failed".to_owned(),
+            "https://example.test/failed".to_owned(),
+            14,
+        );
+        failed.status = "Failed".to_owned();
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/completed".to_owned(),
+            15,
+        );
+        completed.status = "Completed".to_owned();
+        store
+            .save_downloads(vec![queued, retry_wait, paused, active, failed, completed])
+            .await
+            .unwrap();
+
+        let (active_sender, active_signal) = watch::channel(JobSignal::Continue);
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            "active".to_owned(),
+            Arc::new(active_sender),
+        )])));
+
+        assert_eq!(cancel_all_downloads(&store, &active_jobs).await.unwrap(), (3, 1));
+        assert_eq!(*active_signal.borrow(), JobSignal::Cancel);
+        let rows = store.list_downloads().await.unwrap();
+        for id in ["queued", "retry-wait", "paused"] {
+            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Canceled");
+        }
+        assert_eq!(rows.iter().find(|row| row.id == "active").unwrap().status, "Canceling");
+        assert_eq!(rows.iter().find(|row| row.id == "failed").unwrap().status, "Failed");
+        assert_eq!(rows.iter().find(|row| row.id == "completed").unwrap().status, "Completed");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_all_failed_requeues_only_failed_and_interrupted_rows() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut failed = DownloadRecord::queued(
+            "failed".to_owned(),
+            "https://example.test/failed".to_owned(),
+            10,
+        );
+        failed.status = "Failed".to_owned();
+        failed.error = Some("Temporary failure".to_owned());
+        let mut interrupted = DownloadRecord::queued(
+            "interrupted".to_owned(),
+            "https://example.test/interrupted".to_owned(),
+            11,
+        );
+        interrupted.status = "Interrupted".to_owned();
+        let mut canceled = DownloadRecord::queued(
+            "canceled".to_owned(),
+            "https://example.test/canceled".to_owned(),
+            12,
+        );
+        canceled.status = "Canceled".to_owned();
+        let mut completed = DownloadRecord::queued(
+            "completed".to_owned(),
+            "https://example.test/completed".to_owned(),
+            13,
+        );
+        completed.status = "Completed".to_owned();
+        store.save_downloads(vec![failed, interrupted, canceled, completed]).await.unwrap();
+
+        assert_eq!(retry_all_failed_downloads(&store).await.unwrap(), 2);
+        let rows = store.list_downloads().await.unwrap();
+        for id in ["failed", "interrupted"] {
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.status, "Queued");
+            assert_eq!(row.error, None);
+        }
+        assert_eq!(rows.iter().find(|row| row.id == "canceled").unwrap().status, "Canceled");
+        assert_eq!(rows.iter().find(|row| row.id == "completed").unwrap().status, "Completed");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
     #[test]
     fn dispatcher_capacity_tracks_raised_and_lowered_limits_without_stopping_workers() {
         assert!(can_dispatch_more(1, 3));
@@ -4080,6 +4401,44 @@ mod tests {
         assert!(!is_active_status("Completed"));
         assert_eq!(tray_tooltip(0, 0), "Yt Save");
         assert_eq!(tray_tooltip(1, 2), "Yt Save — 1 active, 2 paused");
+    }
+
+    #[test]
+    fn queue_action_state_enables_only_actions_with_matching_rows() {
+        assert_eq!(queue_action_state(&[]), QueueActionState::default());
+
+        let mut queued = DownloadRecord::queued(
+            "queued".to_owned(),
+            "https://example.test/queued".to_owned(),
+            10,
+        );
+        let mut paused = DownloadRecord::queued(
+            "paused".to_owned(),
+            "https://example.test/paused".to_owned(),
+            11,
+        );
+        paused.status = "Paused".to_owned();
+        let mut failed = DownloadRecord::queued(
+            "failed".to_owned(),
+            "https://example.test/failed".to_owned(),
+            12,
+        );
+        failed.status = "Failed".to_owned();
+
+        assert_eq!(
+            queue_action_state(&[queued.clone(), paused.clone(), failed.clone()]),
+            QueueActionState {
+                can_pause_all: true,
+                can_resume_all: true,
+                can_cancel_all: true,
+                can_retry_failed: true,
+            }
+        );
+
+        queued.status = "Completed".to_owned();
+        paused.status = "Completed".to_owned();
+        failed.status = "Canceled".to_owned();
+        assert_eq!(queue_action_state(&[queued, paused, failed]), QueueActionState::default());
     }
 
     #[test]

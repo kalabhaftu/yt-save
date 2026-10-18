@@ -85,6 +85,11 @@ export component MainWindow inherits Window {
     in-out property <string> download-directory: "";
     in-out property <string> status-message: "Paste a media URL to get started.";
     in-out property <string> queue-summary: "No pending work";
+    in property <bool> can-pause-all: false;
+    in property <bool> can-resume-all: false;
+    in property <bool> can-cancel-all: false;
+    in property <bool> can-retry-failed: false;
+    in-out property <bool> confirm-cancel-all: false;
     in-out property <string> max-concurrent-downloads: "1";
     in-out property <string> concurrent-fragments: "1";
     in-out property <string> auto-retry-attempts: "3";
@@ -124,6 +129,10 @@ export component MainWindow inherits Window {
     callback open-download-folder();
     callback choose-download-directory-requested();
     callback clear-completed-requested();
+    callback pause-all-requested();
+    callback resume-all-requested();
+    callback cancel-all-requested();
+    callback retry-all-failed-requested();
     callback export-history-requested();
     callback history-search-requested(string);
     callback library-search-requested(string);
@@ -978,7 +987,7 @@ export component MainWindow inherits Window {
                     }
 
                     VerticalLayout {
-                        height: 152px;
+                        height: 188px;
                         spacing: 4px;
                         HorizontalLayout {
                             height: 36px;
@@ -993,6 +1002,67 @@ export component MainWindow inherits Window {
                                 clicked => { root.clear-completed-requested(); }
                             }
                             Text { text: root.queue-summary; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            height: 30px;
+                            if root.confirm-cancel-all : HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Cancel queued and active downloads? Partial files will be kept.";
+                                    color: #dfb86f;
+                                    font-size: 11px;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: "Confirm cancel";
+                                    primary: true;
+                                    button-height: 28px;
+                                    button-min-width: 116px;
+                                    clicked => {
+                                        root.cancel-all-requested();
+                                        root.confirm-cancel-all = false;
+                                    }
+                                }
+                                ActionButton {
+                                    label: "Keep downloads";
+                                    button-height: 28px;
+                                    button-min-width: 116px;
+                                    clicked => { root.confirm-cancel-all = false; }
+                                }
+                            }
+                            if !root.confirm-cancel-all : HorizontalLayout {
+                                spacing: 6px;
+                                ActionButton {
+                                    label: "Pause all";
+                                    is-enabled: root.can-pause-all;
+                                    button-height: 28px;
+                                    button-min-width: 86px;
+                                    clicked => { root.pause-all-requested(); }
+                                }
+                                ActionButton {
+                                    label: "Resume paused";
+                                    is-enabled: root.can-resume-all;
+                                    button-height: 28px;
+                                    button-min-width: 108px;
+                                    clicked => { root.resume-all-requested(); }
+                                }
+                                ActionButton {
+                                    label: "Cancel all";
+                                    is-enabled: root.can-cancel-all;
+                                    button-height: 28px;
+                                    button-min-width: 88px;
+                                    clicked => { root.confirm-cancel-all = true; }
+                                }
+                                ActionButton {
+                                    label: "Retry failed";
+                                    is-enabled: root.can-retry-failed;
+                                    button-height: 28px;
+                                    button-min-width: 96px;
+                                    clicked => { root.retry-all-failed-requested(); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
                         }
                         HorizontalLayout {
                             height: 36px;

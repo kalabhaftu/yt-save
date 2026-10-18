@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add main-queue Pause all, Resume paused, confirmed Cancel all, and Retry failed actions, with real SQLite/process transitions and partial-file preservation.
+- Cover bulk cancel, failed/interrupted retry selection, and queue-toolbar action availability with app tests.
 - Add a deterministic queue-worker acceptance fixture that inspects metadata, streams progress, creates media, and verifies the completed SQLite record and output file.
 - Verify the packaged yt-dlp and explicit Deno runtime can download a public YouTube sample and merge its low-resolution video/audio streams with bundled FFmpeg.
 - Add an opt-in Windows acceptance test that runs the app queue worker against packaged yt-dlp, Deno, FFmpeg, and FFprobe, then verifies the downloaded YouTube file and SQLite completion record.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a deterministic queue-worker acceptance fixture that inspects metadata, streams progress, creates media, and verifies the completed SQLite record and output file.
+- Verify the packaged yt-dlp and explicit Deno runtime can download a public YouTube sample and merge its low-resolution video/audio streams with bundled FFmpeg.
 - Add durable playlist-group identity and queue actions to pause or resume all selected entries together, including active jobs while preserving partial files.
 - Add SQLite migration and queue-view coverage for playlist group persistence, mixed group states, and filtered queue views.
 - Add Select all, Select none, and inclusive index-range selection to playlist previews; entries without valid playlist indexes remain unselectable.

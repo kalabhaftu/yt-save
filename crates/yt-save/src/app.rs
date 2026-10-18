@@ -4363,6 +4363,84 @@ mod tests {
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn queue_worker_downloads_fixture_and_persists_completed_media() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let fixture_source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("fake_yt_dlp.rs");
+        let fake_yt_dlp = temp_dir.join("yt-dlp.exe");
+        let compilation = Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(&fixture_source)
+            .arg("-o")
+            .arg(&fake_yt_dlp)
+            .output()
+            .expect("launch rustc for the deterministic yt-dlp fixture");
+        assert!(
+            compilation.status.success(),
+            "could not compile fake yt-dlp: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+
+        let output_directory = temp_dir.join("downloads");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut queued = DownloadRecord::queued(
+            "fixture-job".to_owned(),
+            "https://example.test/media".to_owned(),
+            10,
+        );
+        queued.download_directory = output_directory.to_string_lossy().into_owned();
+        store.save_download(queued).await.unwrap();
+        let active = store
+            .claim_queued_download_if_next("fixture-job", 11)
+            .await
+            .unwrap()
+            .expect("fixture job should be claimed");
+
+        let (signal_sender, signal_receiver) = watch::channel(JobSignal::Continue);
+        let signal_sender = Arc::new(signal_sender);
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            active.id.clone(),
+            signal_sender.clone(),
+        )])));
+        let registration = ActiveJobRegistration {
+            id: active.id.clone(),
+            jobs: active_jobs,
+            sender: signal_sender,
+        };
+        let dependencies = DependencyPaths {
+            directory: temp_dir.clone(),
+            yt_dlp: fake_yt_dlp,
+            deno: temp_dir.join("deno.exe"),
+            ffmpeg: temp_dir.join("ffmpeg.exe"),
+            ffprobe: temp_dir.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, output_directory.clone());
+        let (events, _receiver) = mpsc::unbounded_channel();
+        run_download_job(active, store.clone(), engine, events, signal_receiver, registration)
+            .await;
+
+        let completed = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "fixture-job")
+            .unwrap();
+        let expected_path = output_directory.join("Fixture media [fixture-123].mp4");
+        assert_eq!(completed.status, "Completed");
+        assert_eq!(completed.title, "Fixture media");
+        assert_eq!(completed.source, "Fixture");
+        assert_eq!(completed.progress, 100.0);
+        assert_eq!(completed.output_path.as_deref(), Some(expected_path.to_str().unwrap()));
+        assert_eq!(std::fs::read(expected_path).unwrap(), b"tiny deterministic media fixture");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
     #[test]
     fn retry_wait_has_a_visible_deadline_and_counts_as_pending_work() {
         let mut record = DownloadRecord::queued(

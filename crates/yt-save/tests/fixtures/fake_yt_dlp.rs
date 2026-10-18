@@ -22,13 +22,28 @@ fn main() {
         eprintln!("could not create output directory: {error}");
         std::process::exit(2);
     }
-    let output_path = output_directory.join("Fixture media [fixture-123].mp4");
-    if let Err(error) = fs::write(&output_path, b"tiny deterministic media fixture") {
+    let subtitles_only = arguments.iter().any(|argument| argument == "--skip-download");
+    let output_path = if subtitles_only {
+        output_directory.join("Fixture media [fixture-123].en.srt")
+    } else {
+        output_directory.join("Fixture media [fixture-123].mp4")
+    };
+    let contents = if subtitles_only {
+        b"1\n00:00:00,000 --> 00:00:01,000\nfixture subtitle\n".as_slice()
+    } else {
+        b"tiny deterministic media fixture".as_slice()
+    };
+    if let Err(error) = fs::write(&output_path, contents) {
         eprintln!("could not write fixture media: {error}");
         std::process::exit(2);
     }
 
     println!("__YT_SAVE_PROGRESS__downloading|32|32|32|NA|0");
     println!("__YT_SAVE_PROGRESS__finished|32|32|32|NA|0");
-    println!("__YT_SAVE_OUTPUT__{}", output_path.display());
+    if subtitles_only {
+        let escaped = output_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        println!("__YT_SAVE_SUBTITLE_OUTPUT__{{\"en\":{{\"ext\":\"srt\",\"filepath\":\"{escaped}\"}}}}");
+    } else {
+        println!("__YT_SAVE_OUTPUT__{}", output_path.display());
+    }
 }

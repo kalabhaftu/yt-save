@@ -79,6 +79,10 @@ export component MainWindow inherits Window {
 
     in-out property <string> url-input: "";
     in-out property <bool> audio-only: false;
+    in-out property <bool> subtitle-only: false;
+    in-out property <string> subtitle-languages: "en";
+    in-out property <string> subtitle-format: "vtt";
+    in-out property <bool> include-auto-subtitles: false;
     in-out property <string> audio-format: "original";
     in-out property <string> audio-quality: "best";
     in-out property <string> video-quality: "Best";
@@ -445,7 +449,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         ComboBox {
-                            model: ["All files", "Video", "Audio", "Missing files"];
+                            model: ["All files", "Video", "Audio", "Subtitles", "Missing files"];
                             current-value <=> root.library-filter;
                             width: 136px;
                             height: 34px;
@@ -571,7 +575,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 350px + (root.clipboard-candidate != "" ? 38px : 0px);
+                        height: 350px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -662,17 +666,24 @@ export component MainWindow inherits Window {
                                 }
                                 ActionButton {
                                     label: "Video";
-                                    primary: !root.audio-only;
+                                    primary: !root.audio-only && !root.subtitle-only;
                                     button-height: 30px;
                                     button-min-width: 86px;
-                                    clicked => { root.audio-only = false; }
+                                    clicked => { root.audio-only = false; root.subtitle-only = false; }
                                 }
                                 ActionButton {
                                     label: "Audio only";
                                     primary: root.audio-only;
                                     button-height: 30px;
                                     button-min-width: 102px;
-                                    clicked => { root.audio-only = true; }
+                                    clicked => { root.audio-only = true; root.subtitle-only = false; }
+                                }
+                                ActionButton {
+                                    label: "Subtitles";
+                                    primary: root.subtitle-only;
+                                    button-height: 30px;
+                                    button-min-width: 98px;
+                                    clicked => { root.audio-only = false; root.subtitle-only = true; }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
@@ -689,7 +700,7 @@ export component MainWindow inherits Window {
                                 ComboBox {
                                     model: ["Best", "2160p / 4K", "1440p", "1080p", "720p", "480p", "360p", "Lowest"];
                                     current-value <=> root.video-quality;
-                                    enabled: !root.audio-only;
+                                    enabled: !root.audio-only && !root.subtitle-only;
                                     height: 34px;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
@@ -834,9 +845,60 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
+                            if root.subtitle-only : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Languages"; color: #a9b0c4; font-size: 11px; width: 92px; vertical-alignment: center; }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    border-radius: 8px;
+                                    TextInput {
+                                        text <=> root.subtitle-languages;
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: parent.height;
+                                        accessible-placeholder-text: "For example: en,fr";
+                                        color: #ecedf4;
+                                        font-size: 12px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                ActionButton {
+                                    label: root.include-auto-subtitles ? "Auto captions: On" : "Auto captions: Off";
+                                    primary: root.include-auto-subtitles;
+                                    button-height: 28px;
+                                    button-min-width: 132px;
+                                    clicked => { root.include-auto-subtitles = !root.include-auto-subtitles; }
+                                }
+                            }
+                            if root.subtitle-only : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Subtitle format"; color: #a9b0c4; font-size: 11px; width: 92px; vertical-alignment: center; }
+                                ActionButton {
+                                    label: "SRT";
+                                    primary: root.subtitle-format == "srt";
+                                    button-height: 28px;
+                                    button-min-width: 66px;
+                                    clicked => { root.subtitle-format = "srt"; }
+                                }
+                                ActionButton {
+                                    label: "VTT";
+                                    primary: root.subtitle-format == "vtt";
+                                    button-height: 28px;
+                                    button-min-width: 66px;
+                                    clicked => { root.subtitle-format = "vtt"; }
+                                }
+                                Text { text: "Analyze to see reported caption languages."; color: #727b92; font-size: 10px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
                             Text {
                                 height: 12px;
-                                text: !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                text: root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
                                 color: #747d96;
                                 font-size: 10px;
                                 overflow: elide;
@@ -894,7 +956,7 @@ export component MainWindow inherits Window {
                                     button-height: 30px;
                                     min-width: 170px;
                                     primary: true;
-                                    is-enabled: root.selected-playlist-count > 0;
+                                    is-enabled: root.selected-playlist-count > 0 && !root.subtitle-only;
                                     clicked => { root.enqueue-selected-playlist-entries-requested(); }
                                 }
                             }

@@ -6,7 +6,8 @@ use rusqlite::{
 };
 
 use crate::model::{
-    AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, VideoQuality,
+    AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
+    VideoQuality,
 };
 
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
@@ -73,7 +74,10 @@ impl Store {
                     queue_rank INTEGER NOT NULL DEFAULT 0,
                     priority INTEGER NOT NULL DEFAULT 0,
                     retry_attempts INTEGER NOT NULL DEFAULT 0,
-                    next_retry_at INTEGER
+                    next_retry_at INTEGER,
+                    subtitle_languages TEXT NOT NULL DEFAULT 'en',
+                    subtitle_format TEXT NOT NULL DEFAULT 'vtt',
+                    include_auto_subtitles INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -105,6 +109,9 @@ impl Store {
                 ("next_retry_at", "INTEGER"),
                 ("playlist_group_id", "TEXT"),
                 ("playlist_group_title", "TEXT"),
+                ("subtitle_languages", "TEXT NOT NULL DEFAULT 'en'"),
+                ("subtitle_format", "TEXT NOT NULL DEFAULT 'vtt'"),
+                ("include_auto_subtitles", "INTEGER NOT NULL DEFAULT 0"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -1253,7 +1260,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             error, created_at, updated_at, playlist_index,
             playlist_group_id, playlist_group_title,
             download_mode, audio_format, audio_quality, video_quality,
-            download_directory, queue_rank, priority, retry_attempts, next_retry_at
+            download_directory, queue_rank, priority, retry_attempts, next_retry_at,
+            subtitle_languages, subtitle_format, include_auto_subtitles
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -1262,7 +1270,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             :download_directory,
             coalesce((SELECT max(queue_rank) FROM downloads
                       WHERE priority = :priority), 0) + 1024,
-            :priority, :retry_attempts, :next_retry_at
+            :priority, :retry_attempts, :next_retry_at,
+            :subtitle_languages, :subtitle_format, :include_auto_subtitles
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -1280,7 +1289,10 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             video_quality=excluded.video_quality,
             download_directory=excluded.download_directory,
             retry_attempts=excluded.retry_attempts,
-            next_retry_at=excluded.next_retry_at",
+            next_retry_at=excluded.next_retry_at,
+            subtitle_languages=excluded.subtitle_languages,
+            subtitle_format=excluded.subtitle_format,
+            include_auto_subtitles=excluded.include_auto_subtitles",
         named_params! {
             ":id": record.id,
             ":url": record.url,
@@ -1307,6 +1319,9 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":priority": record.priority,
             ":retry_attempts": i64::from(record.retry_attempts),
             ":next_retry_at": record.next_retry_at,
+            ":subtitle_languages": record.subtitle_languages,
+            ":subtitle_format": record.subtitle_format.as_database_value(),
+            ":include_auto_subtitles": record.include_auto_subtitles,
         },
     )?;
     Ok(())
@@ -1330,7 +1345,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 error, created_at, updated_at, playlist_index,
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
-                priority, download_directory, retry_attempts, next_retry_at
+                priority, download_directory, retry_attempts, next_retry_at,
+                subtitle_languages, subtitle_format, include_auto_subtitles
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -1362,6 +1378,9 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 priority: row.get(22)?,
                 retry_attempts: retry_attempts_from_row(row, 24)?,
                 next_retry_at: row.get(25)?,
+                subtitle_languages: row.get(26)?,
+                subtitle_format: subtitle_format_from_row(row, 27)?,
+                include_auto_subtitles: row.get(28)?,
             })
         })
         .optional()?;
@@ -1384,7 +1403,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 error, created_at, updated_at, playlist_index,
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
-                priority, download_directory, retry_attempts, next_retry_at
+                priority, download_directory, retry_attempts, next_retry_at,
+                subtitle_languages, subtitle_format, include_auto_subtitles
          FROM downloads
         ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN 0 ELSE 1 END,
                   CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused') THEN priority ELSE 0 END DESC,
@@ -1420,6 +1440,9 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             priority: row.get(22)?,
             retry_attempts: retry_attempts_from_row(row, 24)?,
             next_retry_at: row.get(25)?,
+            subtitle_languages: row.get(26)?,
+            subtitle_format: subtitle_format_from_row(row, 27)?,
+            include_auto_subtitles: row.get(28)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -1443,6 +1466,11 @@ fn audio_quality_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<Audio
 fn video_quality_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<VideoQuality> {
     let value: String = row.get(index)?;
     VideoQuality::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
+}
+
+fn subtitle_format_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<SubtitleFormat> {
+    let value: String = row.get(index)?;
+    SubtitleFormat::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
 }
 
 fn invalid_enum_value(index: usize, value: &str) -> rusqlite::Error {
@@ -1729,7 +1757,10 @@ mod tests {
         let mut record =
             DownloadRecord::queued("job-1".to_owned(), "https://example.test/media".to_owned(), 10);
         record.playlist_index = Some(4);
-        record.download_mode = DownloadMode::AudioOnly;
+        record.download_mode = DownloadMode::SubtitlesOnly;
+        record.subtitle_languages = "en,fr".to_owned();
+        record.subtitle_format = SubtitleFormat::Srt;
+        record.include_auto_subtitles = true;
         record.audio_format = AudioFormat::Opus;
         record.audio_quality = AudioQuality::K320;
         record.video_quality = VideoQuality::P2160;
@@ -1748,7 +1779,10 @@ mod tests {
         assert_eq!(rows[0].total_bytes, Some(1_000));
         assert_eq!(rows[0].eta_seconds, Some(12));
         assert_eq!(rows[0].playlist_index, Some(4));
-        assert_eq!(rows[0].download_mode, DownloadMode::AudioOnly);
+        assert_eq!(rows[0].download_mode, DownloadMode::SubtitlesOnly);
+        assert_eq!(rows[0].subtitle_languages, "en,fr");
+        assert_eq!(rows[0].subtitle_format, SubtitleFormat::Srt);
+        assert!(rows[0].include_auto_subtitles);
         assert_eq!(rows[0].audio_format, AudioFormat::Opus);
         assert_eq!(rows[0].audio_quality, AudioQuality::K320);
         assert_eq!(rows[0].video_quality, VideoQuality::P2160);
@@ -2182,6 +2216,9 @@ mod tests {
         assert_eq!(legacy.priority, 0);
         assert_eq!(legacy.playlist_index, None);
         assert_eq!(legacy.playlist_group_id, None);
+        assert_eq!(legacy.subtitle_languages, "en");
+        assert_eq!(legacy.subtitle_format, SubtitleFormat::Vtt);
+        assert!(!legacy.include_auto_subtitles);
         assert_eq!(legacy.playlist_group_title, None);
         assert_eq!(legacy.download_mode, DownloadMode::Video);
         assert_eq!(legacy.audio_format, AudioFormat::Original);

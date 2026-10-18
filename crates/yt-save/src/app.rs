@@ -29,8 +29,9 @@ use crate::{
     },
     history::download_history_csv,
     model::{
-        DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry, format_bytes,
-        format_duration,
+        DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry,
+        SubtitleFormat, format_bytes, format_duration, normalize_subtitle_languages,
+        subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
@@ -63,7 +64,7 @@ enum UiEvent {
     Metadata {
         request_id: u64,
         source_url: String,
-        metadata: MediaMetadata,
+        metadata: Box<MediaMetadata>,
     },
 }
 
@@ -239,6 +240,7 @@ pub fn run() -> Result<()> {
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
     window.set_audio_only(download_presets.mode == DownloadMode::AudioOnly);
+    window.set_subtitle_only(download_presets.mode == DownloadMode::SubtitlesOnly);
     window.set_audio_format(download_presets.audio_format.as_database_value().into());
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
@@ -555,6 +557,7 @@ pub fn run() -> Result<()> {
                     if request_id != latest_analysis_id {
                         continue;
                     }
+                    let metadata = *metadata;
                     let format_summary = if metadata.is_playlist {
                         String::new()
                     } else {
@@ -563,12 +566,28 @@ pub fn run() -> Result<()> {
                     let playlist_summary = metadata.playlist_count.map_or(String::new(), |count| {
                         format!(" · {count} entries in preview; preview capped at 50")
                     });
+                    let subtitle_summary = if metadata.is_playlist {
+                        String::new()
+                    } else {
+                        let manual = if metadata.manual_subtitle_languages.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            metadata.manual_subtitle_languages.join(", ")
+                        };
+                        let automatic = if metadata.automatic_subtitle_languages.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            metadata.automatic_subtitle_languages.join(", ")
+                        };
+                        format!(" · captions: manual {manual}; auto {automatic}")
+                    };
                     let details = format!(
-                        "{} · {}{}{}",
+                        "{} · {}{}{}{}",
                         metadata.source,
                         format_duration(metadata.duration_seconds),
                         format_summary,
                         playlist_summary,
+                        subtitle_summary,
                     );
                     let weak = weak_window.clone();
                     let title = metadata.title;
@@ -766,8 +785,11 @@ pub fn run() -> Result<()> {
             match engine.inspect(&url).await {
                 Ok(metadata) => {
                     let _ = events.send(UiEvent::Status("Media details loaded.".to_owned()));
-                    let _ =
-                        events.send(UiEvent::Metadata { request_id, source_url: url, metadata });
+                    let _ = events.send(UiEvent::Metadata {
+                        request_id,
+                        source_url: url,
+                        metadata: Box::new(metadata),
+                    });
                 }
                 Err(error) => {
                     let _ = events.send(UiEvent::Status(error.to_string()));
@@ -848,6 +870,10 @@ pub fn run() -> Result<()> {
         ));
         let (
             audio_only,
+            subtitle_only,
+            selected_subtitle_languages,
+            selected_subtitle_format,
+            include_auto_subtitles,
             selected_format,
             selected_quality,
             selected_video_quality,
@@ -857,6 +883,10 @@ pub fn run() -> Result<()> {
             .map(|window| {
                 (
                     window.get_audio_only(),
+                    window.get_subtitle_only(),
+                    window.get_subtitle_languages().to_string(),
+                    window.get_subtitle_format().to_string(),
+                    window.get_include_auto_subtitles(),
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
@@ -864,6 +894,19 @@ pub fn run() -> Result<()> {
                 )
             })
             .unwrap_or_default();
+        let normalized_subtitle_languages = if subtitle_only {
+            match normalize_subtitle_languages(&selected_subtitle_languages) {
+                Some(languages) => languages,
+                None => {
+                    let _ = queue_events.send(UiEvent::Status(
+                        "Enter one or more subtitle language codes, such as en or en,fr.".to_owned(),
+                    ));
+                    return;
+                }
+            }
+        } else {
+            "en".to_owned()
+        };
         let inspection_url = url.clone();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
         let download_presets = DownloadPresets::from_ui_values(
@@ -872,10 +915,18 @@ pub fn run() -> Result<()> {
             &selected_quality,
             &selected_video_quality,
         );
-        record.download_mode = download_presets.mode;
+        record.download_mode = if subtitle_only {
+            DownloadMode::SubtitlesOnly
+        } else {
+            download_presets.mode
+        };
         record.audio_format = download_presets.audio_format;
         record.audio_quality = download_presets.audio_quality;
         record.video_quality = download_presets.video_quality;
+        record.subtitle_languages = normalized_subtitle_languages;
+        record.subtitle_format = SubtitleFormat::from_database_value(&selected_subtitle_format)
+            .unwrap_or_default();
+        record.include_auto_subtitles = include_auto_subtitles;
         let store = queue_store.clone();
         let engine = queue_engine.clone();
         let events = queue_events.clone();
@@ -885,25 +936,46 @@ pub fn run() -> Result<()> {
         queue_handle.spawn(async move {
             match inspector.inspect(&inspection_url).await {
                 Ok(metadata) if metadata.is_playlist => {
+                    let playlist_message = if record.download_mode == DownloadMode::SubtitlesOnly {
+                        "Subtitle-only downloads support one media URL at a time. Choose a single video or audio URL."
+                    } else {
+                        "This URL contains a playlist. Review its entries and select what to queue."
+                    };
                     if analysis_generation.load(Ordering::Acquire) == request_id {
                         let _ = events.send(UiEvent::Metadata {
                             request_id,
                             source_url: inspection_url,
-                            metadata,
+                            metadata: Box::new(metadata),
                         });
-                        let _ = events.send(UiEvent::Status(
-                            "This URL contains a playlist. Review its entries and select what to queue."
-                                .to_owned(),
-                        ));
+                        let _ = events.send(UiEvent::Status(playlist_message.to_owned()));
                     } else {
-                        let _ = events.send(UiEvent::Status(
+                        let stale_message = if record.download_mode == DownloadMode::SubtitlesOnly {
+                            "This link contains a playlist. Subtitle-only downloads support one media URL at a time."
+                        } else {
                             "This link contains a playlist. Analyze it again to review its entries before queueing."
-                                .to_owned(),
-                        ));
+                        };
+                        let _ = events.send(UiEvent::Status(stale_message.to_owned()));
                     }
                     return;
                 }
-                Ok(_) => {}
+                Ok(metadata) => {
+                    if record.download_mode == DownloadMode::SubtitlesOnly {
+                        let mut available = metadata.manual_subtitle_languages.clone();
+                        if record.include_auto_subtitles {
+                            available.extend(metadata.automatic_subtitle_languages.iter().cloned());
+                        }
+                        if !subtitle_languages_available(&record.subtitle_languages, &available) {
+                            let _ = events.send(UiEvent::Status(if record.include_auto_subtitles {
+                                "yt-dlp did not report captions in the selected language(s) for this link.".to_owned()
+                            } else {
+                                "yt-dlp did not report manual captions in the selected language(s). Enable auto captions or choose another language.".to_owned()
+                            }));
+                            return;
+                        }
+                        record.title = metadata.title;
+                        record.source = metadata.source;
+                    }
+                }
                 Err(error) => {
                     error!(%error, "inspect media link before queueing");
                     let _ = events.send(UiEvent::Status(format!(
@@ -1055,6 +1127,15 @@ pub fn run() -> Result<()> {
         if selected_shutdown_started.load(Ordering::Acquire) {
             let _ = selected_queue_events
                 .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
+        if selected_queue_window
+            .upgrade()
+            .is_some_and(|window| window.get_subtitle_only())
+        {
+            let _ = selected_queue_events.send(UiEvent::Status(
+                "Subtitle-only playlist queues are not available yet. Add one media URL at a time.".to_owned(),
+            ));
             return;
         }
         let selection = selected_playlist.lock().ok().and_then(|state| state.clone());
@@ -2191,6 +2272,7 @@ fn queue_clipboard_candidate(url: String, audio_only: bool, context: ClipboardPo
     if let Some(window) = context.main_window.upgrade() {
         window.set_url_input(url.clone().into());
         window.set_audio_only(audio_only);
+        window.set_subtitle_only(false);
         window.set_status_message("Checking the copied link before adding it to the queue…".into());
         if let Err(error) = window.show() {
             error!(%error, "show window to add copied link");
@@ -3209,6 +3291,11 @@ async fn run_download_job(
             DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
                 .with_video_quality(active.video_quality)
                 .with_concurrent_fragments(concurrent_fragments)
+                .with_subtitle_options(
+                    active.subtitle_languages.clone(),
+                    active.subtitle_format,
+                    active.include_auto_subtitles,
+                )
                 .with_output_directory(PathBuf::from(&active.download_directory)),
             &mut signal_receiver,
             move |progress| {
@@ -3223,7 +3310,12 @@ async fn run_download_job(
             final_record.progress = 100.0;
             final_record.output_path = result.output_path;
             final_record.error = None;
-            (true, false, false, "Download complete.".to_owned())
+            let message = if final_record.download_mode == DownloadMode::SubtitlesOnly {
+                "Subtitle sidecar saved."
+            } else {
+                "Download complete."
+            };
+            (true, false, false, message.to_owned())
         }
         Ok(EngineOutcome::Paused) => {
             final_record.status = "Paused".to_owned();
@@ -3610,6 +3702,7 @@ fn scan_library_entries(records: &[DownloadRecord]) -> Vec<LibraryCacheEntry> {
             let kind = match record.download_mode {
                 DownloadMode::Video => "Video",
                 DownloadMode::AudioOnly => "Audio",
+                DownloadMode::SubtitlesOnly => "Subtitles",
             };
             let file_format = Path::new(path)
                 .extension()
@@ -3685,6 +3778,7 @@ fn library_row_views_from_cache(
         .filter(|entry| match filter {
             "Video" => entry.row.kind.as_str() == "Video",
             "Audio" => entry.row.kind.as_str() == "Audio",
+            "Subtitles" => entry.row.kind.as_str() == "Subtitles",
             "Missing files" => !entry.row.path_available,
             _ => true,
         })
@@ -3840,6 +3934,12 @@ fn row_view_with_queue_position(
             format!("Audio · {} · {}", record.audio_format.label(), record.audio_quality.label())
         }
         DownloadMode::AudioOnly => format!("Audio · {}", record.audio_format.label()),
+        DownloadMode::SubtitlesOnly => format!(
+            "Subtitles · {} · {}{}",
+            record.subtitle_languages,
+            record.subtitle_format.as_database_value().to_uppercase(),
+            if record.include_auto_subtitles { " · auto captions" } else { " · manual captions" }
+        ),
     };
     let playlist_group = record
         .playlist_group_title
@@ -3984,7 +4084,7 @@ fn pick_library_media_file() -> Result<Option<PathBuf>> {
 
     let filter: Vec<u16> = concat!(
         "Media files\0",
-        "*.3g2;*.3gp;*.aac;*.ac3;*.aif;*.aiff;*.alac;*.amr;*.ape;*.asf;*.au;*.avi;*.caf;*.flac;*.flv;*.m2ts;*.m4a;*.m4b;*.m4v;*.mka;*.mkv;*.mov;*.mp2;*.mp3;*.mp4;*.mpeg;*.mpg;*.oga;*.ogg;*.ogv;*.opus;*.ra;*.rm;*.ts;*.wav;*.webm;*.wma;*.wmv\0\0"
+        "*.3g2;*.3gp;*.aac;*.ac3;*.aif;*.aiff;*.alac;*.amr;*.ape;*.asf;*.au;*.avi;*.caf;*.flac;*.flv;*.m2ts;*.m4a;*.m4b;*.m4v;*.mka;*.mkv;*.mov;*.mp2;*.mp3;*.mp4;*.mpeg;*.mpg;*.oga;*.ogg;*.ogv;*.opus;*.ra;*.rm;*.srt;*.ts;*.vtt;*.wav;*.webm;*.wma;*.wmv\0\0"
     )
     .encode_utf16()
     .collect();
@@ -4098,6 +4198,8 @@ fn has_supported_media_extension(path: &Path) -> bool {
             | "webm"
             | "wma"
             | "wmv"
+            | "srt"
+            | "vtt"
     )
 }
 
@@ -4497,8 +4599,10 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
         let video_path = temp_dir.join("tutorial.mp4");
         let audio_path = temp_dir.join("track.mp3");
+        let subtitle_path = temp_dir.join("captions.srt");
         std::fs::write(&video_path, b"video-bytes").unwrap();
         std::fs::write(&audio_path, b"audio").unwrap();
+        std::fs::write(&subtitle_path, b"subs").unwrap();
 
         let mut video = DownloadRecord::queued(
             "video".to_owned(),
@@ -4523,6 +4627,18 @@ mod tests {
         audio.output_path = Some(audio_path.to_string_lossy().into_owned());
         audio.updated_at = 10;
 
+        let mut subtitles = DownloadRecord::queued(
+            "subtitles".to_owned(),
+            "https://video.example/watch/4".to_owned(),
+            12,
+        );
+        subtitles.title = "English captions".to_owned();
+        subtitles.source = "Video Example".to_owned();
+        subtitles.status = "Completed".to_owned();
+        subtitles.download_mode = DownloadMode::SubtitlesOnly;
+        subtitles.output_path = Some(subtitle_path.to_string_lossy().into_owned());
+        subtitles.updated_at = 15;
+
         let mut missing = DownloadRecord::queued(
             "missing".to_owned(),
             "https://video.example/watch/3".to_owned(),
@@ -4533,19 +4649,24 @@ mod tests {
         missing.output_path = Some(temp_dir.join("moved.mp4").to_string_lossy().into_owned());
         missing.updated_at = 30;
 
-        let records = [video, audio, missing];
+        let records = [video, audio, subtitles, missing];
         let all = library_row_views(&records, "", "All files", "Newest first");
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
         assert_eq!(all[0].id.as_str(), "missing");
         assert!(!all[0].path_available);
         assert_eq!(all[0].file_status.as_str(), "Unavailable · locate moved file");
         assert_eq!(all[1].id.as_str(), "video");
         assert!(all[1].path_available);
         assert!(all[1].size_label.as_str().contains("on disk"));
+        assert_eq!(all[2].id.as_str(), "subtitles");
+        assert_eq!(all[2].kind.as_str(), "Subtitles");
 
         let audio_only = library_row_views(&records, "audio.example", "Audio", "Title A–Z");
         assert_eq!(audio_only.len(), 1);
         assert_eq!(audio_only[0].id.as_str(), "audio");
+        let subtitle_only = library_row_views(&records, "", "Subtitles", "Newest first");
+        assert_eq!(subtitle_only.len(), 1);
+        assert_eq!(subtitle_only[0].id.as_str(), "subtitles");
         let missing_only = library_row_views(&records, "", "Missing files", "Newest first");
         assert_eq!(missing_only.len(), 1);
         assert_eq!(missing_only[0].id.as_str(), "missing");
@@ -4559,6 +4680,8 @@ mod tests {
     fn library_relink_accepts_media_extensions_and_rejects_unrelated_files() {
         assert!(has_supported_media_extension(Path::new("lesson.MP4")));
         assert!(has_supported_media_extension(Path::new("recording.opus")));
+        assert!(has_supported_media_extension(Path::new("captions.SRT")));
+        assert!(has_supported_media_extension(Path::new("captions.vtt")));
         assert!(!has_supported_media_extension(Path::new("notes.txt")));
         assert!(!has_supported_media_extension(Path::new("extensionless")));
     }
@@ -4771,9 +4894,10 @@ mod tests {
             jobs: active_jobs,
             sender: signal_sender,
         };
+        std::fs::write(temp_dir.join("ffmpeg.exe"), b"fixture ffmpeg placeholder").unwrap();
         let dependencies = DependencyPaths {
             directory: temp_dir.clone(),
-            yt_dlp: fake_yt_dlp,
+            yt_dlp: fake_yt_dlp.clone(),
             deno: temp_dir.join("deno.exe"),
             ffmpeg: temp_dir.join("ffmpeg.exe"),
             ffprobe: temp_dir.join("ffprobe.exe"),
@@ -4797,6 +4921,74 @@ mod tests {
         assert_eq!(completed.progress, 100.0);
         assert_eq!(completed.output_path.as_deref(), Some(expected_path.to_str().unwrap()));
         assert_eq!(std::fs::read(expected_path).unwrap(), b"tiny deterministic media fixture");
+
+        let mut subtitle_queued = DownloadRecord::queued(
+            "fixture-subtitle-job".to_owned(),
+            "https://example.test/media-with-captions".to_owned(),
+            12,
+        );
+        subtitle_queued.download_directory = output_directory.to_string_lossy().into_owned();
+        subtitle_queued.download_mode = DownloadMode::SubtitlesOnly;
+        subtitle_queued.subtitle_languages = "en".to_owned();
+        subtitle_queued.subtitle_format = SubtitleFormat::Srt;
+        subtitle_queued.include_auto_subtitles = true;
+        store.save_download(subtitle_queued).await.unwrap();
+        let subtitle_active = store
+            .claim_queued_download_if_next("fixture-subtitle-job", 13)
+            .await
+            .unwrap()
+            .expect("subtitle fixture job should be claimed");
+        let (subtitle_sender, subtitle_receiver) = watch::channel(JobSignal::Continue);
+        let subtitle_sender = Arc::new(subtitle_sender);
+        let subtitle_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            subtitle_active.id.clone(),
+            subtitle_sender.clone(),
+        )])));
+        let subtitle_registration = ActiveJobRegistration {
+            id: subtitle_active.id.clone(),
+            jobs: subtitle_jobs,
+            sender: subtitle_sender,
+        };
+        let subtitle_dependencies = DependencyPaths {
+            directory: temp_dir.clone(),
+            yt_dlp: fake_yt_dlp,
+            deno: temp_dir.join("deno.exe"),
+            ffmpeg: temp_dir.join("ffmpeg.exe"),
+            ffprobe: temp_dir.join("ffprobe.exe"),
+        };
+        let subtitle_engine = DownloadEngine::new(subtitle_dependencies, output_directory.clone());
+        let (subtitle_events, _subtitle_event_receiver) = mpsc::unbounded_channel();
+        run_download_job(
+            subtitle_active,
+            store.clone(),
+            subtitle_engine,
+            subtitle_events,
+            subtitle_receiver,
+            subtitle_registration,
+        )
+        .await;
+
+        let subtitle_completed = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "fixture-subtitle-job")
+            .unwrap();
+        let expected_subtitle_path = output_directory.join("Fixture media [fixture-123].en.srt");
+        assert_eq!(subtitle_completed.status, "Completed");
+        assert_eq!(subtitle_completed.download_mode, DownloadMode::SubtitlesOnly);
+        assert_eq!(subtitle_completed.subtitle_languages, "en");
+        assert_eq!(subtitle_completed.subtitle_format, SubtitleFormat::Srt);
+        assert!(subtitle_completed.include_auto_subtitles);
+        assert_eq!(
+            subtitle_completed.output_path.as_deref(),
+            Some(expected_subtitle_path.to_str().unwrap())
+        );
+        assert_eq!(
+            std::fs::read(expected_subtitle_path).unwrap(),
+            b"1\n00:00:00,000 --> 00:00:01,000\nfixture subtitle\n"
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

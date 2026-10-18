@@ -5,6 +5,7 @@ pub enum DownloadMode {
     #[default]
     Video,
     AudioOnly,
+    SubtitlesOnly,
 }
 
 impl DownloadMode {
@@ -12,6 +13,7 @@ impl DownloadMode {
         match self {
             Self::Video => "video",
             Self::AudioOnly => "audio",
+            Self::SubtitlesOnly => "subtitles",
         }
     }
 
@@ -19,9 +21,68 @@ impl DownloadMode {
         match value {
             "video" => Some(Self::Video),
             "audio" => Some(Self::AudioOnly),
+            "subtitles" => Some(Self::SubtitlesOnly),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubtitleFormat {
+    Srt,
+    #[default]
+    Vtt,
+}
+
+impl SubtitleFormat {
+    pub fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Vtt => "vtt",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "srt" => Some(Self::Srt),
+            "vtt" => Some(Self::Vtt),
+            _ => None,
+        }
+    }
+}
+
+pub fn normalize_subtitle_languages(value: &str) -> Option<String> {
+    let mut languages = Vec::new();
+    for language in value.split(',').map(str::trim) {
+        if language.is_empty()
+            || language.len() > 32
+            || !language.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+            || languages.iter().any(|existing: &String| existing.eq_ignore_ascii_case(language))
+        {
+            return None;
+        }
+        languages.push(language.to_owned());
+    }
+    if languages.is_empty() || languages.len() > 8 {
+        return None;
+    }
+    let includes_all = languages.iter().any(|language| language.eq_ignore_ascii_case("all"));
+    if includes_all && languages.len() != 1 {
+        return None;
+    }
+    Some(languages.join(","))
+}
+
+pub fn subtitle_languages_available(requested: &str, available: &[String]) -> bool {
+    if available.is_empty() {
+        return false;
+    }
+    requested.eq_ignore_ascii_case("all")
+        || requested.split(',').map(str::trim).all(|language| {
+            available.iter().any(|candidate| candidate.eq_ignore_ascii_case(language))
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -298,6 +359,10 @@ pub struct MediaMetadata {
     pub playlist_count: Option<usize>,
     #[serde(default)]
     pub playlist_entries: Vec<PlaylistEntry>,
+    #[serde(default)]
+    pub manual_subtitle_languages: Vec<String>,
+    #[serde(default)]
+    pub automatic_subtitle_languages: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,8 +421,20 @@ impl MediaMetadata {
             is_playlist,
             playlist_count: entries.map(Vec::len),
             playlist_entries,
+            manual_subtitle_languages: subtitle_languages(first_entry, "subtitles"),
+            automatic_subtitle_languages: subtitle_languages(first_entry, "automatic_captions"),
         }
     }
+}
+
+fn subtitle_languages(value: &serde_json::Value, field: &str) -> Vec<String> {
+    let mut languages = value
+        .get(field)
+        .and_then(serde_json::Value::as_object)
+        .map(|subtitles| subtitles.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    languages.sort_unstable();
+    languages
 }
 
 fn playlist_index(value: &serde_json::Value) -> Option<i64> {
@@ -378,6 +455,9 @@ pub struct DownloadRecord {
     /// Playlist title shown in queue controls for this selection group.
     pub playlist_group_title: Option<String>,
     pub download_mode: DownloadMode,
+    pub subtitle_languages: String,
+    pub subtitle_format: SubtitleFormat,
+    pub include_auto_subtitles: bool,
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
     pub video_quality: VideoQuality,
@@ -412,6 +492,9 @@ impl DownloadRecord {
             playlist_group_id: None,
             playlist_group_title: None,
             download_mode: DownloadMode::Video,
+            subtitle_languages: "en".to_owned(),
+            subtitle_format: SubtitleFormat::Vtt,
+            include_auto_subtitles: false,
             audio_format: AudioFormat::Original,
             audio_quality: AudioQuality::Best,
             video_quality: VideoQuality::Best,
@@ -504,6 +587,56 @@ mod tests {
     }
 
     #[test]
+    fn metadata_parser_reports_manual_and_automatic_subtitle_languages() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"id":"captions","title":"Caption sample","subtitles":{"fr":[{"ext":"vtt"}],"en":[{"ext":"srt"}]},"automatic_captions":{"es":[{"ext":"vtt"}],"en":[{"ext":"vtt"}]}}"#,
+        )
+        .unwrap();
+
+        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &value,
+            "https://example.test/captions",
+            None,
+        );
+        assert_eq!(metadata.manual_subtitle_languages, ["en", "fr"]);
+        assert_eq!(metadata.automatic_subtitle_languages, ["en", "es"]);
+
+        let without_captions: serde_json::Value =
+            serde_json::from_str(r#"{"id":"no-captions","title":"No captions"}"#).unwrap();
+        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &without_captions,
+            "https://example.test/no-captions",
+            None,
+        );
+        assert!(metadata.manual_subtitle_languages.is_empty());
+        assert!(metadata.automatic_subtitle_languages.is_empty());
+    }
+
+    #[test]
+    fn subtitle_choices_have_stable_database_values() {
+        assert_eq!(
+            DownloadMode::from_database_value("subtitles"),
+            Some(DownloadMode::SubtitlesOnly)
+        );
+        assert_eq!(SubtitleFormat::from_database_value("srt"), Some(SubtitleFormat::Srt));
+        assert_eq!(SubtitleFormat::from_database_value("vtt"), Some(SubtitleFormat::Vtt));
+        assert_eq!(SubtitleFormat::from_database_value("ass"), None);
+    }
+
+    #[test]
+    fn subtitle_language_selection_accepts_codes_and_rejects_ambiguous_input() {
+        assert_eq!(normalize_subtitle_languages("en, fr-CA"), Some("en,fr-CA".to_owned()));
+        assert_eq!(normalize_subtitle_languages("all"), Some("all".to_owned()));
+        assert!(normalize_subtitle_languages("all,en").is_none());
+        assert!(normalize_subtitle_languages("en,en").is_none());
+        assert!(normalize_subtitle_languages("en;--exec").is_none());
+        assert!(subtitle_languages_available("EN,fr", &["en".to_owned(), "fr".to_owned()]));
+        assert!(!subtitle_languages_available("EN,fr", &["en".to_owned()]));
+        assert!(!subtitle_languages_available("fr", &["en".to_owned()]));
+        assert!(subtitle_languages_available("all", &["ja".to_owned()]));
+    }
+
+    #[test]
     fn playlist_entries_are_selectable_only_with_positive_integer_indexes() {
         let playlist: serde_json::Value = serde_json::from_str(
             r#"{"title":"Playlist","entries":[{"title":"First","playlist_index":1},{"title":"Zero","playlist_index":0},{"title":"String","playlist_index":"3"},{"title":"Missing"},null,{"title":"Sixth","playlist_index":6}]}"#,
@@ -551,7 +684,11 @@ mod tests {
 
     #[test]
     fn persisted_audio_choices_have_stable_database_values() {
-        for (mode, value) in [(DownloadMode::Video, "video"), (DownloadMode::AudioOnly, "audio")] {
+        for (mode, value) in [
+            (DownloadMode::Video, "video"),
+            (DownloadMode::AudioOnly, "audio"),
+            (DownloadMode::SubtitlesOnly, "subtitles"),
+        ] {
             assert_eq!(DownloadMode::from_database_value(value), Some(mode));
             assert_eq!(mode.as_database_value(), value);
         }

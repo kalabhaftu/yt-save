@@ -14,11 +14,15 @@ use tracing::{debug, warn};
 
 use crate::{
     dependencies::DependencyPaths,
-    model::{AudioFormat, AudioQuality, DownloadMode, MediaMetadata, VideoQuality},
+    model::{
+        AudioFormat, AudioQuality, DownloadMode, MediaMetadata, SubtitleFormat, VideoQuality,
+        normalize_subtitle_languages,
+    },
 };
 
 const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
+const SUBTITLE_OUTPUT_PREFIX: &str = "__YT_SAVE_SUBTITLE_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 
 #[derive(Debug)]
@@ -42,6 +46,9 @@ pub(crate) struct DownloadOptions {
     audio_format: AudioFormat,
     audio_quality: AudioQuality,
     video_quality: VideoQuality,
+    subtitle_languages: String,
+    subtitle_format: SubtitleFormat,
+    include_auto_subtitles: bool,
     concurrent_fragments: usize,
     output_directory: Option<PathBuf>,
 }
@@ -57,6 +64,9 @@ impl DownloadOptions {
             audio_format,
             audio_quality,
             video_quality: VideoQuality::Best,
+            subtitle_languages: "en".to_owned(),
+            subtitle_format: SubtitleFormat::Vtt,
+            include_auto_subtitles: false,
             concurrent_fragments: 1,
             output_directory: None,
         }
@@ -74,6 +84,18 @@ impl DownloadOptions {
 
     pub(crate) fn with_concurrent_fragments(mut self, concurrent_fragments: usize) -> Self {
         self.concurrent_fragments = concurrent_fragments.clamp(1, 8);
+        self
+    }
+
+    pub(crate) fn with_subtitle_options(
+        mut self,
+        languages: String,
+        format: SubtitleFormat,
+        include_auto_subtitles: bool,
+    ) -> Self {
+        self.subtitle_languages = languages;
+        self.subtitle_format = format;
+        self.include_auto_subtitles = include_auto_subtitles;
         self
     }
 }
@@ -230,6 +252,9 @@ impl DownloadEngine {
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
+        let subtitle_only = options.mode == DownloadMode::SubtitlesOnly;
+        let subtitle_output_directory =
+            options.output_directory.clone().unwrap_or_else(|| self.output_directory.clone());
         self.dependencies.require_for_download()?;
         let mut command = self.download_command(url, playlist_index, options)?;
         debug!(host = url_host(url), "starting yt-dlp download");
@@ -298,6 +323,22 @@ impl DownloadEngine {
             warn!(code = ?status.code(), "yt-dlp download failed");
             return Err(yt_dlp_error(stderr.trim()));
         }
+        if subtitle_only {
+            let path = output_path.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "yt-dlp exited successfully but wrote no matching subtitle sidecar. Check the selected language and caption type."
+                )
+            })?;
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() { path } else { subtitle_output_directory.join(path) };
+            if !path.is_file() {
+                bail!(
+                    "yt-dlp reported a subtitle path that does not exist: {}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("subtitle")
+                );
+            }
+            output_path = Some(path.to_string_lossy().into_owned());
+        }
         Ok(EngineOutcome::Completed(DownloadResult { output_path }))
     }
 
@@ -311,7 +352,7 @@ impl DownloadEngine {
         if self.dependencies.deno.is_file() {
             command.arg("--js-runtimes").arg(format!("deno:{}", self.dependencies.deno.display()));
         }
-        if self.dependencies.ffmpeg.is_file() && self.dependencies.ffprobe.is_file() {
+        if self.dependencies.ffmpeg.is_file() {
             command.arg("--ffmpeg-location").arg(&self.dependencies.directory);
         }
         #[cfg(windows)]
@@ -341,19 +382,20 @@ impl DownloadEngine {
             .arg(format!(
                 "download:{PROGRESS_PREFIX}%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
             ))
-            .arg("--print")
-            .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"))
             .arg("--paths")
             .arg(format!("home:{}", output_directory.display()))
             .arg("--output")
-            .arg(OUTPUT_TEMPLATE)
-            .arg("--format");
+            .arg(OUTPUT_TEMPLATE);
         match options.mode {
             DownloadMode::Video => {
-                command.arg(options.video_quality.yt_dlp_format());
+                command
+                    .arg("--format")
+                    .arg(options.video_quality.yt_dlp_format())
+                    .arg("--print")
+                    .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
             }
             DownloadMode::AudioOnly => {
-                command.arg("bestaudio");
+                command.arg("--format").arg("bestaudio");
                 if let Some(format) = options.audio_format.yt_dlp_name() {
                     let missing = match (
                         self.dependencies.ffmpeg.is_file(),
@@ -375,6 +417,39 @@ impl DownloadEngine {
                         command.arg("--audio-quality").arg(options.audio_quality.yt_dlp_argument());
                     }
                 }
+                command.arg("--print").arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
+            }
+            DownloadMode::SubtitlesOnly => {
+                if playlist_index.is_some() {
+                    bail!(
+                        "Subtitle-only playlist downloads are not supported yet; add one media URL at a time."
+                    );
+                }
+                if !self.dependencies.ffmpeg.is_file() {
+                    bail!(
+                        "Converting subtitles to SRT or VTT requires the bundled FFmpeg executable, which is unavailable."
+                    );
+                }
+                let languages = normalize_subtitle_languages(&options.subtitle_languages)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Enter one or more subtitle language codes, such as en or en,fr."
+                        )
+                    })?;
+                command.arg("--skip-download").arg("--write-subs");
+                if options.include_auto_subtitles {
+                    command.arg("--write-auto-subs");
+                }
+                let format = options.subtitle_format.as_database_value();
+                command
+                    .arg("--sub-langs")
+                    .arg(languages)
+                    .arg("--sub-format")
+                    .arg(format!("{format}/best"))
+                    .arg("--convert-subs")
+                    .arg(format)
+                    .arg("--print")
+                    .arg(format!("after_move:{SUBTITLE_OUTPUT_PREFIX}%(requested_subtitles)j"));
             }
         }
         add_playlist_item_argument(&mut command, playlist_index)?;
@@ -418,9 +493,25 @@ where
         }
     } else if let Some(path) = line.strip_prefix(OUTPUT_PREFIX) {
         *output_path = Some(path.to_owned());
+    } else if let Some(subtitles) = line.strip_prefix(SUBTITLE_OUTPUT_PREFIX) {
+        if let Some(path) = parse_requested_subtitle_path(subtitles) {
+            *output_path = Some(path);
+        }
     } else if !line.trim().is_empty() {
         debug!("yt-dlp emitted status output");
     }
+}
+
+fn parse_requested_subtitle_path(value: &str) -> Option<String> {
+    let requested: serde_json::Value = serde_json::from_str(value).ok()?;
+    requested.as_object()?.values().find_map(|subtitle| {
+        subtitle
+            .get("filepath")
+            .or_else(|| subtitle.get("filename"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(str::to_owned)
+    })
 }
 
 async fn read_all<R>(mut reader: R) -> std::io::Result<Vec<u8>>
@@ -760,6 +851,100 @@ mod tests {
         );
         assert_eq!(arguments.last().map(String::as_str), Some("https://example.test/watch/123"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subtitle_command_selects_language_type_and_converts_to_requested_sidecar_format() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        std::fs::write(root.join("ffmpeg.exe"), b"test ffmpeg placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        let arguments = engine
+            .download_command(
+                "https://example.test/watch/123",
+                None,
+                DownloadOptions::new(
+                    DownloadMode::SubtitlesOnly,
+                    AudioFormat::Original,
+                    AudioQuality::Best,
+                )
+                .with_subtitle_options(
+                    "en,fr".to_owned(),
+                    SubtitleFormat::Srt,
+                    true,
+                ),
+            )
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for flag in ["--skip-download", "--write-subs", "--write-auto-subs"] {
+            assert!(arguments.iter().any(|argument| argument == flag));
+        }
+        assert!(!arguments.iter().any(|argument| argument == "--format"));
+        let language_flag =
+            arguments.iter().position(|argument| argument == "--sub-langs").unwrap();
+        assert_eq!(arguments.get(language_flag + 1).map(String::as_str), Some("en,fr"));
+        let format_flag =
+            arguments.iter().position(|argument| argument == "--convert-subs").unwrap();
+        assert_eq!(arguments.get(format_flag + 1).map(String::as_str), Some("srt"));
+        assert!(arguments.iter().any(|argument| argument.contains("requested_subtitles")));
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/playlist",
+                    Some(2),
+                    DownloadOptions::new(
+                        DownloadMode::SubtitlesOnly,
+                        AudioFormat::Original,
+                        AudioQuality::Best
+                    ),
+                )
+                .is_err()
+        );
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/watch/123",
+                    None,
+                    DownloadOptions::new(
+                        DownloadMode::SubtitlesOnly,
+                        AudioFormat::Original,
+                        AudioQuality::Best
+                    )
+                    .with_subtitle_options(
+                        "en;--exec".to_owned(),
+                        SubtitleFormat::Vtt,
+                        false
+                    ),
+                )
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn requested_subtitle_output_marker_extracts_a_sidecar_path() {
+        let value = r#"{"en":{"ext":"srt","filepath":"C:/Media/clip.en.srt"}}"#;
+        let mut output_path = None;
+        process_download_line(
+            &format!("{SUBTITLE_OUTPUT_PREFIX}{value}"),
+            &mut output_path,
+            &mut |_| {},
+        );
+        assert_eq!(output_path.as_deref(), Some("C:/Media/clip.en.srt"));
+        assert_eq!(parse_requested_subtitle_path("not json"), None);
     }
 
     #[test]

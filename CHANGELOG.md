@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add single-media subtitle-only downloads with language selection, optional automatic captions, and SRT/VTT sidecars; queued choices survive retries, restart recovery, and history export.
+- Show manual and automatic caption languages from Analyze, validate requested languages before queueing, reject playlist subtitle requests clearly, and fail completion if yt-dlp reports no output sidecar.
+- Extend the Library filters and relinking picker to include SRT/VTT files; add deterministic queue-worker, parser, command, migration, and library coverage. Live subtitle download and Windows UI acceptance remain pending.
 - Add main-queue Pause all, Resume paused, confirmed Cancel all, and Retry failed actions, with real SQLite/process transitions and partial-file preservation.
 - Cover bulk cancel, failed/interrupted retry selection, and queue-toolbar action availability with app tests.
 - Add a deterministic queue-worker acceptance fixture that inspects metadata, streams progress, creates media, and verifies the completed SQLite record and output file.

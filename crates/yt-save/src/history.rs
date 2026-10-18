@@ -1,12 +1,15 @@
 use crate::model::DownloadRecord;
 
-const HISTORY_COLUMNS: [&str; 24] = [
+const HISTORY_COLUMNS: [&str; 27] = [
     "id",
     "url",
     "queue_order",
     "priority",
     "playlist_index",
     "download_mode",
+    "subtitle_languages",
+    "subtitle_format",
+    "include_auto_subtitles",
     "audio_format",
     "audio_quality",
     "video_quality",
@@ -38,6 +41,9 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.priority.to_string(),
             optional_display(record.playlist_index),
             record.download_mode.as_database_value().to_owned(),
+            record.subtitle_languages.clone(),
+            record.subtitle_format.as_database_value().to_owned(),
+            record.include_auto_subtitles.to_string(),
             record.audio_format.as_database_value().to_owned(),
             record.audio_quality.as_database_value().to_owned(),
             record.video_quality.as_database_value().to_owned(),

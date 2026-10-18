@@ -4441,6 +4441,74 @@ mod tests {
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
+    #[tokio::test]
+    #[ignore = "requires packaged Windows media tools and live YouTube access"]
+    async fn packaged_yt_dlp_deno_ffmpeg_complete_a_youtube_queue_job() {
+        let package_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("package")
+            .join("bin")
+            .canonicalize()
+            .expect("build package dependencies before running this acceptance test");
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-live-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let output_directory = temp_dir.join("downloads");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let mut queued = DownloadRecord::queued(
+            "youtube-live-job".to_owned(),
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw".to_owned(),
+            now(),
+        );
+        queued.download_directory = output_directory.to_string_lossy().into_owned();
+        queued.video_quality = crate::model::VideoQuality::Lowest;
+        store.save_download(queued).await.unwrap();
+        let active = store
+            .claim_queued_download_if_next("youtube-live-job", now())
+            .await
+            .unwrap()
+            .expect("YouTube queue job should be claimed");
+
+        let (signal_sender, signal_receiver) = watch::channel(JobSignal::Continue);
+        let signal_sender = Arc::new(signal_sender);
+        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            active.id.clone(),
+            signal_sender.clone(),
+        )])));
+        let registration = ActiveJobRegistration {
+            id: active.id.clone(),
+            jobs: active_jobs,
+            sender: signal_sender,
+        };
+        let dependencies = DependencyPaths {
+            directory: package_bin.clone(),
+            yt_dlp: package_bin.join("yt-dlp.exe"),
+            deno: package_bin.join("deno.exe"),
+            ffmpeg: package_bin.join("ffmpeg.exe"),
+            ffprobe: package_bin.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, output_directory);
+        let (events, _receiver) = mpsc::unbounded_channel();
+        run_download_job(active, store.clone(), engine, events, signal_receiver, registration)
+            .await;
+
+        let completed = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "youtube-live-job")
+            .unwrap();
+        assert_eq!(completed.status, "Completed", "{:?}", completed.error);
+        assert!(completed.title.contains("zoo"), "unexpected title: {}", completed.title);
+        let output_path = PathBuf::from(completed.output_path.as_deref().unwrap());
+        assert!(output_path.is_file(), "missing downloaded file: {}", output_path.display());
+        assert!(std::fs::metadata(&output_path).unwrap().len() > 0);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
     #[test]
     fn retry_wait_has_a_visible_deadline_and_counts_as_pending_work() {
         let mut record = DownloadRecord::queued(

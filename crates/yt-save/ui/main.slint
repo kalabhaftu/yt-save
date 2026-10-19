@@ -42,6 +42,7 @@ struct PlaylistSubscriptionRowData {
     source: string,
     url: string,
     summary: string,
+    check-frequency: string,
     selected: bool,
 }
 
@@ -125,6 +126,7 @@ export component MainWindow inherits Window {
     in-out property <string> selected-subscription-details: "Choose a saved playlist to review its archive.";
     in-out property <string> subscription-selection-summary: "";
     in-out property <bool> subscription-checking: false;
+    in-out property <string> subscription-check-frequency: "Manual";
     in-out property <int> playlist-subscription-selected-count: 0;
     in-out property <string> library-search: "";
     in-out property <string> library-filter: "All files";
@@ -160,6 +162,7 @@ export component MainWindow inherits Window {
     callback subscriptions-view-requested(bool);
     callback playlist-subscription-selected-requested(string);
     callback playlist-subscription-check-requested(string);
+    callback playlist-subscription-frequency-requested(string, string);
     callback playlist-subscription-delete-requested(string);
     callback playlist-subscription-entry-toggle-requested(string);
     callback playlist-subscription-queue-selected-requested();
@@ -620,10 +623,21 @@ export component MainWindow inherits Window {
                             spacing: 4px;
                             Text { text: "Playlist subscriptions"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
                             Text {
-                                text: "Check saved playlists manually. New entries wait here for your review; local files are never removed.";
+                                text: "Check saved playlists manually or on a schedule while Yt Save is running. New entries wait here for your review; local files are never removed.";
                                 color: #8c94aa;
                                 font-size: 12px;
                                 overflow: elide;
+                            }
+                        }
+                        Text { text: "Auto-check"; color: #8c94aa; font-size: 11px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["Manual", "Every hour", "Every 6 hours", "Every 12 hours", "Daily", "Weekly"];
+                            current-value <=> root.subscription-check-frequency;
+                            enabled: root.selected-subscription-id != "";
+                            width: 142px;
+                            height: 34px;
+                            selected(value) => {
+                                root.playlist-subscription-frequency-requested(root.selected-subscription-id, value);
                             }
                         }
                         ActionButton {
@@ -670,7 +684,7 @@ export component MainWindow inherits Window {
                                         padding: 10px;
                                         spacing: 4px;
                                         Text { text: subscription.title; color: #e4e6ef; font-size: 12px; font-weight: 600; overflow: elide; }
-                                        Text { text: subscription.source + " · " + subscription.summary; color: #8c95ad; font-size: 10px; overflow: elide; }
+                                        Text { text: subscription.source + " · " + subscription.check-frequency + " · " + subscription.summary; color: #8c95ad; font-size: 10px; overflow: elide; }
                                         Text { text: subscription.url; color: #717a92; font-size: 9px; overflow: elide; }
                                     }
                                     TouchArea { clicked => { root.playlist-subscription-selected-requested(subscription.id); } }

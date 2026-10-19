@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Add a user-triggered stable yt-dlp updater with bounded HTTPS downloads, GitHub SHA-256 digest verification, staged `--version` checks, per-user versioned binaries, rollback markers, startup recovery, and a Windows single-instance guard for shared engine state. Detached OpenPGP signature verification and live Windows update acceptance remain pending.
-- Add manual playlist subscriptions for yt-dlp-supported sources, with archived entry snapshots, stable-ID/URL deduplication, explicit review, selected-entry queueing, and dismissal; no recurring checks are scheduled.
+- Add playlist subscriptions for yt-dlp-supported sources with Manual, hourly, 6-hour, 12-hour, daily, and weekly check frequencies. The in-app scheduler polls every 30 seconds and checks at most eight due subscriptions per pass while the app is running; new entries remain in the review archive and are not queued automatically.
+- Persist subscription check intervals and next-check times, schedule the next attempt after both successful and failed checks, and migrate existing subscriptions to Manual.
+- Cover interval validation and mapping, legacy migration, due-time ordering and batch bounds, successful/failed rescheduling, and interval-change behavior. Windows UI and recurring scheduler runtime acceptance remain pending.
 - Keep subscription archive updates and download queue insertion transactional, preserve downloaded files and history when removing a subscription, and record unavailable playlist entries without queueing them.
 - Add coverage for playlist snapshot updates, queue/dismiss state, migration/reopen, deletion safety, and blank extractor-ID fallback. Windows UI and cross-site runtime acceptance remain pending.
 - Add one-time local date/time scheduling for single downloads and selected playlist entries; scheduled queue rows persist across restart and remain outside worker slots until due.

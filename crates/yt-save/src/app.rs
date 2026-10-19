@@ -36,8 +36,11 @@ use crate::{
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
-        PlaylistSubscription, PlaylistSubscriptionEntry, PlaylistSubscriptionEntryInput,
-        PlaylistSubscriptionQueueItem, QueueMove, Store, TrayPreferences,
+        PLAYLIST_CHECK_INTERVAL_1_HOUR, PLAYLIST_CHECK_INTERVAL_6_HOURS,
+        PLAYLIST_CHECK_INTERVAL_7_DAYS, PLAYLIST_CHECK_INTERVAL_12_HOURS,
+        PLAYLIST_CHECK_INTERVAL_24_HOURS, PLAYLIST_CHECK_INTERVAL_MANUAL, PlaylistSubscription,
+        PlaylistSubscriptionEntry, PlaylistSubscriptionEntryInput, PlaylistSubscriptionQueueItem,
+        QueueMove, Store, TrayPreferences,
     },
 };
 
@@ -276,6 +279,9 @@ fn playlist_subscription_rows(
                 source: SharedString::from(subscription.source.as_str()),
                 url: SharedString::from(subscription.url.as_str()),
                 summary: SharedString::from(summary),
+                check_frequency: SharedString::from(subscription_check_frequency_label(
+                    subscription.check_interval_seconds,
+                )),
                 selected: subscription.id == selected_id,
             }
         })
@@ -320,16 +326,49 @@ fn subscription_last_checked(subscription: Option<&PlaylistSubscription>) -> Str
     let Some(subscription) = subscription else {
         return "Choose a saved playlist to review its archive.".to_owned();
     };
-    if let Some(error) = &subscription.last_check_error {
-        return format!("Last check failed: {error}");
-    }
-    let Some(timestamp) = subscription.last_checked_at else {
-        return "Not checked yet.".to_owned();
+    let last_check = if let Some(error) = &subscription.last_check_error {
+        format!("Last check failed: {error}")
+    } else if let Some(timestamp) = subscription.last_checked_at {
+        let checked = local_timestamp_label(timestamp);
+        format!("Last checked {checked} · {} new", subscription.pending_count)
+    } else {
+        "Not checked yet.".to_owned()
     };
-    let checked = chrono::DateTime::from_timestamp(timestamp, 0)
+    let frequency = subscription_check_frequency_label(subscription.check_interval_seconds);
+    let next_check = subscription
+        .next_check_at
+        .map(|timestamp| format!("Next check {}", local_timestamp_label(timestamp)))
+        .unwrap_or_else(|| "No scheduled check".to_owned());
+    format!("{last_check} · {frequency} · {next_check}")
+}
+
+fn local_timestamp_label(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
         .map(|value| value.with_timezone(&chrono::Local).format("%b %d, %Y %H:%M").to_string())
-        .unwrap_or_else(|| "unknown time".to_owned());
-    format!("Last checked {checked} local time · {} new", subscription.pending_count)
+        .unwrap_or_else(|| "unknown time".to_owned())
+}
+
+fn subscription_check_frequency_label(interval_seconds: i64) -> &'static str {
+    match interval_seconds {
+        PLAYLIST_CHECK_INTERVAL_1_HOUR => "Every hour",
+        PLAYLIST_CHECK_INTERVAL_6_HOURS => "Every 6 hours",
+        PLAYLIST_CHECK_INTERVAL_12_HOURS => "Every 12 hours",
+        PLAYLIST_CHECK_INTERVAL_24_HOURS => "Daily",
+        PLAYLIST_CHECK_INTERVAL_7_DAYS => "Weekly",
+        _ => "Manual",
+    }
+}
+
+fn subscription_check_frequency_seconds(label: &str) -> Option<i64> {
+    match label {
+        "Manual" => Some(PLAYLIST_CHECK_INTERVAL_MANUAL),
+        "Every hour" => Some(PLAYLIST_CHECK_INTERVAL_1_HOUR),
+        "Every 6 hours" => Some(PLAYLIST_CHECK_INTERVAL_6_HOURS),
+        "Every 12 hours" => Some(PLAYLIST_CHECK_INTERVAL_12_HOURS),
+        "Daily" => Some(PLAYLIST_CHECK_INTERVAL_24_HOURS),
+        "Weekly" => Some(PLAYLIST_CHECK_INTERVAL_7_DAYS),
+        _ => None,
+    }
 }
 
 async fn refresh_playlist_subscription_view(
@@ -401,6 +440,14 @@ async fn refresh_playlist_subscription_view(
             window.set_playlist_subscriptions(ModelRc::new(VecModel::from(subscription_rows)));
             window.set_playlist_subscription_entries(ModelRc::new(VecModel::from(entry_rows)));
             window.set_selected_subscription_id(selected_id.into());
+            window.set_subscription_check_frequency(
+                selected_subscription
+                    .as_ref()
+                    .map_or("Manual", |subscription| {
+                        subscription_check_frequency_label(subscription.check_interval_seconds)
+                    })
+                    .into(),
+            );
             window.set_selected_subscription_title(title.into());
             window.set_selected_subscription_details(details.into());
             window.set_subscription_selection_summary(summary.into());
@@ -440,6 +487,89 @@ async fn perform_playlist_subscription_check(
             entries,
         )
         .await
+}
+
+async fn run_playlist_subscription_scheduler(
+    store: Store,
+    engine: DownloadEngine,
+    review_state: Arc<Mutex<PlaylistSubscriptionReviewState>>,
+    check_active: Arc<AtomicBool>,
+    weak_window: slint::Weak<MainWindow>,
+    events: mpsc::UnboundedSender<UiEvent>,
+    shutdown_started: Arc<AtomicBool>,
+) {
+    let mut timer = tokio::time::interval(Duration::from_secs(30));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        if shutdown_started.load(Ordering::Acquire) {
+            break;
+        }
+        let due_subscriptions = match store.list_due_playlist_subscriptions(now(), 8).await {
+            Ok(subscriptions) => subscriptions,
+            Err(error) => {
+                error!(%error, "load scheduled playlist checks");
+                continue;
+            }
+        };
+        if due_subscriptions.is_empty() {
+            continue;
+        }
+        let Some(check_guard) =
+            PlaylistSubscriptionCheckGuard::start(&check_active, weak_window.clone())
+        else {
+            continue;
+        };
+
+        let mut checked = 0usize;
+        let mut failed = 0usize;
+        let mut new_entries = 0usize;
+        for subscription in due_subscriptions {
+            if shutdown_started.load(Ordering::Acquire) {
+                break;
+            }
+            match perform_playlist_subscription_check(&store, &engine, &subscription.id).await {
+                Ok(count) => {
+                    checked += 1;
+                    new_entries = new_entries.saturating_add(count);
+                }
+                Err(error) => {
+                    failed += 1;
+                    if let Err(save_error) = store
+                        .record_playlist_subscription_error(
+                            subscription.id.clone(),
+                            error.to_string(),
+                            now(),
+                        )
+                        .await
+                    {
+                        error!(%save_error, subscription_id = %subscription.id, "save scheduled playlist check failure");
+                    }
+                    error!(%error, subscription_id = %subscription.id, "scheduled playlist check failed");
+                }
+            }
+        }
+        drop(check_guard);
+
+        if checked > 0 || failed > 0 {
+            let message = format!(
+                "Scheduled playlist checks: {checked} completed, {failed} failed, {new_entries} new {}. New entries wait for your review.",
+                plural_word(new_entries, "entry", "entries")
+            );
+            let _ = events.send(UiEvent::Status(message));
+            let selected_id = review_state.lock().ok().map(|review| review.subscription_id.clone());
+            if let Err(error) = refresh_playlist_subscription_view(
+                &store,
+                &review_state,
+                weak_window.clone(),
+                selected_id,
+            )
+            .await
+            {
+                error!(%error, "refresh scheduled playlist checks");
+            }
+        }
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -1458,6 +1588,57 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let frequency_subscription_store = store.clone();
+    let frequency_subscription_review = playlist_subscription_review.clone();
+    let frequency_subscription_window = window.as_weak();
+    let frequency_subscription_events = events_tx.clone();
+    let frequency_subscription_handle = handle.clone();
+    window.on_playlist_subscription_frequency_requested(move |id, label| {
+        let id = id.to_string();
+        if id.is_empty() {
+            return;
+        }
+        let label = label.to_string();
+        let Some(interval_seconds) = subscription_check_frequency_seconds(&label) else {
+            let _ = frequency_subscription_events
+                .send(UiEvent::Status("Choose a supported playlist check frequency.".to_owned()));
+            return;
+        };
+        let store = frequency_subscription_store.clone();
+        let review = frequency_subscription_review.clone();
+        let weak_window = frequency_subscription_window.clone();
+        let events = frequency_subscription_events.clone();
+        frequency_subscription_handle.spawn(async move {
+            match store
+                .set_playlist_subscription_check_interval(id.clone(), interval_seconds, now())
+                .await
+            {
+                Ok(()) => {
+                    let message = if interval_seconds == 0 {
+                        "Automatic checks are off for this playlist.".to_owned()
+                    } else {
+                        format!(
+                            "This playlist will be checked {} while Yt Save is running.",
+                            label.to_lowercase()
+                        )
+                    };
+                    let _ = events.send(UiEvent::Status(message));
+                }
+                Err(error) => {
+                    error!(%error, subscription_id = %id, "update playlist check frequency");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not update the playlist check frequency: {error}"
+                    )));
+                }
+            }
+            if let Err(error) =
+                refresh_playlist_subscription_view(&store, &review, weak_window, Some(id)).await
+            {
+                error!(%error, "refresh playlist after changing its check frequency");
+            }
+        });
+    });
+
     let delete_subscription_store = store.clone();
     let delete_subscription_review = playlist_subscription_review.clone();
     let delete_subscription_window = window.as_weak();
@@ -1739,6 +1920,23 @@ pub fn run() -> Result<()> {
             }
         });
     });
+
+    let scheduled_subscription_store = store.clone();
+    let scheduled_subscription_engine = engine.clone();
+    let scheduled_subscription_review = playlist_subscription_review.clone();
+    let scheduled_subscription_active = playlist_subscription_check_active.clone();
+    let scheduled_subscription_window = window.as_weak();
+    let scheduled_subscription_events = events_tx.clone();
+    let scheduled_subscription_shutdown = shutdown_started.clone();
+    handle.spawn(run_playlist_subscription_scheduler(
+        scheduled_subscription_store,
+        scheduled_subscription_engine,
+        scheduled_subscription_review,
+        scheduled_subscription_active,
+        scheduled_subscription_window,
+        scheduled_subscription_events,
+        scheduled_subscription_shutdown,
+    ));
 
     window.on_enqueue_requested(move |submitted_url| {
         if enqueue_shutdown_started.load(Ordering::Acquire) {
@@ -5304,6 +5502,24 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_subscription_frequency_labels_match_persisted_intervals() {
+        let choices = [
+            ("Manual", PLAYLIST_CHECK_INTERVAL_MANUAL),
+            ("Every hour", PLAYLIST_CHECK_INTERVAL_1_HOUR),
+            ("Every 6 hours", PLAYLIST_CHECK_INTERVAL_6_HOURS),
+            ("Every 12 hours", PLAYLIST_CHECK_INTERVAL_12_HOURS),
+            ("Daily", PLAYLIST_CHECK_INTERVAL_24_HOURS),
+            ("Weekly", PLAYLIST_CHECK_INTERVAL_7_DAYS),
+        ];
+
+        for (label, seconds) in choices {
+            assert_eq!(subscription_check_frequency_seconds(label), Some(seconds));
+            assert_eq!(subscription_check_frequency_label(seconds), label);
+        }
+        assert_eq!(subscription_check_frequency_seconds("Unknown"), None);
+    }
 
     #[test]
     fn subscription_entry_identity_falls_back_when_extractor_id_is_blank() {

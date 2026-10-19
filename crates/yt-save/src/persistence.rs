@@ -17,6 +17,41 @@ pub const MAX_CONCURRENT_FRAGMENTS: usize = 8;
 pub const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
 pub const MAX_AUTO_RETRY_ATTEMPTS: usize = 5;
 
+pub const PLAYLIST_CHECK_INTERVAL_MANUAL: i64 = 0;
+pub const PLAYLIST_CHECK_INTERVAL_1_HOUR: i64 = 60 * 60;
+pub const PLAYLIST_CHECK_INTERVAL_6_HOURS: i64 = 6 * 60 * 60;
+pub const PLAYLIST_CHECK_INTERVAL_12_HOURS: i64 = 12 * 60 * 60;
+pub const PLAYLIST_CHECK_INTERVAL_24_HOURS: i64 = 24 * 60 * 60;
+pub const PLAYLIST_CHECK_INTERVAL_7_DAYS: i64 = 7 * 24 * 60 * 60;
+pub const PLAYLIST_CHECK_INTERVALS_SECONDS: &[i64] = &[
+    PLAYLIST_CHECK_INTERVAL_MANUAL,
+    PLAYLIST_CHECK_INTERVAL_1_HOUR,
+    PLAYLIST_CHECK_INTERVAL_6_HOURS,
+    PLAYLIST_CHECK_INTERVAL_12_HOURS,
+    PLAYLIST_CHECK_INTERVAL_24_HOURS,
+    PLAYLIST_CHECK_INTERVAL_7_DAYS,
+];
+pub const MAX_DUE_PLAYLIST_SUBSCRIPTIONS_PER_BATCH: usize = 64;
+
+pub fn is_supported_playlist_check_interval_seconds(interval_seconds: i64) -> bool {
+    PLAYLIST_CHECK_INTERVALS_SECONDS.contains(&interval_seconds)
+}
+
+fn playlist_next_check_at(interval_seconds: i64, checked_at: i64) -> Result<Option<i64>> {
+    anyhow::ensure!(
+        is_supported_playlist_check_interval_seconds(interval_seconds),
+        "unsupported playlist check interval: {interval_seconds} seconds"
+    );
+    if interval_seconds == PLAYLIST_CHECK_INTERVAL_MANUAL {
+        Ok(None)
+    } else {
+        checked_at
+            .checked_add(interval_seconds)
+            .map(Some)
+            .context("playlist next-check timestamp overflow")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrayPreferences {
     pub close_to_tray: bool,
@@ -28,7 +63,7 @@ pub struct Store {
     path: PathBuf,
 }
 
-/// Saved playlist watched by the manual subscription checker.
+/// Saved playlist and its persisted check schedule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaylistSubscription {
     pub id: String,
@@ -36,6 +71,10 @@ pub struct PlaylistSubscription {
     pub title: String,
     pub source: String,
     pub created_at: i64,
+    /// Seconds between checks, or zero when only manual checks are enabled.
+    pub check_interval_seconds: i64,
+    /// Next scheduled check, absent when manual checks are enabled.
+    pub next_check_at: Option<i64>,
     /// Timestamp of the most recent successful or failed check attempt.
     pub last_checked_at: Option<i64>,
     pub last_check_error: Option<String>,
@@ -146,6 +185,8 @@ impl Store {
                     title TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
+                    check_interval_seconds INTEGER NOT NULL DEFAULT 0,
+                    next_check_at INTEGER,
                     last_checked_at INTEGER,
                     last_check_error TEXT
                  );
@@ -172,6 +213,28 @@ impl Store {
                     ON playlist_subscription_entries(subscription_id, playlist_index, media_key);
                  CREATE INDEX IF NOT EXISTS idx_playlist_subscription_entries_pending
                     ON playlist_subscription_entries(subscription_id, state, available);",
+            )?;
+            let subscription_columns = {
+                let mut statement =
+                    connection.prepare("PRAGMA table_info(playlist_subscriptions)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if !subscription_columns.iter().any(|name| name == "check_interval_seconds") {
+                connection.execute_batch(
+                    "ALTER TABLE playlist_subscriptions
+                     ADD COLUMN check_interval_seconds INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !subscription_columns.iter().any(|name| name == "next_check_at") {
+                connection.execute_batch(
+                    "ALTER TABLE playlist_subscriptions ADD COLUMN next_check_at INTEGER;",
+                )?;
+            }
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_playlist_subscriptions_due
+                    ON playlist_subscriptions(next_check_at, id)
+                    WHERE next_check_at IS NOT NULL;",
             )?;
             let has_subscription_completed_at = {
                 let mut statement =
@@ -258,7 +321,8 @@ impl Store {
         Ok(store)
     }
 
-    /// Adds a playlist to the manual check list. Both the id and URL must be unique.
+    /// Adds a playlist to the check list with manual checks enabled by default.
+    /// Both the id and URL must be unique.
     pub async fn create_playlist_subscription(
         &self,
         id: String,
@@ -274,8 +338,8 @@ impl Store {
             store.with_connection(|connection| {
                 connection.execute(
                     "INSERT INTO playlist_subscriptions
-                        (id, url, title, source, created_at)
-                     VALUES (:id, :url, :title, :source, :created_at)",
+                        (id, url, title, source, created_at, check_interval_seconds, next_check_at)
+                     VALUES (:id, :url, :title, :source, :created_at, 0, NULL)",
                     named_params! {
                         ":id": id,
                         ":url": url,
@@ -299,6 +363,7 @@ impl Store {
             store.with_connection(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT s.id, s.url, s.title, s.source, s.created_at,
+                            s.check_interval_seconds, s.next_check_at,
                             s.last_checked_at, s.last_check_error,
                             (SELECT count(*) FROM playlist_subscription_entries e
                              WHERE e.subscription_id = s.id AND e.state = 'new')
@@ -312,9 +377,11 @@ impl Store {
                         title: row.get(2)?,
                         source: row.get(3)?,
                         created_at: row.get(4)?,
-                        last_checked_at: row.get(5)?,
-                        last_check_error: row.get(6)?,
-                        pending_count: row.get::<_, i64>(7)? as usize,
+                        check_interval_seconds: row.get(5)?,
+                        next_check_at: row.get(6)?,
+                        last_checked_at: row.get(7)?,
+                        last_check_error: row.get(8)?,
+                        pending_count: row.get::<_, i64>(9)? as usize,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -322,6 +389,90 @@ impl Store {
         })
         .await
         .context("join playlist subscriptions read")?
+    }
+
+    /// Changes a playlist's interval and schedules its next check from `changed_at`.
+    /// Interval zero disables scheduled checks and clears the next-check timestamp.
+    pub async fn set_playlist_subscription_check_interval(
+        &self,
+        id: String,
+        interval_seconds: i64,
+        changed_at: i64,
+    ) -> Result<()> {
+        let next_check_at = playlist_next_check_at(interval_seconds, changed_at)?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let updated = connection.execute(
+                    "UPDATE playlist_subscriptions
+                     SET check_interval_seconds = :interval,
+                         next_check_at = CASE
+                             WHEN check_interval_seconds = :interval THEN next_check_at
+                             ELSE :next_check_at
+                         END
+                     WHERE id = :id",
+                    named_params! {
+                        ":id": id,
+                        ":interval": interval_seconds,
+                        ":next_check_at": next_check_at,
+                    },
+                )?;
+                anyhow::ensure!(updated == 1, "playlist subscription {id} does not exist");
+                Ok(())
+            })
+        })
+        .await
+        .context("join playlist subscription schedule update")??;
+        Ok(())
+    }
+
+    /// Returns at most the requested number of due subscriptions in due-time order.
+    /// The batch is capped so callers cannot accidentally load an unbounded schedule.
+    pub async fn list_due_playlist_subscriptions(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<PlaylistSubscription>> {
+        let limit = limit.min(MAX_DUE_PLAYLIST_SUBSCRIPTIONS_PER_BATCH);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT s.id, s.url, s.title, s.source, s.created_at,
+                            s.check_interval_seconds, s.next_check_at,
+                            s.last_checked_at, s.last_check_error,
+                            (SELECT count(*) FROM playlist_subscription_entries e
+                             WHERE e.subscription_id = s.id AND e.state = 'new')
+                     FROM playlist_subscriptions s
+                     WHERE s.check_interval_seconds > 0 AND s.next_check_at <= :now
+                     ORDER BY s.next_check_at ASC, s.id ASC
+                     LIMIT :limit",
+                )?;
+                let rows = statement.query_map(
+                    named_params! { ":now": now, ":limit": limit as i64 },
+                    |row| {
+                        Ok(PlaylistSubscription {
+                            id: row.get(0)?,
+                            url: row.get(1)?,
+                            title: row.get(2)?,
+                            source: row.get(3)?,
+                            created_at: row.get(4)?,
+                            check_interval_seconds: row.get(5)?,
+                            next_check_at: row.get(6)?,
+                            last_checked_at: row.get(7)?,
+                            last_check_error: row.get(8)?,
+                            pending_count: row.get::<_, i64>(9)? as usize,
+                        })
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            })
+        })
+        .await
+        .context("join due playlist subscriptions read")?
     }
 
     /// Deletes a subscription and its archive only; linked download rows and files are retained.
@@ -363,16 +514,27 @@ impl Store {
             store.with_connection_mut(|connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let interval_seconds = transaction
+                    .query_row(
+                        "SELECT check_interval_seconds FROM playlist_subscriptions WHERE id = :id",
+                        named_params! { ":id": id },
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .with_context(|| format!("playlist subscription {id} does not exist"))?;
+                let next_check_at = playlist_next_check_at(interval_seconds, checked_at)?;
                 let updated = transaction.execute(
                     "UPDATE playlist_subscriptions
                      SET title = :title, source = :source,
-                         last_checked_at = :checked_at, last_check_error = NULL
+                         last_checked_at = :checked_at, last_check_error = NULL,
+                         next_check_at = :next_check_at
                      WHERE id = :id",
                     named_params! {
                         ":id": id,
                         ":title": title,
                         ":source": source,
                         ":checked_at": checked_at,
+                        ":next_check_at": next_check_at,
                     },
                 )?;
                 anyhow::ensure!(updated == 1, "playlist subscription {id} does not exist");
@@ -444,18 +606,32 @@ impl Store {
     ) -> Result<()> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
-                let updated = connection.execute(
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let interval_seconds = transaction
+                    .query_row(
+                        "SELECT check_interval_seconds FROM playlist_subscriptions WHERE id = :id",
+                        named_params! { ":id": id },
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .with_context(|| format!("playlist subscription {id} does not exist"))?;
+                let next_check_at = playlist_next_check_at(interval_seconds, checked_at)?;
+                let updated = transaction.execute(
                     "UPDATE playlist_subscriptions
-                     SET last_checked_at = :checked_at, last_check_error = :error
+                     SET last_checked_at = :checked_at, last_check_error = :error,
+                         next_check_at = :next_check_at
                      WHERE id = :id",
                     named_params! {
                         ":id": id,
                         ":error": error,
                         ":checked_at": checked_at,
+                        ":next_check_at": next_check_at,
                     },
                 )?;
                 anyhow::ensure!(updated == 1, "playlist subscription {id} does not exist");
+                transaction.commit()?;
                 Ok(())
             })
         })
@@ -3788,6 +3964,187 @@ mod tests {
         (temp_dir, store)
     }
 
+    async fn add_playlist_subscription(store: &Store, id: &str, created_at: i64) {
+        store
+            .create_playlist_subscription(
+                id.to_owned(),
+                format!("https://example.test/{id}"),
+                format!("Playlist {id}"),
+                "Example".to_owned(),
+                created_at,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn playlist_check_intervals_are_limited_to_supported_choices() {
+        assert_eq!(
+            PLAYLIST_CHECK_INTERVALS_SECONDS,
+            &[0, 60 * 60, 6 * 60 * 60, 12 * 60 * 60, 24 * 60 * 60, 7 * 24 * 60 * 60,]
+        );
+        assert!(
+            PLAYLIST_CHECK_INTERVALS_SECONDS
+                .iter()
+                .all(|interval| is_supported_playlist_check_interval_seconds(*interval))
+        );
+        assert!(!is_supported_playlist_check_interval_seconds(-1));
+        assert!(!is_supported_playlist_check_interval_seconds(60));
+    }
+
+    #[tokio::test]
+    async fn subscription_interval_changes_schedule_or_clear_the_next_check() {
+        let (temp_dir, store) = new_subscription_store().await;
+        let created = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(created.check_interval_seconds, PLAYLIST_CHECK_INTERVAL_MANUAL);
+        assert_eq!(created.next_check_at, None);
+
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-1".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_1_HOUR,
+                100,
+            )
+            .await
+            .unwrap();
+        let scheduled = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(scheduled.check_interval_seconds, PLAYLIST_CHECK_INTERVAL_1_HOUR);
+        assert_eq!(scheduled.next_check_at, Some(100 + PLAYLIST_CHECK_INTERVAL_1_HOUR));
+
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-1".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_1_HOUR,
+                500,
+            )
+            .await
+            .unwrap();
+        let unchanged = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(unchanged.next_check_at, scheduled.next_check_at);
+
+        assert!(
+            store
+                .set_playlist_subscription_check_interval("sub-1".to_owned(), 60, 200)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .set_playlist_subscription_check_interval(
+                    "missing".to_owned(),
+                    PLAYLIST_CHECK_INTERVAL_1_HOUR,
+                    200,
+                )
+                .await
+                .is_err()
+        );
+
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-1".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_MANUAL,
+                300,
+            )
+            .await
+            .unwrap();
+        let manual = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(manual.check_interval_seconds, PLAYLIST_CHECK_INTERVAL_MANUAL);
+        assert_eq!(manual.next_check_at, None);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn due_subscription_list_is_ordered_bounded_and_survives_reopen() {
+        let (temp_dir, store) = new_subscription_store().await;
+        let now = 1_000_000;
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-1".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_1_HOUR,
+                now - PLAYLIST_CHECK_INTERVAL_1_HOUR - 200,
+            )
+            .await
+            .unwrap();
+        add_playlist_subscription(&store, "sub-2", 20).await;
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-2".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_6_HOURS,
+                now - PLAYLIST_CHECK_INTERVAL_6_HOURS - 1_000,
+            )
+            .await
+            .unwrap();
+        add_playlist_subscription(&store, "sub-3", 30).await;
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-3".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_24_HOURS,
+                now - PLAYLIST_CHECK_INTERVAL_24_HOURS + 5,
+            )
+            .await
+            .unwrap();
+        add_playlist_subscription(&store, "manual", 40).await;
+
+        let limited = store.list_due_playlist_subscriptions(now, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "sub-2");
+        assert_eq!(limited[0].next_check_at, Some(now - 1_000));
+        assert!(store.list_due_playlist_subscriptions(now, 0).await.unwrap().is_empty());
+
+        drop(store);
+        let reopened = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let due = reopened.list_due_playlist_subscriptions(now, usize::MAX).await.unwrap();
+        assert_eq!(
+            due.iter().map(|subscription| subscription.id.as_str()).collect::<Vec<_>>(),
+            ["sub-2", "sub-1"]
+        );
+        assert_eq!(due[1].next_check_at, Some(now - 200));
+        assert!(due.iter().all(|subscription| subscription.check_interval_seconds > 0));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_and_failed_subscription_checks_reschedule_from_check_time() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .set_playlist_subscription_check_interval(
+                "sub-1".to_owned(),
+                PLAYLIST_CHECK_INTERVAL_6_HOURS,
+                100,
+            )
+            .await
+            .unwrap();
+
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Updated title".to_owned(),
+                "Example".to_owned(),
+                200,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let successful = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(successful.last_checked_at, Some(200));
+        assert_eq!(successful.last_check_error, None);
+        assert_eq!(successful.next_check_at, Some(200 + PLAYLIST_CHECK_INTERVAL_6_HOURS));
+
+        store
+            .record_playlist_subscription_error(
+                "sub-1".to_owned(),
+                "temporary failure".to_owned(),
+                300,
+            )
+            .await
+            .unwrap();
+        let failed = store.list_playlist_subscriptions().await.unwrap().remove(0);
+        assert_eq!(failed.last_checked_at, Some(300));
+        assert_eq!(failed.last_check_error.as_deref(), Some("temporary failure"));
+        assert_eq!(failed.next_check_at, Some(300 + PLAYLIST_CHECK_INTERVAL_6_HOURS));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn subscription_tables_migrate_and_records_survive_reopen() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
@@ -3812,7 +4169,20 @@ mod tests {
                         error TEXT,
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL
-                    );",
+                    );
+                    CREATE TABLE playlist_subscriptions (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        url TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT '',
+                        created_at INTEGER NOT NULL,
+                        last_checked_at INTEGER,
+                        last_check_error TEXT
+                    );
+                    INSERT INTO playlist_subscriptions
+                        (id, url, title, source, created_at, last_checked_at)
+                    VALUES
+                        ('legacy-sub', 'https://example.test/legacy', 'Old playlist', 'Example', 5, 7);",
                 )
                 .unwrap();
         }
@@ -3849,10 +4219,20 @@ mod tests {
 
         let reopened = Store::open(db_path).unwrap();
         let subscriptions = reopened.list_playlist_subscriptions().await.unwrap();
-        assert_eq!(subscriptions.len(), 1);
-        assert_eq!(subscriptions[0].title, "After check");
-        assert_eq!(subscriptions[0].last_checked_at, Some(20));
-        assert_eq!(subscriptions[0].pending_count, 1);
+        assert_eq!(subscriptions.len(), 2);
+        let migrated =
+            subscriptions.iter().find(|subscription| subscription.id == "migrated-sub").unwrap();
+        assert_eq!(migrated.title, "After check");
+        assert_eq!(migrated.last_checked_at, Some(20));
+        assert_eq!(migrated.pending_count, 1);
+        assert_eq!(migrated.check_interval_seconds, PLAYLIST_CHECK_INTERVAL_MANUAL);
+        assert_eq!(migrated.next_check_at, None);
+        let legacy =
+            subscriptions.iter().find(|subscription| subscription.id == "legacy-sub").unwrap();
+        assert_eq!(legacy.title, "Old playlist");
+        assert_eq!(legacy.last_checked_at, Some(7));
+        assert_eq!(legacy.check_interval_seconds, PLAYLIST_CHECK_INTERVAL_MANUAL);
+        assert_eq!(legacy.next_check_at, None);
         let entries =
             reopened.list_playlist_subscription_entries("migrated-sub".to_owned()).await.unwrap();
         assert_eq!(entries.len(), 1);

@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::{process::Command, time::timeout};
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,26 +40,75 @@ impl DependencyPaths {
             let yt_dlp = directory.join("yt-dlp.exe");
             let deno = directory.join("deno.exe");
             if yt_dlp.is_file() && deno.is_file() {
-                return Ok(Self {
+                let mut dependencies = Self {
                     ffmpeg: directory.join("ffmpeg.exe"),
                     ffprobe: directory.join("ffprobe.exe"),
                     directory,
                     yt_dlp,
                     deno,
-                });
+                };
+                dependencies.prefer_user_yt_dlp_override()?;
+                return Ok(dependencies);
             }
         }
         let directory = dependency_directories()?
             .into_iter()
             .next()
             .context("could not determine the bundled dependency directory")?;
-        Ok(Self {
+        let mut dependencies = Self {
             yt_dlp: directory.join("yt-dlp.exe"),
             deno: directory.join("deno.exe"),
             ffmpeg: directory.join("ffmpeg.exe"),
             ffprobe: directory.join("ffprobe.exe"),
             directory,
-        })
+        };
+        dependencies.prefer_user_yt_dlp_override()?;
+        Ok(dependencies)
+    }
+
+    pub fn user_yt_dlp_directory() -> Result<PathBuf> {
+        let project_dirs = directories::ProjectDirs::from(
+            "com",
+            env!("YT_SAVE_PUBLISHER"),
+            env!("YT_SAVE_PRODUCT_NAME"),
+        )
+        .context("determine the Yt Save per-user data directory")?;
+        Ok(project_dirs.data_local_dir().join("engine"))
+    }
+
+    fn prefer_user_yt_dlp_override(&mut self) -> Result<()> {
+        let directory = Self::user_yt_dlp_directory()?;
+        let active_version = directory.join("active-version");
+        let previous_version = directory.join("previous-version");
+        if let Some(version) = read_stable_version_marker(&active_version) {
+            let executable = directory.join("versions").join(&version).join("yt-dlp.exe");
+            if executable.is_file() {
+                self.yt_dlp = executable;
+                return Ok(());
+            }
+        }
+        if let Some(version) = read_stable_version_marker(&previous_version) {
+            let executable = directory.join("versions").join(&version).join("yt-dlp.exe");
+            if executable.is_file() {
+                match std::fs::symlink_metadata(&active_version) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        std::fs::remove_file(&active_version)
+                            .context("remove an invalid yt-dlp version marker link")?;
+                    }
+                    Ok(metadata) if !metadata.is_file() => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).context("inspect the active yt-dlp version marker");
+                    }
+                    _ => {}
+                }
+                std::fs::write(&active_version, &version)
+                    .context("restore the previous yt-dlp version marker")?;
+                let _ = std::fs::remove_file(&previous_version);
+                self.yt_dlp = executable;
+            }
+        }
+        Ok(())
     }
 
     pub async fn preflight(&self) -> DependencyReadiness {
@@ -71,13 +120,22 @@ impl DependencyPaths {
         );
         DependencyReadiness { yt_dlp, deno, ffmpeg, ffprobe }
     }
+}
 
-    pub fn require_for_download(&self) -> Result<()> {
-        if !self.yt_dlp.is_file() {
-            bail!("The bundled yt-dlp executable is missing.");
-        }
-        Ok(())
+pub(crate) fn read_stable_version_marker(path: &Path) -> Option<String> {
+    if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
     }
+    let version = std::fs::read_to_string(path).ok()?.trim().to_owned();
+    let mut parts = version.split('.');
+    let year = parts.next()?.parse::<u32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(2000..=2999).contains(&year) {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)?;
+    Some(version)
 }
 
 impl DependencyReadiness {
@@ -179,6 +237,24 @@ fn dependency_directories() -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_markers_accept_only_safe_dated_stable_versions() {
+        let root =
+            std::env::temp_dir().join(format!("yt-save-engine-marker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("active-version");
+        for (value, expected) in [
+            ("2026.08.19", Some("2026.08.19")),
+            ("2026.02.31", None),
+            ("../../outside", None),
+            ("2026.08.19-nightly", None),
+        ] {
+            std::fs::write(&marker, value).unwrap();
+            assert_eq!(read_stable_version_marker(&marker).as_deref(), expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn readiness_summary_shows_versions_and_optional_dependency_degradation() {

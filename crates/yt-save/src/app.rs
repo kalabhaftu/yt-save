@@ -60,6 +60,7 @@ enum UiEvent {
         candidate: ClipboardCandidate,
     },
     DependencyStatus(String),
+    DependencyUpdateState(bool),
     ClearPreview {
         request_id: u64,
     },
@@ -442,11 +443,20 @@ async fn perform_playlist_subscription_check(
 }
 
 pub fn run() -> Result<()> {
+    #[cfg(windows)]
+    let _instance_guard = match crate::single_instance::SingleInstanceGuard::acquire()? {
+        Some(guard) => guard,
+        None => {
+            crate::single_instance::show_already_running_message();
+            return Ok(());
+        }
+    };
+
     let paths = AppPaths::discover()?;
     std::fs::create_dir_all(&paths.downloads)
         .with_context(|| format!("create download directory {}", paths.downloads.display()))?;
     let store = Store::open(paths.database.clone())?;
-    let dependencies = DependencyPaths::discover()?;
+    let mut dependencies = DependencyPaths::discover()?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -454,6 +464,12 @@ pub fn run() -> Result<()> {
         .thread_name("yt-save-worker")
         .build()
         .context("create background runtime")?;
+    let user_engine_directory = DependencyPaths::user_yt_dlp_directory()?;
+    let packaged_yt_dlp = dependencies.directory.join("yt-dlp.exe");
+    dependencies.yt_dlp = runtime.block_on(crate::yt_dlp_update::recover_startup_engine(
+        &user_engine_directory,
+        &packaged_yt_dlp,
+    ));
     let fallback_directory = validate_download_directory(&paths.downloads)?;
     let configured_directory =
         runtime.block_on(store.get_or_initialize_download_directory(
@@ -791,6 +807,14 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
+                UiEvent::DependencyUpdateState(in_progress) => {
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_yt_dlp_update_in_progress(in_progress);
+                        }
+                    });
+                }
                 UiEvent::ClearPreview { request_id } => {
                     latest_analysis_id = request_id;
                     if let Ok(mut state) = event_playlist_selection.lock() {
@@ -1002,8 +1026,11 @@ pub fn run() -> Result<()> {
     });
 
     let dependency_events = events_tx.clone();
-    let dependency_paths = dependencies.clone();
+    let mut dependency_paths = dependencies.clone();
+    let dependency_engine = engine.clone();
     handle.spawn(async move {
+        let _process_guard = dependency_engine.lock_for_yt_dlp_process().await;
+        dependency_paths.yt_dlp = dependency_engine.current_yt_dlp_path();
         let readiness = dependency_paths.preflight().await;
         let summary = readiness.summary();
         let status = if readiness.yt_dlp_ready() {
@@ -1065,6 +1092,7 @@ pub fn run() -> Result<()> {
     let enqueue_shutdown_started = shutdown_started.clone();
     let enqueue_analysis_generation = analysis_generation.clone();
     let enqueue_queue_wake = queue_wake.clone();
+    let update_dispatch_gate = Arc::new(AsyncMutex::new(()));
     let _ = runtime.block_on(recover_pending(&store))?;
     let dispatcher_shutdown_started = shutdown_started.clone();
     handle.spawn(run_queue_dispatcher(
@@ -1073,8 +1101,96 @@ pub fn run() -> Result<()> {
         events_tx.clone(),
         queue_wake.clone(),
         active_jobs.clone(),
+        update_dispatch_gate.clone(),
         dispatcher_shutdown_started,
     ));
+
+    let updater_running = Arc::new(AtomicBool::new(false));
+    let update_events = events_tx.clone();
+    let update_handle = handle.clone();
+    let update_engine = engine.clone();
+    let update_active_jobs = active_jobs.clone();
+    let update_gate = update_dispatch_gate.clone();
+    let update_shutdown_started = shutdown_started.clone();
+    let update_dependencies = dependencies.clone();
+    let update_running = updater_running.clone();
+    window.on_yt_dlp_update_requested(move || {
+        if update_shutdown_started.load(Ordering::Acquire) {
+            let _ = update_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
+        if update_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = update_events.send(UiEvent::Status("Checking the official yt-dlp stable release…".to_owned()));
+        let events = update_events.clone();
+        let engine = update_engine.clone();
+        let active_jobs = update_active_jobs.clone();
+        let dispatch_gate = update_gate.clone();
+        let dependencies = update_dependencies.clone();
+        let running = update_running.clone();
+        update_handle.spawn(async move {
+            let _ = events.send(UiEvent::DependencyUpdateState(true));
+            let result = async {
+                let _dispatch_guard = dispatch_gate.lock().await;
+                let active_count = active_jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
+                    .len();
+                if active_count != 0 {
+                    anyhow::bail!("Wait for active downloads to finish before updating yt-dlp.");
+                }
+                let _process_guard = engine.lock_for_yt_dlp_update().await;
+                let current_executable = engine.current_yt_dlp_path();
+                let user_directory = DependencyPaths::user_yt_dlp_directory()?;
+                let outcome = crate::yt_dlp_update::check_and_install(
+                    &current_executable,
+                    &user_directory,
+                )
+                .await?;
+                if let crate::yt_dlp_update::UpdateOutcome::Updated { installed_version, .. } =
+                    &outcome
+                {
+                    let installed_path = user_directory
+                        .join("versions")
+                        .join(installed_version)
+                        .join("yt-dlp.exe");
+                    engine.use_yt_dlp_path(installed_path.clone());
+                    let mut updated_dependencies = dependencies;
+                    updated_dependencies.yt_dlp = installed_path;
+                    let readiness = updated_dependencies.preflight().await;
+                    let _ = events.send(UiEvent::DependencyStatus(readiness.summary()));
+                }
+                Ok::<_, anyhow::Error>(outcome)
+            }
+            .await;
+            match result {
+                Ok(crate::yt_dlp_update::UpdateOutcome::AlreadyCurrent {
+                    installed_version,
+                    latest_version,
+                }) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "yt-dlp {installed_version} is current (latest stable: {latest_version})."
+                    )));
+                }
+                Ok(crate::yt_dlp_update::UpdateOutcome::Updated {
+                    previous_version,
+                    installed_version,
+                }) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Updated yt-dlp from {previous_version} to {installed_version}. The previous per-user engine is retained for rollback."
+                    )));
+                    let _ = events.send(UiEvent::Refresh);
+                }
+                Err(error) => {
+                    error!(%error, "check or install yt-dlp update");
+                    let _ = events.send(UiEvent::Status(format!("yt-dlp update was not installed: {error}")));
+                }
+            }
+            running.store(false, Ordering::Release);
+            let _ = events.send(UiEvent::DependencyUpdateState(false));
+        });
+    });
     let _ = events_tx.send(UiEvent::Refresh);
 
     let history_search_events = events_tx.clone();
@@ -3805,6 +3921,7 @@ async fn run_queue_dispatcher(
     events: mpsc::UnboundedSender<UiEvent>,
     queue_wake: Arc<Notify>,
     active_jobs: ActiveJobs,
+    update_dispatch_gate: Arc<AsyncMutex<()>>,
     shutdown_started: Arc<AtomicBool>,
 ) {
     let mut workers = JoinSet::new();
@@ -3858,6 +3975,10 @@ async fn run_queue_dispatcher(
                 }
             };
             if !can_dispatch_more(workers.len(), limit) {
+                break;
+            }
+            let _dispatch_guard = update_dispatch_gate.lock().await;
+            if shutdown_started.load(Ordering::Acquire) {
                 break;
             }
             let pending = match store.next_queued_download().await {

@@ -32,3 +32,11 @@ This is an engineering inventory, not a legal opinion. A release must use the ex
 4. Run the fetch script, inspect the archive's notices/configuration, and validate executable versions.
 5. Build both installers and run the Windows install/download/uninstall acceptance checklist.
 6. Update this document and the feature verification matrix with actual evidence.
+
+## In-app yt-dlp updates
+
+The Engine Status panel's **Check & install** action checks only the stable release from the fixed `yt-dlp/yt-dlp` GitHub releases API. The updater accepts a dated stable release tag, requires the exact `yt-dlp.exe` asset URL, and requires GitHub's asset metadata to publish a SHA-256 digest. It downloads over HTTPS with a bounded size and timeout, compares the complete file digest, then runs the staged executable with `--version` and requires an exact match to the release tag.
+
+Verified versions are kept in version-specific folders under the user's LocalAppData application-data directory, with a SHA-256 record beside each executable. Startup rechecks that digest and the exact `--version` before selecting an overlay. If the active overlay fails either check, the app tries the previous version and then falls back to the packaged executable; it changes only version markers and preserves the engine files. The app changes a small active-version marker only after candidate validation; the previous marker and binary remain available for rollback. A failed update leaves the current engine selected. The app will not install an engine update while a queue download is active, and a shared process gate prevents racing yt-dlp metadata extraction or queue dispatch. The new executable becomes available to subsequent work in the same app session.
+
+The runtime updater uses GitHub's published asset SHA-256 digest over authenticated HTTPS; it does not currently verify yt-dlp's detached OpenPGP checksum signature. If GitHub omits the SHA-256 asset digest, the updater fails closed and leaves the selected engine unchanged. This trust boundary is distinct from the repository's build-time dependency manifest, whose digests remain pinned and reviewed in source control. Manual dependency updates must still follow the pinned artifact procedure above.

@@ -134,6 +134,7 @@ export component MainWindow inherits Window {
     in-out property <bool> close-to-tray-enabled: false;
     in-out property <bool> minimize-to-tray-enabled: false;
     in-out property <string> dependency-status: "Checking bundled tools…";
+    in-out property <bool> yt-dlp-update-in-progress: false;
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
     in-out property <bool> analyzed-is-playlist: false;
@@ -164,6 +165,7 @@ export component MainWindow inherits Window {
     callback playlist-subscription-queue-selected-requested();
     callback playlist-subscription-dismiss-selected-requested();
     callback clipboard-monitoring-requested(bool);
+    callback yt-dlp-update-requested();
     callback clipboard-candidate-dismissed();
     callback close-to-tray-requested(bool);
     callback minimize-to-tray-requested(bool);
@@ -361,7 +363,7 @@ export component MainWindow inherits Window {
                                 background: #171b28;
                                 border-width: 1px;
                                 border-color: #282d40;
-                                height: 116px;
+                                height: 150px;
 
                                 VerticalLayout {
                                     padding: 12px;
@@ -373,6 +375,13 @@ export component MainWindow inherits Window {
                                         font-size: 11px;
                                         wrap: word-wrap;
                                         vertical-stretch: 1;
+                                    }
+                                    ActionButton {
+                                        label: root.yt-dlp-update-in-progress ? "Checking…" : "Check & install";
+                                        is-enabled: !root.yt-dlp-update-in-progress;
+                                        button-height: 28px;
+                                        button-min-width: 150px;
+                                        clicked => { root.yt-dlp-update-requested(); }
                                     }
                                 }
                             }

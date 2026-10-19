@@ -6,7 +6,10 @@ mod history;
 mod model;
 mod persistence;
 #[cfg(windows)]
+mod single_instance;
+#[cfg(windows)]
 mod window_activation;
+mod yt_dlp_update;
 
 slint::include_modules!();
 

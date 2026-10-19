@@ -17,6 +17,7 @@ The project selects Slint's GPL-3.0-or-later open-source license and therefore l
 - **UI:** Slint components and view models only; no process implementation inside `.slint` files.
 - **Async work:** Tokio multi-thread runtime for URL analysis, SQLite I/O, queue work, and child process output.
 - **Download engine:** the official `yt-dlp.exe`, invoked with structured arguments and no shell.
+- **yt-dlp engine updates:** a user-triggered stable-release updater verifies GitHub's published SHA-256 asset digest, probes the staged executable's version, and activates a per-user versioned executable through a rollback-capable marker. A Windows named mutex keeps one app instance active because its engine overlays and SQLite queue are shared per user. A shared async read/write gate coordinates yt-dlp processes with updates, while the dispatcher gate prevents a queue start from racing activation. The updater does not currently verify the upstream detached OpenPGP checksum signature and fails closed when GitHub does not provide an SHA-256 asset digest.
 - **YouTube JavaScript:** Deno is an explicitly located, pinned runtime when available. The official yt-dlp executable bundles `yt-dlp-ejs`; yt-dlp can still process other supported sites without Deno.
 - **Media processing:** bundled FFmpeg and FFprobe are passed to yt-dlp through `--ffmpeg-location`.
 - **Persistence:** SQLite with WAL mode for durable queue state and settings.

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
+    sync::RwLock,
 };
 
 use anyhow::{Context, Result, bail};
@@ -8,7 +9,7 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
-    sync::watch,
+    sync::{RwLock as AsyncRwLock, watch},
 };
 use tracing::{debug, warn};
 
@@ -103,6 +104,8 @@ impl DownloadOptions {
 #[derive(Clone)]
 pub struct DownloadEngine {
     dependencies: DependencyPaths,
+    yt_dlp_path: std::sync::Arc<RwLock<PathBuf>>,
+    process_gate: std::sync::Arc<AsyncRwLock<()>>,
     output_directory: PathBuf,
 }
 
@@ -149,7 +152,29 @@ pub(crate) enum JobSignal {
 
 impl DownloadEngine {
     pub fn new(dependencies: DependencyPaths, output_directory: PathBuf) -> Self {
-        Self { dependencies, output_directory }
+        let yt_dlp_path = std::sync::Arc::new(RwLock::new(dependencies.yt_dlp.clone()));
+        Self {
+            dependencies,
+            yt_dlp_path,
+            process_gate: std::sync::Arc::new(AsyncRwLock::new(())),
+            output_directory,
+        }
+    }
+
+    pub fn current_yt_dlp_path(&self) -> PathBuf {
+        self.yt_dlp_path.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub fn use_yt_dlp_path(&self, path: PathBuf) {
+        *self.yt_dlp_path.write().unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+    }
+
+    pub async fn lock_for_yt_dlp_update(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.process_gate.write().await
+    }
+
+    pub async fn lock_for_yt_dlp_process(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.process_gate.read().await
     }
 
     pub async fn inspect(&self, url: &str) -> Result<MediaMetadata> {
@@ -198,10 +223,11 @@ impl DownloadEngine {
         playlist_end: Option<usize>,
         signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
+        let _process_guard = self.process_gate.read().await;
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
-        self.dependencies.require_for_download()?;
+        self.require_yt_dlp()?;
         let mut command = if let Some(limit) = playlist_end {
             self.inspect_command(url, playlist_index, Some(limit))?
         } else {
@@ -275,13 +301,14 @@ impl DownloadEngine {
     where
         F: FnMut(ProgressUpdate) + Send,
     {
+        let _process_guard = self.process_gate.read().await;
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
         let subtitle_only = options.mode == DownloadMode::SubtitlesOnly;
         let subtitle_output_directory =
             options.output_directory.clone().unwrap_or_else(|| self.output_directory.clone());
-        self.dependencies.require_for_download()?;
+        self.require_yt_dlp()?;
         let mut command = self.download_command(url, playlist_index, options)?;
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
@@ -369,7 +396,7 @@ impl DownloadEngine {
     }
 
     fn base_command(&self) -> Command {
-        let mut command = Command::new(&self.dependencies.yt_dlp);
+        let mut command = Command::new(self.current_yt_dlp_path());
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -384,6 +411,14 @@ impl DownloadEngine {
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
         command
+    }
+
+    fn require_yt_dlp(&self) -> Result<()> {
+        let path = self.current_yt_dlp_path();
+        if !path.is_file() {
+            bail!("The bundled yt-dlp executable is missing.");
+        }
+        Ok(())
     }
 
     fn download_command(
@@ -795,8 +830,6 @@ mod tests {
             ffmpeg: root.join("ffmpeg.exe"),
             ffprobe: root.join("ffprobe.exe"),
         };
-        dependencies.require_for_download().unwrap();
-
         let engine = DownloadEngine::new(dependencies, root.clone());
         let arguments = engine
             .base_command()

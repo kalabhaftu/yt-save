@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{
@@ -26,6 +26,59 @@ pub struct TrayPreferences {
 #[derive(Clone)]
 pub struct Store {
     path: PathBuf,
+}
+
+/// Saved playlist watched by the manual subscription checker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistSubscription {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub source: String,
+    pub created_at: i64,
+    /// Timestamp of the most recent successful or failed check attempt.
+    pub last_checked_at: Option<i64>,
+    pub last_check_error: Option<String>,
+    /// Number of entries not yet queued or dismissed, including unavailable archive entries.
+    pub pending_count: usize,
+}
+
+/// Metadata for one item returned by a successful playlist check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistSubscriptionEntryInput {
+    /// Stable identity within an extractor, for example `youtube:abc123`.
+    pub media_key: String,
+    pub media_id: Option<String>,
+    /// URL that the download queue should use for this individual item.
+    pub media_url: String,
+    pub title: String,
+    pub playlist_index: Option<i64>,
+    /// False for private, deleted, or otherwise unavailable playlist items.
+    pub available: bool,
+}
+
+/// One archived playlist item, including its durable offer and queue state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistSubscriptionEntry {
+    pub media_key: String,
+    pub media_id: Option<String>,
+    pub media_url: String,
+    pub title: String,
+    pub playlist_index: Option<i64>,
+    pub available: bool,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    /// `new`, `queued`, `ignored`, or `downloaded` (derived from a durable completion marker).
+    pub state: String,
+    pub download_id: Option<String>,
+    pub completed_at: Option<i64>,
+}
+
+/// Associates an archived media key with the download row to create for it.
+#[derive(Clone, Debug)]
+pub struct PlaylistSubscriptionQueueItem {
+    pub media_key: String,
+    pub record: DownloadRecord,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,8 +139,54 @@ impl Store {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS playlist_subscriptions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    last_checked_at INTEGER,
+                    last_check_error TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS playlist_subscription_entries (
+                    subscription_id TEXT NOT NULL,
+                    media_key TEXT NOT NULL,
+                    media_id TEXT,
+                    media_url TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    playlist_index INTEGER,
+                    available INTEGER NOT NULL DEFAULT 0 CHECK (available IN (0, 1)),
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    state_updated_at INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'new'
+                        CHECK (state IN ('new', 'queued', 'ignored')),
+                    download_id TEXT UNIQUE,
+                    completed_at INTEGER,
+                    PRIMARY KEY (subscription_id, media_key),
+                    FOREIGN KEY (subscription_id) REFERENCES playlist_subscriptions(id)
+                        ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_playlist_subscription_entries_order
+                    ON playlist_subscription_entries(subscription_id, playlist_index, media_key);
+                 CREATE INDEX IF NOT EXISTS idx_playlist_subscription_entries_pending
+                    ON playlist_subscription_entries(subscription_id, state, available);",
             )?;
+            let has_subscription_completed_at = {
+                let mut statement =
+                    connection.prepare("PRAGMA table_info(playlist_subscription_entries)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == "completed_at")
+            };
+            if !has_subscription_completed_at {
+                connection.execute_batch(
+                    "ALTER TABLE playlist_subscription_entries ADD COLUMN completed_at INTEGER;",
+                )?;
+            }
             let has_playlist_index = {
                 let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
                 let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -157,6 +256,388 @@ impl Store {
             Ok(())
         })?;
         Ok(store)
+    }
+
+    /// Adds a playlist to the manual check list. Both the id and URL must be unique.
+    pub async fn create_playlist_subscription(
+        &self,
+        id: String,
+        url: String,
+        title: String,
+        source: String,
+        created_at: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(!id.trim().is_empty(), "playlist subscription id is empty");
+        anyhow::ensure!(!url.trim().is_empty(), "playlist subscription URL is empty");
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO playlist_subscriptions
+                        (id, url, title, source, created_at)
+                     VALUES (:id, :url, :title, :source, :created_at)",
+                    named_params! {
+                        ":id": id,
+                        ":url": url,
+                        ":title": title,
+                        ":source": source,
+                        ":created_at": created_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join playlist subscription write")??;
+        Ok(())
+    }
+
+    /// Lists subscriptions with a count of entries still marked `new`.
+    pub async fn list_playlist_subscriptions(&self) -> Result<Vec<PlaylistSubscription>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT s.id, s.url, s.title, s.source, s.created_at,
+                            s.last_checked_at, s.last_check_error,
+                            (SELECT count(*) FROM playlist_subscription_entries e
+                             WHERE e.subscription_id = s.id AND e.state = 'new')
+                     FROM playlist_subscriptions s
+                     ORDER BY s.created_at DESC, s.id ASC",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok(PlaylistSubscription {
+                        id: row.get(0)?,
+                        url: row.get(1)?,
+                        title: row.get(2)?,
+                        source: row.get(3)?,
+                        created_at: row.get(4)?,
+                        last_checked_at: row.get(5)?,
+                        last_check_error: row.get(6)?,
+                        pending_count: row.get::<_, i64>(7)? as usize,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            })
+        })
+        .await
+        .context("join playlist subscriptions read")?
+    }
+
+    /// Deletes a subscription and its archive only; linked download rows and files are retained.
+    pub async fn delete_playlist_subscription(&self, id: String) -> Result<bool> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "DELETE FROM playlist_subscription_entries WHERE subscription_id = :id",
+                    named_params! { ":id": id },
+                )?;
+                let deleted = transaction.execute(
+                    "DELETE FROM playlist_subscriptions WHERE id = :id",
+                    named_params! { ":id": id },
+                )?;
+                transaction.commit()?;
+                Ok(deleted > 0)
+            })
+        })
+        .await
+        .context("join playlist subscription delete")?
+    }
+
+    /// Stores a successful playlist snapshot and returns the number of previously unseen keys.
+    /// Existing archive state and first-seen timestamps are preserved across checks.
+    pub async fn record_playlist_subscription_check(
+        &self,
+        id: String,
+        title: String,
+        source: String,
+        checked_at: i64,
+        entries: Vec<PlaylistSubscriptionEntryInput>,
+    ) -> Result<usize> {
+        validate_subscription_snapshot(&entries)?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let updated = transaction.execute(
+                    "UPDATE playlist_subscriptions
+                     SET title = :title, source = :source,
+                         last_checked_at = :checked_at, last_check_error = NULL
+                     WHERE id = :id",
+                    named_params! {
+                        ":id": id,
+                        ":title": title,
+                        ":source": source,
+                        ":checked_at": checked_at,
+                    },
+                )?;
+                anyhow::ensure!(updated == 1, "playlist subscription {id} does not exist");
+
+                // Entries omitted from this complete snapshot are no longer queueable, but stay
+                // in the archive with their previous state and last-seen time intact.
+                transaction.execute(
+                    "UPDATE playlist_subscription_entries
+                     SET available = 0 WHERE subscription_id = :id",
+                    named_params! { ":id": id },
+                )?;
+
+                let mut inserted = 0usize;
+                for entry in &entries {
+                    let already_seen: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM playlist_subscription_entries
+                         WHERE subscription_id = :subscription_id AND media_key = :media_key)",
+                        named_params! {
+                            ":subscription_id": id,
+                            ":media_key": entry.media_key,
+                        },
+                        |row| row.get(0),
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO playlist_subscription_entries (
+                            subscription_id, media_key, media_id, media_url, title,
+                            playlist_index, available, first_seen_at, last_seen_at,
+                            state_updated_at, state
+                         ) VALUES (
+                            :subscription_id, :media_key, :media_id, :media_url, :title,
+                            :playlist_index, :available, :checked_at, :checked_at,
+                            :checked_at, 'new'
+                         ) ON CONFLICT(subscription_id, media_key) DO UPDATE SET
+                            media_id = excluded.media_id,
+                            media_url = excluded.media_url,
+                            title = excluded.title,
+                            playlist_index = excluded.playlist_index,
+                            available = excluded.available,
+                            last_seen_at = excluded.last_seen_at",
+                        named_params! {
+                            ":subscription_id": id,
+                            ":media_key": entry.media_key,
+                            ":media_id": entry.media_id,
+                            ":media_url": entry.media_url,
+                            ":title": entry.title,
+                            ":playlist_index": entry.playlist_index,
+                            ":available": entry.available,
+                            ":checked_at": checked_at,
+                        },
+                    )?;
+                    if !already_seen {
+                        inserted += 1;
+                    }
+                }
+                transaction.commit()?;
+                Ok(inserted)
+            })
+        })
+        .await
+        .context("join playlist subscription check write")?
+    }
+
+    /// Records a failed check attempt without changing the last successful archive snapshot.
+    pub async fn record_playlist_subscription_error(
+        &self,
+        id: String,
+        error: String,
+        checked_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let updated = connection.execute(
+                    "UPDATE playlist_subscriptions
+                     SET last_checked_at = :checked_at, last_check_error = :error
+                     WHERE id = :id",
+                    named_params! {
+                        ":id": id,
+                        ":error": error,
+                        ":checked_at": checked_at,
+                    },
+                )?;
+                anyhow::ensure!(updated == 1, "playlist subscription {id} does not exist");
+                Ok(())
+            })
+        })
+        .await
+        .context("join playlist subscription error write")??;
+        Ok(())
+    }
+
+    /// Returns the full archive in the latest playlist order, with unindexed entries last.
+    pub async fn list_playlist_subscription_entries(
+        &self,
+        id: String,
+    ) -> Result<Vec<PlaylistSubscriptionEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT e.media_key, e.media_id, e.media_url, e.title, e.playlist_index,
+                            e.available, e.first_seen_at, e.last_seen_at,
+                            CASE WHEN e.completed_at IS NOT NULL OR d.status = 'Completed'
+                                 THEN 'downloaded' ELSE e.state END,
+                            e.download_id, e.completed_at
+                     FROM playlist_subscription_entries e
+                     LEFT JOIN downloads d ON d.id = e.download_id
+                     WHERE e.subscription_id = :id
+                     ORDER BY e.playlist_index IS NULL, e.playlist_index ASC, e.media_key ASC",
+                )?;
+                let rows = statement.query_map(named_params! { ":id": id }, |row| {
+                    Ok(PlaylistSubscriptionEntry {
+                        media_key: row.get(0)?,
+                        media_id: row.get(1)?,
+                        media_url: row.get(2)?,
+                        title: row.get(3)?,
+                        playlist_index: row.get(4)?,
+                        available: row.get(5)?,
+                        first_seen_at: row.get(6)?,
+                        last_seen_at: row.get(7)?,
+                        state: row.get(8)?,
+                        download_id: row.get(9)?,
+                        completed_at: row.get(10)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            })
+        })
+        .await
+        .context("join playlist subscription archive read")?
+    }
+
+    /// Dismisses only entries still marked `new`; queued and ignored entries are unchanged.
+    pub async fn dismiss_playlist_subscription_entries(
+        &self,
+        id: String,
+        media_keys: Vec<String>,
+        updated_at: i64,
+    ) -> Result<usize> {
+        validate_media_keys(&media_keys)?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM playlist_subscriptions WHERE id = :id)",
+                    named_params! { ":id": id },
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(exists, "playlist subscription {id} does not exist");
+                let mut dismissed = 0usize;
+                for media_key in &media_keys {
+                    dismissed += transaction.execute(
+                        "UPDATE playlist_subscription_entries
+                         SET state = 'ignored', state_updated_at = :updated_at
+                         WHERE subscription_id = :subscription_id
+                           AND media_key = :media_key AND state = 'new'",
+                        named_params! {
+                            ":subscription_id": id,
+                            ":media_key": media_key,
+                            ":updated_at": updated_at,
+                        },
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(dismissed)
+            })
+        })
+        .await
+        .context("join playlist subscription dismiss")?
+    }
+
+    /// Atomically creates download rows and links selected available `new` archive entries.
+    /// Reusing a media key or an existing download id is rejected before any row is saved.
+    pub async fn queue_playlist_subscription_entries(
+        &self,
+        id: String,
+        items: Vec<PlaylistSubscriptionQueueItem>,
+    ) -> Result<usize> {
+        validate_queue_items(&items)?;
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let subscription_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM playlist_subscriptions WHERE id = :id)",
+                    named_params! { ":id": id },
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(subscription_exists, "playlist subscription {id} does not exist");
+
+                // Validate the complete selection first. A stale/unavailable key must not leave
+                // earlier records partially inserted into the durable queue.
+                for item in &items {
+                    let archived: Option<(String, bool, String)> = transaction
+                        .query_row(
+                            "SELECT media_url, available, state
+                             FROM playlist_subscription_entries
+                             WHERE subscription_id = :subscription_id AND media_key = :media_key",
+                            named_params! {
+                                ":subscription_id": id,
+                                ":media_key": item.media_key,
+                            },
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+                    let Some((media_url, available, state)) = archived else {
+                        anyhow::bail!("playlist entry {} is not in the archive", item.media_key);
+                    };
+                    anyhow::ensure!(available, "playlist entry {} is unavailable", item.media_key);
+                    anyhow::ensure!(
+                        state == "new",
+                        "playlist entry {} was already handled",
+                        item.media_key
+                    );
+                    anyhow::ensure!(
+                        !media_url.trim().is_empty(),
+                        "playlist entry {} has no usable media URL",
+                        item.media_key
+                    );
+                    anyhow::ensure!(
+                        item.record.url == media_url,
+                        "download URL does not match archived media URL for {}",
+                        item.media_key
+                    );
+                    let id_exists: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM downloads WHERE id = :id)",
+                        named_params! { ":id": item.record.id },
+                        |row| row.get(0),
+                    )?;
+                    anyhow::ensure!(!id_exists, "download id {} already exists", item.record.id);
+                }
+
+                for item in &items {
+                    save_download_record(&transaction, &item.record)?;
+                    let changed = transaction.execute(
+                        "UPDATE playlist_subscription_entries
+                         SET state = 'queued', download_id = :download_id,
+                             state_updated_at = :updated_at
+                         WHERE subscription_id = :subscription_id AND media_key = :media_key
+                           AND state = 'new' AND available = 1",
+                        named_params! {
+                            ":subscription_id": id,
+                            ":media_key": item.media_key,
+                            ":download_id": item.record.id,
+                            ":updated_at": item.record.updated_at,
+                        },
+                    )?;
+                    anyhow::ensure!(
+                        changed == 1,
+                        "playlist entry {} changed while queuing",
+                        item.media_key
+                    );
+                }
+                transaction.commit()?;
+                Ok(items.len())
+            })
+        })
+        .await
+        .context("join playlist subscription queue write")?
     }
 
     pub async fn list_downloads(&self) -> Result<Vec<DownloadRecord>> {
@@ -839,14 +1320,45 @@ impl Store {
         let store = self.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
-                let affected = connection.execute(
-                    "DELETE FROM downloads
-                     WHERE id = :id
-                       AND status IN ('Completed', 'Failed', 'Canceled', 'Interrupted')",
-                    named_params! { ":id": id },
-                )?;
-                Ok(affected > 0)
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let status: Option<String> = transaction
+                    .query_row(
+                        "SELECT status FROM downloads WHERE id = :id",
+                        named_params! { ":id": id },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(status) = status else {
+                    transaction.commit()?;
+                    return Ok(false);
+                };
+                if !matches!(status.as_str(), "Completed" | "Failed" | "Canceled" | "Interrupted") {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                if status == "Completed" {
+                    transaction.execute(
+                        "UPDATE playlist_subscription_entries
+                         SET completed_at = COALESCE(completed_at, :updated_at),
+                             state_updated_at = :updated_at
+                         WHERE download_id = :id AND state = 'queued'",
+                        named_params! { ":id": id, ":updated_at": chrono::Utc::now().timestamp() },
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE playlist_subscription_entries
+                         SET state = 'new', download_id = NULL, completed_at = NULL,
+                             state_updated_at = :updated_at
+                         WHERE download_id = :id AND state = 'queued'",
+                        named_params! { ":id": id, ":updated_at": chrono::Utc::now().timestamp() },
+                    )?;
+                }
+                let affected = transaction
+                    .execute("DELETE FROM downloads WHERE id = :id", named_params! { ":id": id })?;
+                transaction.commit()?;
+                Ok(affected == 1)
             })
         })
         .await
@@ -880,9 +1392,21 @@ impl Store {
     pub async fn clear_completed_downloads(&self) -> Result<usize> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let cleared_at = chrono::Utc::now().timestamp();
+                transaction.execute(
+                    "UPDATE playlist_subscription_entries
+                     SET completed_at = COALESCE(completed_at, :cleared_at),
+                         state_updated_at = :cleared_at
+                     WHERE state = 'queued'
+                       AND download_id IN (SELECT id FROM downloads WHERE status = 'Completed')",
+                    named_params! { ":cleared_at": cleared_at },
+                )?;
                 let affected =
-                    connection.execute("DELETE FROM downloads WHERE status = 'Completed'", [])?;
+                    transaction.execute("DELETE FROM downloads WHERE status = 'Completed'", [])?;
+                transaction.commit()?;
                 Ok(affected)
             })
         })
@@ -1080,10 +1604,15 @@ impl Store {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
         let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
+        let completed = record.status == "Completed";
+        let completed_id = record.id.clone();
+        let completed_at = record.updated_at;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            store.with_connection(|connection| {
-                let affected = connection.execute(
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let affected = transaction.execute(
                     "UPDATE downloads
                      SET title = :title, source = :source, status = :status,
                          progress = :progress, downloaded_bytes = :downloaded,
@@ -1107,6 +1636,15 @@ impl Store {
                         ":updated": record.updated_at,
                     },
                 )?;
+                if affected == 1 && completed {
+                    transaction.execute(
+                        "UPDATE playlist_subscription_entries
+                         SET completed_at = :completed_at, state_updated_at = :completed_at
+                         WHERE download_id = :id AND state = 'queued'",
+                        named_params! { ":id": completed_id, ":completed_at": completed_at },
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(affected > 0)
             })
         })
@@ -1296,6 +1834,7 @@ impl Store {
         let connection = Connection::open(&self.path)
             .with_context(|| format!("open application database {}", self.path.display()))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         operation(&connection)
     }
 
@@ -1306,6 +1845,7 @@ impl Store {
         let mut connection = Connection::open(&self.path)
             .with_context(|| format!("open application database {}", self.path.display()))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         operation(&mut connection)
     }
 }
@@ -1387,6 +1927,55 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":scheduled_at": record.scheduled_at,
         },
     )?;
+    Ok(())
+}
+
+fn validate_media_key(media_key: &str) -> Result<()> {
+    anyhow::ensure!(!media_key.trim().is_empty(), "playlist media key is empty");
+    anyhow::ensure!(media_key == media_key.trim(), "playlist media key has surrounding whitespace");
+    anyhow::ensure!(media_key.len() <= 1024, "playlist media key exceeds 1024 bytes");
+    anyhow::ensure!(
+        !media_key.chars().any(char::is_control),
+        "playlist media key contains a control character"
+    );
+    Ok(())
+}
+
+fn validate_media_keys(media_keys: &[String]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(media_keys.len());
+    for media_key in media_keys {
+        validate_media_key(media_key)?;
+        anyhow::ensure!(seen.insert(media_key), "duplicate playlist media key {media_key}");
+    }
+    Ok(())
+}
+
+fn validate_subscription_snapshot(entries: &[PlaylistSubscriptionEntryInput]) -> Result<()> {
+    let keys = entries.iter().map(|entry| entry.media_key.clone()).collect::<Vec<_>>();
+    validate_media_keys(&keys)
+}
+
+fn validate_queue_items(items: &[PlaylistSubscriptionQueueItem]) -> Result<()> {
+    let keys = items.iter().map(|item| item.media_key.clone()).collect::<Vec<_>>();
+    validate_media_keys(&keys)?;
+    let mut download_ids = HashSet::with_capacity(items.len());
+    for item in items {
+        anyhow::ensure!(
+            download_ids.insert(item.record.id.as_str()),
+            "duplicate download id {} in subscription queue batch",
+            item.record.id
+        );
+        anyhow::ensure!(
+            item.record.status == "Queued",
+            "subscription download {} must start in Queued state",
+            item.record.id
+        );
+        anyhow::ensure!(
+            !item.record.url.trim().is_empty(),
+            "subscription download {} has an empty URL",
+            item.record.id
+        );
+    }
     Ok(())
 }
 
@@ -3158,6 +3747,600 @@ mod tests {
         assert!(!store.cancel_queued_download("completed", 21).await.unwrap());
         assert!(store.claim_queued_download_if_next("completed", 21).await.unwrap().is_none());
         assert_eq!(store.list_downloads().await.unwrap()[0].status, "Completed");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn subscription_entry(
+        media_key: &str,
+        media_id: Option<&str>,
+        media_url: &str,
+        title: &str,
+        playlist_index: Option<i64>,
+        available: bool,
+    ) -> PlaylistSubscriptionEntryInput {
+        PlaylistSubscriptionEntryInput {
+            media_key: media_key.to_owned(),
+            media_id: media_id.map(str::to_owned),
+            media_url: media_url.to_owned(),
+            title: title.to_owned(),
+            playlist_index,
+            available,
+        }
+    }
+
+    fn subscription_download(id: &str, url: &str, created_at: i64) -> DownloadRecord {
+        DownloadRecord::queued(id.to_owned(), url.to_owned(), created_at)
+    }
+
+    async fn new_subscription_store() -> (PathBuf, Store) {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        store
+            .create_playlist_subscription(
+                "sub-1".to_owned(),
+                "https://example.test/playlist".to_owned(),
+                "Initial title".to_owned(),
+                "Example".to_owned(),
+                10,
+            )
+            .await
+            .unwrap();
+        (temp_dir, store)
+    }
+
+    #[tokio::test]
+    async fn subscription_tables_migrate_and_records_survive_reopen() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("legacy.sqlite3");
+        {
+            let connection = Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE downloads (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        url TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        progress REAL NOT NULL DEFAULT 0,
+                        downloaded_bytes INTEGER,
+                        total_bytes INTEGER,
+                        speed_bytes_per_second REAL,
+                        eta_seconds INTEGER,
+                        output_path TEXT,
+                        error TEXT,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(db_path.clone()).unwrap();
+        store
+            .create_playlist_subscription(
+                "migrated-sub".to_owned(),
+                "https://example.test/playlist".to_owned(),
+                "Before reopen".to_owned(),
+                "Example".to_owned(),
+                10,
+            )
+            .await
+            .unwrap();
+        store
+            .record_playlist_subscription_check(
+                "migrated-sub".to_owned(),
+                "After check".to_owned(),
+                "Example Extractor".to_owned(),
+                20,
+                vec![subscription_entry(
+                    "example:one",
+                    Some("one"),
+                    "https://cdn.example.test/one.mp4",
+                    "One",
+                    Some(1),
+                    true,
+                )],
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        let subscriptions = reopened.list_playlist_subscriptions().await.unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].title, "After check");
+        assert_eq!(subscriptions[0].last_checked_at, Some(20));
+        assert_eq!(subscriptions[0].pending_count, 1);
+        let entries =
+            reopened.list_playlist_subscription_entries("migrated-sub".to_owned()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].media_key, "example:one");
+        assert_eq!(entries[0].state, "new");
+        assert_eq!(entries[0].first_seen_at, 20);
+        assert_eq!(entries[0].last_seen_at, 20);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_subscription_check_offers_all_seen_entries_as_new() {
+        let (temp_dir, store) = new_subscription_store().await;
+        let inserted = store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "My playlist".to_owned(),
+                "Example extractor".to_owned(),
+                20,
+                vec![
+                    subscription_entry(
+                        "example:one",
+                        Some("one"),
+                        "https://cdn.example.test/one.mp4",
+                        "One",
+                        Some(1),
+                        true,
+                    ),
+                    subscription_entry(
+                        "example:two",
+                        Some("two"),
+                        "https://cdn.example.test/two.mp4",
+                        "Two",
+                        Some(2),
+                        true,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+        let listed = store.list_playlist_subscriptions().await.unwrap();
+        assert_eq!(listed[0].pending_count, 2);
+        assert_eq!(listed[0].last_check_error, None);
+        let entries = store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.state.as_str()).collect::<Vec<_>>(),
+            ["new", "new"]
+        );
+        assert!(entries.iter().all(|entry| entry.available));
+        assert!(entries.iter().all(|entry| entry.first_seen_at == 20 && entry.last_seen_at == 20));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reordered_and_renamed_checks_preserve_archive_and_handled_state() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "First title".to_owned(),
+                "First source".to_owned(),
+                20,
+                vec![
+                    subscription_entry(
+                        "example:one",
+                        Some("one"),
+                        "https://cdn.example.test/one.mp4",
+                        "One",
+                        Some(1),
+                        true,
+                    ),
+                    subscription_entry(
+                        "example:two",
+                        Some("two"),
+                        "https://cdn.example.test/two.mp4",
+                        "Two",
+                        Some(2),
+                        true,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .dismiss_playlist_subscription_entries(
+                    "sub-1".to_owned(),
+                    vec!["example:two".to_owned()],
+                    21,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let queued_download =
+            subscription_download("job-one", "https://cdn.example.test/one.mp4", 22);
+        assert_eq!(
+            store
+                .queue_playlist_subscription_entries(
+                    "sub-1".to_owned(),
+                    vec![PlaylistSubscriptionQueueItem {
+                        media_key: "example:one".to_owned(),
+                        record: queued_download,
+                    }],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            store
+                .record_playlist_subscription_check(
+                    "sub-1".to_owned(),
+                    "Renamed playlist".to_owned(),
+                    "Renamed source".to_owned(),
+                    30,
+                    vec![
+                        subscription_entry(
+                            "example:two",
+                            Some("two"),
+                            "https://cdn.example.test/two-v2.mp4",
+                            "Two renamed",
+                            Some(1),
+                            true
+                        ),
+                        subscription_entry(
+                            "example:one",
+                            Some("one"),
+                            "https://cdn.example.test/one.mp4",
+                            "One renamed",
+                            Some(2),
+                            true
+                        ),
+                    ],
+                )
+                .await
+                .unwrap(),
+            0
+        );
+
+        let subscription =
+            store.list_playlist_subscriptions().await.unwrap().into_iter().next().unwrap();
+        assert_eq!(subscription.title, "Renamed playlist");
+        assert_eq!(subscription.source, "Renamed source");
+        assert_eq!(subscription.last_checked_at, Some(30));
+        assert_eq!(subscription.pending_count, 0);
+        let entries = store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap();
+        assert_eq!(entries[0].media_key, "example:two");
+        assert_eq!(entries[0].title, "Two renamed");
+        assert_eq!(entries[0].state, "ignored");
+        assert_eq!(entries[0].first_seen_at, 20);
+        assert_eq!(entries[0].last_seen_at, 30);
+        assert_eq!(entries[1].media_key, "example:one");
+        assert_eq!(entries[1].state, "queued");
+        assert_eq!(entries[1].download_id.as_deref(), Some("job-one"));
+        assert_eq!(entries[1].first_seen_at, 20);
+        assert_eq!(entries[1].last_seen_at, 30);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_items_are_archived_but_cannot_be_queued() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                20,
+                vec![subscription_entry(
+                    "example:private",
+                    Some("private"),
+                    "",
+                    "Private item",
+                    Some(1),
+                    false,
+                )],
+            )
+            .await
+            .unwrap();
+        let entry = store
+            .list_playlist_subscription_entries("sub-1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(!entry.available);
+        assert_eq!(entry.state, "new");
+        assert_eq!(store.list_playlist_subscriptions().await.unwrap()[0].pending_count, 1);
+        let result = store
+            .queue_playlist_subscription_entries(
+                "sub-1".to_owned(),
+                vec![PlaylistSubscriptionQueueItem {
+                    media_key: "example:private".to_owned(),
+                    record: subscription_download("private-job", "", 21),
+                }],
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(store.list_downloads().await.unwrap().is_empty());
+
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                30,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let entry = store
+            .list_playlist_subscription_entries("sub-1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(!entry.available);
+        assert_eq!(entry.last_seen_at, 20);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_queue_is_atomic_and_duplicate_queue_is_rejected() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                20,
+                vec![
+                    subscription_entry(
+                        "example:one",
+                        Some("one"),
+                        "https://cdn.example.test/one.mp4",
+                        "One",
+                        Some(1),
+                        true,
+                    ),
+                    subscription_entry(
+                        "example:unavailable",
+                        None,
+                        "",
+                        "Unavailable",
+                        Some(2),
+                        false,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let atomic_failure = store
+            .queue_playlist_subscription_entries(
+                "sub-1".to_owned(),
+                vec![
+                    PlaylistSubscriptionQueueItem {
+                        media_key: "example:one".to_owned(),
+                        record: subscription_download(
+                            "job-one",
+                            "https://cdn.example.test/one.mp4",
+                            21,
+                        ),
+                    },
+                    PlaylistSubscriptionQueueItem {
+                        media_key: "example:unavailable".to_owned(),
+                        record: subscription_download("job-unavailable", "", 21),
+                    },
+                ],
+            )
+            .await;
+        assert!(atomic_failure.is_err());
+        assert!(store.list_downloads().await.unwrap().is_empty());
+        assert!(
+            store
+                .list_playlist_subscription_entries("sub-1".to_owned())
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.state == "new" && entry.download_id.is_none())
+        );
+
+        let selected = PlaylistSubscriptionQueueItem {
+            media_key: "example:one".to_owned(),
+            record: subscription_download("job-one", "https://cdn.example.test/one.mp4", 22),
+        };
+        assert_eq!(
+            store
+                .queue_playlist_subscription_entries("sub-1".to_owned(), vec![selected.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .queue_playlist_subscription_entries("sub-1".to_owned(), vec![selected])
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_downloads().await.unwrap().len(), 1);
+        let entry = store
+            .list_playlist_subscription_entries("sub-1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.media_key == "example:one")
+            .unwrap();
+        assert_eq!(entry.state, "queued");
+        assert_eq!(entry.download_id.as_deref(), Some("job-one"));
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_subscription_leaves_linked_download_record_intact() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                20,
+                vec![subscription_entry(
+                    "example:one",
+                    Some("one"),
+                    "https://cdn.example.test/one.mp4",
+                    "One",
+                    Some(1),
+                    true,
+                )],
+            )
+            .await
+            .unwrap();
+        let record = subscription_download("job-one", "https://cdn.example.test/one.mp4", 21);
+        store
+            .queue_playlist_subscription_entries(
+                "sub-1".to_owned(),
+                vec![PlaylistSubscriptionQueueItem { media_key: "example:one".to_owned(), record }],
+            )
+            .await
+            .unwrap();
+
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE downloads SET status = 'Completed' WHERE id = 'job-one'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let archived = store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap();
+        assert_eq!(archived[0].state, "downloaded");
+
+        assert!(store.delete_playlist_subscription("sub-1".to_owned()).await.unwrap());
+        assert!(!store.delete_playlist_subscription("sub-1".to_owned()).await.unwrap());
+        assert!(store.list_playlist_subscriptions().await.unwrap().is_empty());
+        assert!(
+            store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap().is_empty()
+        );
+        let downloads = store.list_downloads().await.unwrap();
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].id, "job-one");
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_download_state_survives_history_removal_and_clear() {
+        let (temp_dir, store) = new_subscription_store().await;
+        let first_file = temp_dir.join("first.mp4");
+        let second_file = temp_dir.join("second.mp4");
+        std::fs::write(&first_file, b"first media").unwrap();
+        std::fs::write(&second_file, b"second media").unwrap();
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                20,
+                vec![
+                    subscription_entry(
+                        "example:first",
+                        Some("first"),
+                        "https://cdn.example.test/first.mp4",
+                        "First",
+                        Some(1),
+                        true,
+                    ),
+                    subscription_entry(
+                        "example:second",
+                        Some("second"),
+                        "https://cdn.example.test/second.mp4",
+                        "Second",
+                        Some(2),
+                        true,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut first =
+            subscription_download("job-first", "https://cdn.example.test/first.mp4", 21);
+        first.output_path = Some(first_file.to_string_lossy().into_owned());
+        let mut second =
+            subscription_download("job-second", "https://cdn.example.test/second.mp4", 22);
+        second.output_path = Some(second_file.to_string_lossy().into_owned());
+        store
+            .queue_playlist_subscription_entries(
+                "sub-1".to_owned(),
+                vec![
+                    PlaylistSubscriptionQueueItem {
+                        media_key: "example:first".to_owned(),
+                        record: first,
+                    },
+                    PlaylistSubscriptionQueueItem {
+                        media_key: "example:second".to_owned(),
+                        record: second,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut first =
+            store.claim_queued_download_if_next("job-first", 23).await.unwrap().unwrap();
+        first.status = "Completed".to_owned();
+        first.updated_at = 24;
+        store.finish_download(first).await.unwrap();
+        let mut second =
+            store.claim_queued_download_if_next("job-second", 25).await.unwrap().unwrap();
+        second.status = "Completed".to_owned();
+        second.updated_at = 26;
+        store.finish_download(second).await.unwrap();
+        assert!(
+            store
+                .list_playlist_subscription_entries("sub-1".to_owned())
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.state == "downloaded")
+        );
+
+        assert!(store.remove_download("job-first").await.unwrap());
+        assert_eq!(store.clear_completed_downloads().await.unwrap(), 1);
+        let entries = store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap();
+        assert!(entries.iter().all(|entry| entry.state == "downloaded"));
+        assert_eq!(
+            entries.iter().map(|entry| entry.completed_at.is_some()).collect::<Vec<_>>(),
+            [true, true]
+        );
+        assert!(first_file.is_file());
+        assert!(second_file.is_file());
+        assert!(store.list_downloads().await.unwrap().is_empty());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_connections_enforce_subscription_foreign_keys() {
+        let (temp_dir, store) = new_subscription_store().await;
+        store
+            .record_playlist_subscription_check(
+                "sub-1".to_owned(),
+                "Playlist".to_owned(),
+                "Example".to_owned(),
+                20,
+                vec![subscription_entry(
+                    "example:one",
+                    Some("one"),
+                    "https://cdn.example.test/one.mp4",
+                    "One",
+                    Some(1),
+                    true,
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .with_connection_mut(|connection| {
+                connection.execute("DELETE FROM playlist_subscriptions WHERE id = 'sub-1'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store.list_playlist_subscription_entries("sub-1".to_owned()).await.unwrap().is_empty()
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 }

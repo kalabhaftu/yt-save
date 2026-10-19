@@ -176,11 +176,37 @@ impl DownloadEngine {
         playlist_index: Option<i64>,
         signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
+        self.inspect_with_playlist_limit_cancellable(url, playlist_index, Some(50), signal).await
+    }
+
+    pub(crate) async fn inspect_playlist_for_subscription(
+        &self,
+        url: &str,
+    ) -> Result<MediaMetadata> {
+        let (_signal_sender, mut signal) = watch::channel(JobSignal::Continue);
+        match self.inspect_with_playlist_limit_cancellable(url, None, None, &mut signal).await? {
+            EngineOutcome::Completed(metadata) => Ok(metadata),
+            EngineOutcome::Paused => bail!("playlist inspection was paused"),
+            EngineOutcome::Canceled => bail!("playlist inspection was canceled"),
+        }
+    }
+
+    async fn inspect_with_playlist_limit_cancellable(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+        playlist_end: Option<usize>,
+        signal: &mut watch::Receiver<JobSignal>,
+    ) -> Result<EngineOutcome<MediaMetadata>> {
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
         self.dependencies.require_for_download()?;
-        let mut command = self.inspect_command(url, playlist_index)?;
+        let mut command = if let Some(limit) = playlist_end {
+            self.inspect_command(url, playlist_index, Some(limit))?
+        } else {
+            self.inspect_command(url, playlist_index, None)?
+        };
         debug!(host = url_host(url), "requesting yt-dlp metadata");
         let mut child = command.spawn().context("start yt-dlp metadata extraction")?;
         let stdout = child.stdout.take().context("open yt-dlp metadata stdout")?;
@@ -457,14 +483,17 @@ impl DownloadEngine {
         Ok(command)
     }
 
-    fn inspect_command(&self, url: &str, playlist_index: Option<i64>) -> Result<Command> {
+    fn inspect_command(
+        &self,
+        url: &str,
+        playlist_index: Option<i64>,
+        playlist_end: Option<usize>,
+    ) -> Result<Command> {
         let mut command = self.base_command();
-        command
-            .arg("--no-warnings")
-            .arg("--skip-download")
-            .arg("--flat-playlist")
-            .arg("--playlist-end")
-            .arg("50");
+        command.arg("--no-warnings").arg("--skip-download").arg("--flat-playlist");
+        if let Some(playlist_end) = playlist_end {
+            command.arg("--playlist-end").arg(playlist_end.to_string());
+        }
         add_playlist_item_argument(&mut command, playlist_index)?;
         command.arg("--dump-single-json").arg(url);
         Ok(command)
@@ -1018,14 +1047,18 @@ mod tests {
         };
 
         let ordinary_inspection =
-            args(engine.inspect_command("https://example.test/playlist", None).unwrap());
+            args(engine.inspect_command("https://example.test/playlist", None, Some(50)).unwrap());
         assert!(!ordinary_inspection.iter().any(|arg| arg == "--playlist-items"));
 
-        let selected_inspection =
-            args(engine.inspect_command("https://example.test/playlist", Some(7)).unwrap());
+        let selected_inspection = args(
+            engine.inspect_command("https://example.test/playlist", Some(7), Some(50)).unwrap(),
+        );
         let inspection_end =
             selected_inspection.iter().position(|arg| arg == "--playlist-end").unwrap();
         assert_eq!(selected_inspection.get(inspection_end + 1).map(String::as_str), Some("50"));
+        let subscription_inspection =
+            args(engine.inspect_command("https://example.test/playlist", None, None).unwrap());
+        assert!(!subscription_inspection.iter().any(|arg| arg == "--playlist-end"));
         let selected_download = args(
             engine
                 .download_command(
@@ -1040,7 +1073,7 @@ mod tests {
             assert_eq!(arguments.get(option + 1).map(String::as_str), Some("7"));
         }
 
-        assert!(engine.inspect_command("https://example.test/list", Some(0)).is_err());
+        assert!(engine.inspect_command("https://example.test/list", Some(0), Some(50)).is_err());
         assert!(
             engine
                 .download_command(

@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     AppTray, ClipboardPopup, DownloadRowData, LibraryRowData, MainWindow, PlaylistEntryRowData,
+    PlaylistSubscriptionEntryRowData, PlaylistSubscriptionRowData,
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{
@@ -30,12 +31,13 @@ use crate::{
     history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry,
-        SubtitleFormat, format_bytes, format_duration, normalize_subtitle_languages,
-        subtitle_languages_available,
+        PlaylistMediaEntry, SubtitleFormat, format_bytes, format_duration,
+        normalize_subtitle_languages, subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
-        QueueMove, Store, TrayPreferences,
+        PlaylistSubscription, PlaylistSubscriptionEntry, PlaylistSubscriptionEntryInput,
+        PlaylistSubscriptionQueueItem, QueueMove, Store, TrayPreferences,
     },
 };
 
@@ -125,6 +127,44 @@ struct PlaylistSelectionState {
     selected: Vec<bool>,
 }
 
+#[derive(Clone, Default)]
+struct PlaylistSubscriptionReviewState {
+    subscription_id: String,
+    subscription: Option<PlaylistSubscription>,
+    entries: Vec<PlaylistSubscriptionEntry>,
+    selected_media_keys: HashSet<String>,
+}
+
+struct PlaylistSubscriptionCheckGuard {
+    active: Arc<AtomicBool>,
+    window: slint::Weak<MainWindow>,
+}
+
+impl PlaylistSubscriptionCheckGuard {
+    fn start(active: &Arc<AtomicBool>, window: slint::Weak<MainWindow>) -> Option<Self> {
+        active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        let weak = window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_subscription_checking(true);
+            }
+        });
+        Some(Self { active: active.clone(), window })
+    }
+}
+
+impl Drop for PlaylistSubscriptionCheckGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        let weak = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_subscription_checking(false);
+            }
+        });
+    }
+}
+
 impl PlaylistSelectionState {
     fn selected_count(&self) -> usize {
         self.selected.iter().filter(|selected| **selected).count()
@@ -185,6 +225,220 @@ fn selection_summary(selected_count: usize, selectable_count: usize) -> SharedSt
             "Selected {selected_count} of {selectable_count} selectable entries."
         ))
     }
+}
+
+fn playlist_subscription_entry_inputs(
+    source: &str,
+    entries: &[PlaylistMediaEntry],
+) -> Vec<PlaylistSubscriptionEntryInput> {
+    let source_key = source.trim().to_ascii_lowercase();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let media_id = entry.media_id.as_deref().map(str::trim).filter(|id| !id.is_empty());
+            let media_url = entry.media_url.trim();
+            let media_key = media_id.map_or_else(
+                || (!media_url.is_empty()).then(|| format!("url:{media_url}")),
+                |id| Some(format!("{source_key}:{id}")),
+            )?;
+            Some(PlaylistSubscriptionEntryInput {
+                media_key,
+                media_id: media_id.map(str::to_owned),
+                media_url: media_url.to_owned(),
+                title: entry.title.clone(),
+                playlist_index: entry.playlist_index,
+                available: entry.available,
+            })
+        })
+        .collect()
+}
+
+fn playlist_subscription_rows(
+    subscriptions: &[PlaylistSubscription],
+    selected_id: &str,
+) -> Vec<PlaylistSubscriptionRowData> {
+    subscriptions
+        .iter()
+        .map(|subscription| {
+            let summary = if subscription.last_check_error.is_some() {
+                "check failed".to_owned()
+            } else if subscription.last_checked_at.is_none() {
+                "not checked".to_owned()
+            } else if subscription.pending_count == 0 {
+                "up to date".to_owned()
+            } else {
+                format!("{} new", subscription.pending_count)
+            };
+            PlaylistSubscriptionRowData {
+                id: SharedString::from(subscription.id.as_str()),
+                title: SharedString::from(subscription.title.as_str()),
+                source: SharedString::from(subscription.source.as_str()),
+                url: SharedString::from(subscription.url.as_str()),
+                summary: SharedString::from(summary),
+                selected: subscription.id == selected_id,
+            }
+        })
+        .collect()
+}
+
+fn playlist_subscription_entry_rows(
+    entries: &[PlaylistSubscriptionEntry],
+    selected_media_keys: &HashSet<String>,
+) -> Vec<PlaylistSubscriptionEntryRowData> {
+    entries
+        .iter()
+        .map(|entry| {
+            let state = match entry.state.as_str() {
+                "new" if entry.available => "New",
+                "new" => "Unavailable",
+                "queued" => "Queued",
+                "downloaded" => "Downloaded",
+                "ignored" => "Dismissed",
+                _ => "Archived",
+            };
+            let detail = if !entry.available {
+                "yt-dlp did not provide a directly queueable media URL".to_owned()
+            } else if let Some(index) = entry.playlist_index {
+                format!("Playlist index {index}")
+            } else {
+                "Playlist item".to_owned()
+            };
+            PlaylistSubscriptionEntryRowData {
+                media_key: SharedString::from(entry.media_key.as_str()),
+                title: SharedString::from(entry.title.as_str()),
+                detail: SharedString::from(detail),
+                state: SharedString::from(state),
+                selectable: entry.state == "new" && entry.available,
+                selected: selected_media_keys.contains(&entry.media_key),
+            }
+        })
+        .collect()
+}
+
+fn subscription_last_checked(subscription: Option<&PlaylistSubscription>) -> String {
+    let Some(subscription) = subscription else {
+        return "Choose a saved playlist to review its archive.".to_owned();
+    };
+    if let Some(error) = &subscription.last_check_error {
+        return format!("Last check failed: {error}");
+    }
+    let Some(timestamp) = subscription.last_checked_at else {
+        return "Not checked yet.".to_owned();
+    };
+    let checked = chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| value.with_timezone(&chrono::Local).format("%b %d, %Y %H:%M").to_string())
+        .unwrap_or_else(|| "unknown time".to_owned());
+    format!("Last checked {checked} local time · {} new", subscription.pending_count)
+}
+
+async fn refresh_playlist_subscription_view(
+    store: &Store,
+    review_state: &Arc<Mutex<PlaylistSubscriptionReviewState>>,
+    weak_window: slint::Weak<MainWindow>,
+    requested_id: Option<String>,
+) -> Result<()> {
+    let subscriptions = store.list_playlist_subscriptions().await?;
+    let current_id =
+        review_state.lock().map(|review| review.subscription_id.clone()).unwrap_or_default();
+    let selected_id = requested_id
+        .filter(|requested| subscriptions.iter().any(|subscription| &subscription.id == requested))
+        .or_else(|| {
+            subscriptions
+                .iter()
+                .any(|subscription| subscription.id == current_id)
+                .then_some(current_id)
+        })
+        .or_else(|| subscriptions.first().map(|subscription| subscription.id.clone()))
+        .unwrap_or_default();
+    let selected_subscription =
+        subscriptions.iter().find(|subscription| subscription.id == selected_id).cloned();
+    let entries = if selected_id.is_empty() {
+        Vec::new()
+    } else {
+        store.list_playlist_subscription_entries(selected_id.clone()).await?
+    };
+    let review_snapshot = {
+        let mut review = review_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("playlist subscription review state is unavailable"))?;
+        if review.subscription_id != selected_id {
+            review.selected_media_keys.clear();
+        }
+        review.subscription_id = selected_id.clone();
+        review.subscription = selected_subscription.clone();
+        review.entries = entries.clone();
+        review.selected_media_keys.retain(|media_key| {
+            entries.iter().any(|entry| {
+                entry.media_key == *media_key && entry.state == "new" && entry.available
+            })
+        });
+        review.clone()
+    };
+    let subscription_rows = playlist_subscription_rows(&subscriptions, &selected_id);
+    let entry_rows = playlist_subscription_entry_rows(
+        &review_snapshot.entries,
+        &review_snapshot.selected_media_keys,
+    );
+    let summary = if review_snapshot.selected_media_keys.is_empty() {
+        "Select new entries to queue or dismiss them.".to_owned()
+    } else {
+        format!(
+            "{} new {} selected",
+            review_snapshot.selected_media_keys.len(),
+            plural_word(review_snapshot.selected_media_keys.len(), "entry", "entries")
+        )
+    };
+    let title = review_snapshot
+        .subscription
+        .as_ref()
+        .map_or_else(String::new, |subscription| subscription.title.clone());
+    let details = subscription_last_checked(review_snapshot.subscription.as_ref());
+    let selected_count =
+        i32::try_from(review_snapshot.selected_media_keys.len()).unwrap_or(i32::MAX);
+    slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak_window.upgrade() {
+            window.set_playlist_subscriptions(ModelRc::new(VecModel::from(subscription_rows)));
+            window.set_playlist_subscription_entries(ModelRc::new(VecModel::from(entry_rows)));
+            window.set_selected_subscription_id(selected_id.into());
+            window.set_selected_subscription_title(title.into());
+            window.set_selected_subscription_details(details.into());
+            window.set_subscription_selection_summary(summary.into());
+            window.set_playlist_subscription_selected_count(selected_count);
+        }
+    })?;
+    Ok(())
+}
+
+fn plural_word<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+async fn perform_playlist_subscription_check(
+    store: &Store,
+    engine: &DownloadEngine,
+    subscription_id: &str,
+) -> Result<usize> {
+    let subscription = store
+        .list_playlist_subscriptions()
+        .await?
+        .into_iter()
+        .find(|subscription| subscription.id == subscription_id)
+        .context("playlist subscription no longer exists")?;
+    let metadata = engine.inspect_playlist_for_subscription(&subscription.url).await?;
+    if !metadata.is_playlist {
+        anyhow::bail!("yt-dlp no longer identifies this URL as a playlist.");
+    }
+    let entries =
+        playlist_subscription_entry_inputs(&metadata.source, &metadata.subscription_entries);
+    store
+        .record_playlist_subscription_check(
+            subscription_id.to_owned(),
+            metadata.title,
+            metadata.source,
+            now(),
+            entries,
+        )
+        .await
 }
 
 pub fn run() -> Result<()> {
@@ -280,6 +534,9 @@ pub fn run() -> Result<()> {
     configure_clipboard_popup_window(&popup, clipboard_popup_work_area.clone());
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
+    let playlist_subscription_review =
+        Arc::new(Mutex::new(PlaylistSubscriptionReviewState::default()));
+    let playlist_subscription_check_active = Arc::new(AtomicBool::new(false));
     let weak_window = window.as_weak();
     let weak_tray = tray.as_weak();
     let event_store = store.clone();
@@ -845,9 +1102,526 @@ pub fn run() -> Result<()> {
         let _ = library_view_events.send(UiEvent::LibraryView(visible));
     });
 
+    let subscription_view_store = store.clone();
+    let subscription_view_review = playlist_subscription_review.clone();
+    let subscription_view_window = window.as_weak();
+    let subscription_view_handle = handle.clone();
+    let subscription_view_events = events_tx.clone();
+    window.on_subscriptions_view_requested(move |visible| {
+        if !visible {
+            return;
+        }
+        let store = subscription_view_store.clone();
+        let review = subscription_view_review.clone();
+        let weak_window = subscription_view_window.clone();
+        let events = subscription_view_events.clone();
+        let current_id =
+            weak_window.upgrade().map(|window| window.get_selected_subscription_id().to_string());
+        subscription_view_handle.spawn(async move {
+            if let Err(error) =
+                refresh_playlist_subscription_view(&store, &review, weak_window, current_id).await
+            {
+                error!(%error, "refresh playlist subscriptions");
+                let _ = events.send(UiEvent::Status(format!(
+                    "Could not load playlist subscriptions: {error}"
+                )));
+            }
+        });
+    });
+
     let refresh_library_events = events_tx.clone();
     window.on_library_refresh_requested(move || {
         let _ = refresh_library_events.send(UiEvent::RefreshLibrary);
+    });
+
+    let save_subscription_selection = playlist_selection.clone();
+    let save_subscription_store = store.clone();
+    let save_subscription_engine = engine.clone();
+    let save_subscription_review = playlist_subscription_review.clone();
+    let save_subscription_window = window.as_weak();
+    let save_subscription_events = events_tx.clone();
+    let save_subscription_handle = handle.clone();
+    let save_subscription_shutdown = shutdown_started.clone();
+    let save_subscription_check_active = playlist_subscription_check_active.clone();
+    window.on_subscribe_playlist_requested(move || {
+        if save_subscription_shutdown.load(Ordering::Acquire) {
+            let _ = save_subscription_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
+        let selection = save_subscription_selection.lock().ok().and_then(|state| state.clone());
+        let Some(selection) = selection else {
+            let _ = save_subscription_events
+                .send(UiEvent::Status("Analyze a playlist before saving a subscription.".to_owned()));
+            return;
+        };
+        let Some(check_guard) = PlaylistSubscriptionCheckGuard::start(
+            &save_subscription_check_active,
+            save_subscription_window.clone(),
+        ) else {
+            let _ = save_subscription_events.send(UiEvent::Status(
+                "A playlist check is already running. Wait for it to finish before saving another.".to_owned(),
+            ));
+            return;
+        };
+        let store = save_subscription_store.clone();
+        let engine = save_subscription_engine.clone();
+        let review = save_subscription_review.clone();
+        let weak_window = save_subscription_window.clone();
+        let events = save_subscription_events.clone();
+        save_subscription_handle.spawn(async move {
+            let _check_guard = check_guard;
+            match store.list_playlist_subscriptions().await {
+                Ok(subscriptions) => {
+                    if let Some(existing) = subscriptions
+                        .iter()
+                        .find(|subscription| subscription.url == selection.source_url)
+                    {
+                        let _ = events.send(UiEvent::Status(
+                            "This playlist is already saved as a subscription.".to_owned(),
+                        ));
+                        if let Err(error) = refresh_playlist_subscription_view(
+                            &store,
+                            &review,
+                            weak_window.clone(),
+                            Some(existing.id.clone()),
+                        )
+                        .await
+                        {
+                            error!(%error, "refresh existing playlist subscription");
+                        }
+                        return;
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "check existing playlist subscriptions");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not check saved playlists: {error}"
+                    )));
+                    return;
+                }
+            }
+            let subscription_id = Uuid::new_v4().to_string();
+            if let Err(error) = store
+                .create_playlist_subscription(
+                    subscription_id.clone(),
+                    selection.source_url,
+                    selection.title,
+                    selection.source,
+                    now(),
+                )
+                .await
+            {
+                error!(%error, "save playlist subscription");
+                let _ = events.send(UiEvent::Status(format!(
+                    "Could not save this playlist subscription: {error}"
+                )));
+                return;
+            }
+            let weak = weak_window.clone();
+            let selected_subscription_id = subscription_id.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_show_library(false);
+                    window.set_selected_subscription_id(selected_subscription_id.into());
+                    window.set_show_subscriptions(true);
+                }
+            });
+            let _ = events.send(UiEvent::Status(
+                "Saved the playlist. Checking its entries for your review…".to_owned(),
+            ));
+            match perform_playlist_subscription_check(&store, &engine, &subscription_id).await {
+                Ok(new_count) => {
+                    let message = if new_count == 0 {
+                        "Playlist checked. No new entries were found.".to_owned()
+                    } else {
+                        format!("Found {new_count} new playlist {}. Review them before queueing.", plural_word(new_count, "entry", "entries"))
+                    };
+                    let _ = events.send(UiEvent::Status(message));
+                }
+                Err(error) => {
+                    let _ = store
+                        .record_playlist_subscription_error(subscription_id.clone(), error.to_string(), now())
+                        .await;
+                    error!(%error, subscription_id = %subscription_id, "check new playlist subscription");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Playlist saved, but its first check failed: {error}"
+                    )));
+                }
+            }
+            if let Err(error) = refresh_playlist_subscription_view(
+                &store,
+                &review,
+                weak_window,
+                Some(subscription_id),
+            )
+            .await
+            {
+                error!(%error, "refresh newly saved playlist subscription");
+            }
+        });
+    });
+
+    let selected_subscription_store = store.clone();
+    let selected_subscription_review = playlist_subscription_review.clone();
+    let selected_subscription_window = window.as_weak();
+    let selected_subscription_events = events_tx.clone();
+    let selected_subscription_handle = handle.clone();
+    window.on_playlist_subscription_selected_requested(move |id| {
+        let store = selected_subscription_store.clone();
+        let review = selected_subscription_review.clone();
+        let weak_window = selected_subscription_window.clone();
+        let events = selected_subscription_events.clone();
+        let id = id.to_string();
+        selected_subscription_handle.spawn(async move {
+            if let Err(error) =
+                refresh_playlist_subscription_view(&store, &review, weak_window, Some(id)).await
+            {
+                error!(%error, "select playlist subscription");
+                let _ = events.send(UiEvent::Status(format!(
+                    "Could not load this playlist's archive: {error}"
+                )));
+            }
+        });
+    });
+
+    let check_subscription_store = store.clone();
+    let check_subscription_engine = engine.clone();
+    let check_subscription_review = playlist_subscription_review.clone();
+    let check_subscription_window = window.as_weak();
+    let check_subscription_events = events_tx.clone();
+    let check_subscription_handle = handle.clone();
+    let check_subscription_active = playlist_subscription_check_active.clone();
+    window.on_playlist_subscription_check_requested(move |id| {
+        let id = id.to_string();
+        let store = check_subscription_store.clone();
+        let engine = check_subscription_engine.clone();
+        let review = check_subscription_review.clone();
+        let weak_window = check_subscription_window.clone();
+        let events = check_subscription_events.clone();
+        let Some(check_guard) = PlaylistSubscriptionCheckGuard::start(
+            &check_subscription_active,
+            check_subscription_window.clone(),
+        ) else {
+            let _ = events.send(UiEvent::Status(
+                "A playlist check is already running. Wait for it to finish before checking again."
+                    .to_owned(),
+            ));
+            return;
+        };
+        check_subscription_handle.spawn(async move {
+            let _check_guard = check_guard;
+            let _ =
+                events.send(UiEvent::Status("Checking the playlist for new entries…".to_owned()));
+            match perform_playlist_subscription_check(&store, &engine, &id).await {
+                Ok(new_count) => {
+                    let message = if new_count == 0 {
+                        "Playlist checked. No new entries were found.".to_owned()
+                    } else {
+                        format!(
+                            "Found {new_count} new playlist {}. Review them before queueing.",
+                            plural_word(new_count, "entry", "entries")
+                        )
+                    };
+                    let _ = events.send(UiEvent::Status(message));
+                }
+                Err(error) => {
+                    let _ = store
+                        .record_playlist_subscription_error(id.clone(), error.to_string(), now())
+                        .await;
+                    error!(%error, subscription_id = %id, "check playlist subscription");
+                    let _ = events
+                        .send(UiEvent::Status(format!("Could not check this playlist: {error}")));
+                }
+            }
+            if let Err(error) =
+                refresh_playlist_subscription_view(&store, &review, weak_window, Some(id)).await
+            {
+                error!(%error, "refresh checked playlist subscription");
+            }
+        });
+    });
+
+    let delete_subscription_store = store.clone();
+    let delete_subscription_review = playlist_subscription_review.clone();
+    let delete_subscription_window = window.as_weak();
+    let delete_subscription_events = events_tx.clone();
+    let delete_subscription_handle = handle.clone();
+    window.on_playlist_subscription_delete_requested(move |id| {
+        let id = id.to_string();
+        let store = delete_subscription_store.clone();
+        let review = delete_subscription_review.clone();
+        let weak_window = delete_subscription_window.clone();
+        let events = delete_subscription_events.clone();
+        delete_subscription_handle.spawn(async move {
+            match store.delete_playlist_subscription(id.clone()).await {
+                Ok(true) => {
+                    let _ = events.send(UiEvent::Status(
+                        "Removed the saved playlist and its tracking archive. Downloaded files and queue history were kept.".to_owned(),
+                    ));
+                    if let Err(error) = refresh_playlist_subscription_view(&store, &review, weak_window, None).await {
+                        error!(%error, "refresh subscriptions after removal");
+                    }
+                }
+                Ok(false) => {
+                    let _ = events.send(UiEvent::Status("That playlist subscription no longer exists.".to_owned()));
+                }
+                Err(error) => {
+                    error!(%error, subscription_id = %id, "remove playlist subscription");
+                    let _ = events.send(UiEvent::Status(format!("Could not remove the subscription: {error}")));
+                }
+            }
+        });
+    });
+
+    let toggle_subscription_review = playlist_subscription_review.clone();
+    let toggle_subscription_window = window.as_weak();
+    let toggle_subscription_events = events_tx.clone();
+    window.on_playlist_subscription_entry_toggle_requested(move |media_key| {
+        let media_key = media_key.to_string();
+        let snapshot = match toggle_subscription_review.lock() {
+            Ok(mut review) => {
+                if review.entries.iter().any(|entry| {
+                    entry.media_key == media_key && entry.state == "new" && entry.available
+                }) && !review.selected_media_keys.remove(&media_key)
+                {
+                    review.selected_media_keys.insert(media_key.clone());
+                }
+                Some(review.clone())
+            }
+            Err(_) => None,
+        };
+        let Some(snapshot) = snapshot else {
+            let _ = toggle_subscription_events
+                .send(UiEvent::Status("Playlist review state is unavailable.".to_owned()));
+            return;
+        };
+        let rows =
+            playlist_subscription_entry_rows(&snapshot.entries, &snapshot.selected_media_keys);
+        let summary = if snapshot.selected_media_keys.is_empty() {
+            "Select new entries to queue or dismiss them.".to_owned()
+        } else {
+            format!(
+                "{} new {} selected",
+                snapshot.selected_media_keys.len(),
+                plural_word(snapshot.selected_media_keys.len(), "entry", "entries")
+            )
+        };
+        let selected_count = i32::try_from(snapshot.selected_media_keys.len()).unwrap_or(i32::MAX);
+        let weak = toggle_subscription_window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_playlist_subscription_entries(ModelRc::new(VecModel::from(rows)));
+                window.set_subscription_selection_summary(summary.into());
+                window.set_playlist_subscription_selected_count(selected_count);
+            }
+        });
+    });
+
+    let dismiss_subscription_store = store.clone();
+    let dismiss_subscription_review = playlist_subscription_review.clone();
+    let dismiss_subscription_window = window.as_weak();
+    let dismiss_subscription_events = events_tx.clone();
+    let dismiss_subscription_handle = handle.clone();
+    window.on_playlist_subscription_dismiss_selected_requested(move || {
+        let snapshot = dismiss_subscription_review.lock().ok().map(|review| review.clone());
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        if snapshot.subscription_id.is_empty() || snapshot.selected_media_keys.is_empty() {
+            return;
+        }
+        let store = dismiss_subscription_store.clone();
+        let review = dismiss_subscription_review.clone();
+        let weak_window = dismiss_subscription_window.clone();
+        let events = dismiss_subscription_events.clone();
+        let keys = snapshot.selected_media_keys.into_iter().collect::<Vec<_>>();
+        let id = snapshot.subscription_id;
+        dismiss_subscription_handle.spawn(async move {
+            match store.dismiss_playlist_subscription_entries(id.clone(), keys, now()).await {
+                Ok(count) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Dismissed {count} new playlist {}.",
+                        plural_word(count, "entry", "entries")
+                    )));
+                    if let Err(error) =
+                        refresh_playlist_subscription_view(&store, &review, weak_window, Some(id))
+                            .await
+                    {
+                        error!(%error, "refresh dismissed playlist entries");
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "dismiss new playlist entries");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not dismiss selected entries: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
+    let queue_subscription_store = store.clone();
+    let queue_subscription_review = playlist_subscription_review.clone();
+    let queue_subscription_window = window.as_weak();
+    let queue_subscription_events = events_tx.clone();
+    let queue_subscription_handle = handle.clone();
+    let queue_subscription_wake = queue_wake.clone();
+    window.on_playlist_subscription_queue_selected_requested(move || {
+        let snapshot = queue_subscription_review.lock().ok().map(|review| review.clone());
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let Some(subscription) = snapshot.subscription.clone() else {
+            return;
+        };
+        let selected_entries = snapshot
+            .entries
+            .iter()
+            .filter(|entry| snapshot.selected_media_keys.contains(&entry.media_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected_entries.is_empty() {
+            return;
+        }
+        let (
+            audio_only,
+            subtitle_only,
+            audio_format,
+            audio_quality,
+            video_quality,
+            directory,
+            scheduled,
+            local_time,
+        ) = queue_subscription_window
+            .upgrade()
+            .map(|window| {
+                (
+                    window.get_audio_only(),
+                    window.get_subtitle_only(),
+                    window.get_audio_format().to_string(),
+                    window.get_audio_quality().to_string(),
+                    window.get_video_quality().to_string(),
+                    window.get_download_directory().to_string(),
+                    window.get_schedule_download(),
+                    window.get_schedule_local_time().to_string(),
+                )
+            })
+            .unwrap_or_default();
+        if subtitle_only {
+            let _ = queue_subscription_events.send(UiEvent::Status(
+                "Subtitle-only playlist batches are not available yet. Choose Video or Audio only."
+                    .to_owned(),
+            ));
+            return;
+        }
+        let scheduled_at = if scheduled {
+            match parse_local_schedule(&local_time, now()) {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    let _ = queue_subscription_events.send(UiEvent::Status(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let presets = DownloadPresets::from_ui_values(
+            audio_only,
+            &audio_format,
+            &audio_quality,
+            &video_quality,
+        );
+        let store = queue_subscription_store.clone();
+        let review = queue_subscription_review.clone();
+        let weak_window = queue_subscription_window.clone();
+        let events = queue_subscription_events.clone();
+        let queue_wake = queue_subscription_wake.clone();
+        let handle = queue_subscription_handle.clone();
+        handle.spawn(async move {
+            let destination = match tokio::task::spawn_blocking(move || {
+                validate_download_directory(Path::new(&directory))
+            })
+            .await
+            {
+                Ok(Ok(path)) => path.to_string_lossy().into_owned(),
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not use the selected save folder: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not validate the selected save folder: {error}"
+                    )));
+                    return;
+                }
+            };
+            let group_id = Uuid::new_v4().to_string();
+            let items = selected_entries
+                .into_iter()
+                .map(|entry| {
+                    let mut record = DownloadRecord::queued(
+                        Uuid::new_v4().to_string(),
+                        entry.media_url.clone(),
+                        now(),
+                    );
+                    record.title = entry.title;
+                    record.source = subscription.source.clone();
+                    record.playlist_group_id = Some(group_id.clone());
+                    record.playlist_group_title = Some(subscription.title.clone());
+                    record.download_mode = presets.mode;
+                    record.audio_format = presets.audio_format;
+                    record.audio_quality = presets.audio_quality;
+                    record.video_quality = presets.video_quality;
+                    record.scheduled_at = scheduled_at;
+                    if scheduled_at.is_some() {
+                        record.status = "Waiting for schedule".to_owned();
+                    }
+                    record.download_directory = destination.clone();
+                    PlaylistSubscriptionQueueItem { media_key: entry.media_key, record }
+                })
+                .collect::<Vec<_>>();
+            match store.queue_playlist_subscription_entries(subscription.id.clone(), items).await {
+                Ok(count) => {
+                    if let Err(error) = store.set_download_presets(presets, now()).await {
+                        error!(%error, "save new download presets after subscription queue");
+                    }
+                    let _ = events.send(UiEvent::Refresh);
+                    let message = if let Some(timestamp) = scheduled_at {
+                        format!(
+                            "Scheduled {count} new playlist {} for {} local time.",
+                            plural_word(count, "entry", "entries"),
+                            format_local_schedule(timestamp)
+                        )
+                    } else {
+                        format!(
+                            "Queued {count} new playlist {} from the subscription.",
+                            plural_word(count, "entry", "entries")
+                        )
+                    };
+                    let _ = events.send(UiEvent::Status(message));
+                    queue_wake.notify_one();
+                    if let Err(error) = refresh_playlist_subscription_view(
+                        &store,
+                        &review,
+                        weak_window,
+                        Some(subscription.id),
+                    )
+                    .await
+                    {
+                        error!(%error, "refresh queued playlist subscription entries");
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "queue new playlist subscription entries");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not queue new playlist entries: {error}"
+                    )));
+                }
+            }
+        });
     });
 
     window.on_enqueue_requested(move |submitted_url| {
@@ -4409,6 +5183,41 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_entry_identity_falls_back_when_extractor_id_is_blank() {
+        let entries = vec![
+            PlaylistMediaEntry {
+                media_id: Some("  ".to_owned()),
+                media_url: " https://example.test/one ".to_owned(),
+                playlist_index: Some(1),
+                title: "One".to_owned(),
+                available: true,
+            },
+            PlaylistMediaEntry {
+                media_id: Some(" video-two ".to_owned()),
+                media_url: "https://example.test/two".to_owned(),
+                playlist_index: Some(2),
+                title: "Two".to_owned(),
+                available: true,
+            },
+            PlaylistMediaEntry {
+                media_id: None,
+                media_url: String::new(),
+                playlist_index: Some(3),
+                title: "Not addressable".to_owned(),
+                available: false,
+            },
+        ];
+
+        let inputs = playlist_subscription_entry_inputs(" Example ", &entries);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].media_key, "url:https://example.test/one");
+        assert_eq!(inputs[0].media_id, None);
+        assert_eq!(inputs[0].media_url, "https://example.test/one");
+        assert_eq!(inputs[1].media_key, "example:video-two");
+        assert_eq!(inputs[1].media_id.as_deref(), Some("video-two"));
+    }
 
     #[test]
     fn automatic_retry_backoff_doubles_and_caps_at_four_minutes() {

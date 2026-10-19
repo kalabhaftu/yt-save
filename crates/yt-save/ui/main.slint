@@ -36,6 +36,24 @@ struct LibraryRowData {
     path-available: bool,
 }
 
+struct PlaylistSubscriptionRowData {
+    id: string,
+    title: string,
+    source: string,
+    url: string,
+    summary: string,
+    selected: bool,
+}
+
+struct PlaylistSubscriptionEntryRowData {
+    media-key: string,
+    title: string,
+    detail: string,
+    state: string,
+    selectable: bool,
+    selected: bool,
+}
+
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
@@ -101,6 +119,13 @@ export component MainWindow inherits Window {
     in-out property <string> auto-retry-attempts: "3";
     in-out property <string> history-search: "";
     in-out property <bool> show-library: false;
+    in-out property <bool> show-subscriptions: false;
+    in-out property <string> selected-subscription-id: "";
+    in-out property <string> selected-subscription-title: "";
+    in-out property <string> selected-subscription-details: "Choose a saved playlist to review its archive.";
+    in-out property <string> subscription-selection-summary: "";
+    in-out property <bool> subscription-checking: false;
+    in-out property <int> playlist-subscription-selected-count: 0;
     in-out property <string> library-search: "";
     in-out property <string> library-filter: "All files";
     in-out property <string> library-sort: "Newest first";
@@ -121,6 +146,8 @@ export component MainWindow inherits Window {
     in-out property <string> playlist-range-end: "50";
     in property <[DownloadRowData]> downloads: [];
     in property <[LibraryRowData]> library-entries: [];
+    in property <[PlaylistSubscriptionRowData]> playlist-subscriptions: [];
+    in property <[PlaylistSubscriptionEntryRowData]> playlist-subscription-entries: [];
 
     callback analyze-requested(string);
     callback enqueue-requested(string);
@@ -128,6 +155,14 @@ export component MainWindow inherits Window {
     callback playlist-selection-set-requested(bool);
     callback playlist-range-selection-requested(string, string);
     callback enqueue-selected-playlist-entries-requested();
+    callback subscribe-playlist-requested();
+    callback subscriptions-view-requested(bool);
+    callback playlist-subscription-selected-requested(string);
+    callback playlist-subscription-check-requested(string);
+    callback playlist-subscription-delete-requested(string);
+    callback playlist-subscription-entry-toggle-requested(string);
+    callback playlist-subscription-queue-selected-requested();
+    callback playlist-subscription-dismiss-selected-requested();
     callback clipboard-monitoring-requested(bool);
     callback clipboard-candidate-dismissed();
     callback close-to-tray-requested(bool);
@@ -197,6 +232,10 @@ export component MainWindow inherits Window {
 
     changed show-library => {
         root.library-view-requested(root.show-library);
+    }
+
+    changed show-subscriptions => {
+        root.subscriptions-view-requested(root.show-subscriptions);
     }
 
     VerticalLayout {
@@ -276,14 +315,14 @@ export component MainWindow inherits Window {
                     Rectangle {
                         height: 42px;
                         border-radius: 9px;
-                        background: root.show-library ? #171b28 : #23243a;
+                        background: !root.show-library && !root.show-subscriptions ? #23243a : #171b28;
                         HorizontalLayout {
                             padding-left: 12px;
                             spacing: 10px;
                             Text { text: "↓"; color: #a79aff; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "Downloads"; color: root.show-library ? #aab2c8 : #f4f2ff; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                            Text { text: "Downloads"; color: !root.show-library && !root.show-subscriptions ? #f4f2ff : #aab2c8; font-size: 14px; font-weight: 600; vertical-alignment: center; }
                         }
-                        TouchArea { clicked => { root.show-library = false; } }
+                        TouchArea { clicked => { root.show-library = false; root.show-subscriptions = false; } }
                     }
 
                     Rectangle {
@@ -296,7 +335,20 @@ export component MainWindow inherits Window {
                             Text { text: "▣"; color: #a79aff; font-size: 16px; vertical-alignment: center; }
                             Text { text: "Library"; color: root.show-library ? #f4f2ff : #aab2c8; font-size: 14px; font-weight: 600; vertical-alignment: center; }
                         }
-                        TouchArea { clicked => { root.show-library = true; } }
+                        TouchArea { clicked => { root.show-library = true; root.show-subscriptions = false; } }
+                    }
+
+                    Rectangle {
+                        height: 42px;
+                        border-radius: 9px;
+                        background: root.show-subscriptions ? #23243a : #171b28;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 10px;
+                            Text { text: "↻"; color: #a79aff; font-size: 17px; vertical-alignment: center; }
+                            Text { text: "Subscriptions"; color: root.show-subscriptions ? #f4f2ff : #aab2c8; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                        }
+                        TouchArea { clicked => { root.show-library = false; root.show-subscriptions = true; } }
                     }
 
                     Rectangle { vertical-stretch: 1; }
@@ -544,7 +596,165 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if !root.show-library : VerticalLayout {
+                if root.show-subscriptions : VerticalLayout {
+                    padding-top: 24px;
+                    padding-bottom: 24px;
+                    padding-left: 36px;
+                    padding-right: 36px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+                            spacing: 4px;
+                            Text { text: "Playlist subscriptions"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
+                            Text {
+                                text: "Check saved playlists manually. New entries wait here for your review; local files are never removed.";
+                                color: #8c94aa;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
+                        ActionButton {
+                            label: root.subscription-checking ? "Checking…" : "Check now";
+                            is-enabled: root.selected-subscription-id != "" && !root.subscription-checking;
+                            clicked => { root.playlist-subscription-check-requested(root.selected-subscription-id); }
+                        }
+                        ActionButton {
+                            label: "Queue selected";
+                            primary: true;
+                            is-enabled: root.playlist-subscription-selected-count > 0;
+                            clicked => { root.playlist-subscription-queue-selected-requested(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            width: 292px;
+                            background: #10131c;
+                            border-width: 1px;
+                            border-color: #252a3a;
+                            border-radius: 13px;
+                            if root.playlist-subscriptions.length == 0 : VerticalLayout {
+                                x: 12px;
+                                y: 12px;
+                                width: parent.width - 24px;
+                                height: parent.height - 24px;
+                                alignment: center;
+                                spacing: 8px;
+                                Text { text: "No saved playlists"; color: #d9dce7; font-size: 14px; font-weight: 600; horizontal-alignment: center; }
+                                Text { text: "Analyze a playlist and choose Save subscription."; color: #778099; font-size: 11px; horizontal-alignment: center; wrap: word-wrap; }
+                            }
+                            if root.playlist-subscriptions.length > 0 : ListView {
+                                x: 6px;
+                                y: 6px;
+                                width: parent.width - 12px;
+                                height: parent.height - 12px;
+                                for subscription in root.playlist-subscriptions : Rectangle {
+                                    height: 82px;
+                                    border-radius: 8px;
+                                    background: subscription.selected ? #25243c : #10131c;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 4px;
+                                        Text { text: subscription.title; color: #e4e6ef; font-size: 12px; font-weight: 600; overflow: elide; }
+                                        Text { text: subscription.source + " · " + subscription.summary; color: #8c95ad; font-size: 10px; overflow: elide; }
+                                        Text { text: subscription.url; color: #717a92; font-size: 9px; overflow: elide; }
+                                    }
+                                    TouchArea { clicked => { root.playlist-subscription-selected-requested(subscription.id); } }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: #10131c;
+                            border-width: 1px;
+                            border-color: #252a3a;
+                            border-radius: 13px;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 10px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                        spacing: 3px;
+                                        Text { text: root.selected-subscription-title == "" ? "Review new entries" : root.selected-subscription-title; color: #e4e6ef; font-size: 15px; font-weight: 600; overflow: elide; }
+                                        Text { text: root.selected-subscription-details + " · " + root.subscription-selection-summary; color: #8c95ad; font-size: 10px; overflow: elide; }
+                                    }
+                                    ActionButton {
+                                        label: "Dismiss selected";
+                                        button-height: 32px;
+                                        button-min-width: 120px;
+                                        is-enabled: root.playlist-subscription-selected-count > 0;
+                                        clicked => { root.playlist-subscription-dismiss-selected-requested(); }
+                                    }
+                                    ActionButton {
+                                        label: "Remove";
+                                        button-height: 32px;
+                                        button-min-width: 72px;
+                                        is-enabled: root.selected-subscription-id != "";
+                                        clicked => { root.playlist-subscription-delete-requested(root.selected-subscription-id); }
+                                    }
+                                }
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    background: #0d1017;
+                                    border-width: 1px;
+                                    border-color: #222737;
+                                    border-radius: 9px;
+                                    if root.playlist-subscription-entries.length == 0 : VerticalLayout {
+                                        x: 8px;
+                                        y: 8px;
+                                        width: parent.width - 16px;
+                                        height: parent.height - 16px;
+                                        alignment: center;
+                                        spacing: 7px;
+                                        Text { text: root.selected-subscription-id == "" ? "Select a playlist" : "No archived entries yet"; color: #d9dce7; font-size: 14px; font-weight: 600; horizontal-alignment: center; }
+                                        Text { text: "Choose Check now to look for playlist entries."; color: #778099; font-size: 11px; horizontal-alignment: center; }
+                                    }
+                                    if root.playlist-subscription-entries.length > 0 : ListView {
+                                        x: 6px;
+                                        y: 6px;
+                                        width: parent.width - 12px;
+                                        height: parent.height - 12px;
+                                        for entry in root.playlist-subscription-entries : Rectangle {
+                                            height: 58px;
+                                            background: entry.selected ? #1b1d2e : #0d1017;
+                                            HorizontalLayout {
+                                                padding-left: 10px;
+                                                padding-right: 8px;
+                                                spacing: 10px;
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    min-width: 0px;
+                                                    alignment: center;
+                                                    spacing: 3px;
+                                                    Text { text: entry.title; color: #e4e6ef; font-size: 12px; font-weight: 600; overflow: elide; }
+                                                    Text { text: entry.detail; color: #8c95ad; font-size: 10px; overflow: elide; }
+                                                }
+                                                Text { text: entry.state; color: entry.state == "New" ? #dfb86f : #8c95ad; font-size: 10px; }
+                                                if entry.selectable : ActionButton {
+                                                    label: entry.selected ? "Selected" : "Select";
+                                                    button-height: 28px;
+                                                    button-min-width: 72px;
+                                                    clicked => { root.playlist-subscription-entry-toggle-requested(entry.media-key); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.show-library && !root.show-subscriptions : VerticalLayout {
                     padding-top: 20px;
                     padding-bottom: 20px;
                     padding-left: 36px;
@@ -1005,6 +1215,13 @@ export component MainWindow inherits Window {
                                     primary: true;
                                     is-enabled: root.selected-playlist-count > 0 && !root.subtitle-only;
                                     clicked => { root.enqueue-selected-playlist-entries-requested(); }
+                                }
+                                ActionButton {
+                                    label: "Save subscription";
+                                    button-height: 30px;
+                                    button-min-width: 126px;
+                                    is-enabled: !root.subscription-checking;
+                                    clicked => { root.subscribe-playlist-requested(); }
                                 }
                             }
                             if root.analyzed-is-playlist && root.show-playlist-range-controls : HorizontalLayout {

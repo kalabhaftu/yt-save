@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add manual playlist subscriptions for yt-dlp-supported sources, with archived entry snapshots, stable-ID/URL deduplication, explicit review, selected-entry queueing, and dismissal; no recurring checks are scheduled.
+- Keep subscription archive updates and download queue insertion transactional, preserve downloaded files and history when removing a subscription, and record unavailable playlist entries without queueing them.
+- Add coverage for playlist snapshot updates, queue/dismiss state, migration/reopen, deletion safety, and blank extractor-ID fallback. Windows UI and cross-site runtime acceptance remain pending.
 - Add one-time local date/time scheduling for single downloads and selected playlist entries; scheduled queue rows persist across restart and remain outside worker slots until due.
 - Add scheduled-job pause, resume, cancel, reorder, queue summaries, and history export fields; the app must be running at the scheduled time and does not configure Windows auto-launch.
 - Cover due-time promotion, claim ordering, pause/cancel, schema migration, restart persistence, local-time validation, and scheduled queue presentation. Installed-app timer acceptance remains pending.

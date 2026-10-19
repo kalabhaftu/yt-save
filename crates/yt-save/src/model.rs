@@ -360,6 +360,8 @@ pub struct MediaMetadata {
     #[serde(default)]
     pub playlist_entries: Vec<PlaylistEntry>,
     #[serde(default)]
+    pub subscription_entries: Vec<PlaylistMediaEntry>,
+    #[serde(default)]
     pub manual_subtitle_languages: Vec<String>,
     #[serde(default)]
     pub automatic_subtitle_languages: Vec<String>,
@@ -369,6 +371,15 @@ pub struct MediaMetadata {
 pub struct PlaylistEntry {
     pub playlist_index: Option<i64>,
     pub title: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaylistMediaEntry {
+    pub media_id: Option<String>,
+    pub media_url: String,
+    pub playlist_index: Option<i64>,
+    pub title: String,
+    pub available: bool,
 }
 
 impl MediaMetadata {
@@ -397,6 +408,34 @@ impl MediaMetadata {
                 })
                 .collect()
         });
+        let subscription_entries = entries.map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .filter(|entry| entry.is_object())
+                .map(|entry| {
+                    let media_url = ["webpage_url", "original_url", "url"]
+                        .into_iter()
+                        .filter_map(|field| text(entry, field))
+                        .find(|candidate| is_http_url(candidate))
+                        .unwrap_or_default();
+                    let explicitly_unavailable =
+                        text(entry, "availability").is_some_and(|availability| {
+                            matches!(
+                                availability.to_ascii_lowercase().as_str(),
+                                "unavailable" | "private" | "needs_auth" | "premium_only"
+                            )
+                        });
+                    PlaylistMediaEntry {
+                        media_id: text(entry, "id"),
+                        media_url: media_url.clone(),
+                        playlist_index: playlist_index(entry),
+                        title: text(entry, "title")
+                            .unwrap_or_else(|| "Untitled playlist item".to_owned()),
+                        available: !media_url.is_empty() && !explicitly_unavailable,
+                    }
+                })
+                .collect()
+        });
         let title = if selected_playlist_index.is_some() {
             text(first_entry, "title").or_else(|| text(value, "title"))
         } else {
@@ -421,10 +460,17 @@ impl MediaMetadata {
             is_playlist,
             playlist_count: entries.map(Vec::len),
             playlist_entries,
+            subscription_entries,
             manual_subtitle_languages: subtitle_languages(first_entry, "subtitles"),
             automatic_subtitle_languages: subtitle_languages(first_entry, "automatic_captions"),
         }
     }
+}
+
+fn is_http_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+    })
 }
 
 fn subtitle_languages(value: &serde_json::Value, field: &str) -> Vec<String> {
@@ -660,6 +706,28 @@ mod tests {
         assert_eq!(parsed.playlist_entries[2].playlist_index, None);
         assert_eq!(parsed.playlist_entries[3].playlist_index, None);
         assert_eq!(parsed.playlist_entries[4].playlist_index, Some(6));
+    }
+
+    #[test]
+    fn playlist_subscription_entries_keep_stable_ids_and_only_addressable_urls() {
+        let playlist: serde_json::Value = serde_json::from_str(
+            r#"{"title":"Playlist","extractor_key":"Example","entries":[{"id":"one","title":"First","playlist_index":1,"webpage_url":"https://example.test/watch/one"},{"id":"two","title":"Unavailable","playlist_index":2,"url":"two","availability":"unavailable"},{"id":"three","title":"Private","playlist_index":3,"webpage_url":"https://example.test/watch/three","availability":"private"}]}"#,
+        )
+        .unwrap();
+
+        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &playlist,
+            "https://example.test/list",
+            None,
+        );
+
+        assert_eq!(metadata.subscription_entries.len(), 3);
+        assert_eq!(metadata.subscription_entries[0].media_id.as_deref(), Some("one"));
+        assert_eq!(metadata.subscription_entries[0].media_url, "https://example.test/watch/one");
+        assert!(metadata.subscription_entries[0].available);
+        assert!(!metadata.subscription_entries[1].available);
+        assert!(metadata.subscription_entries[1].media_url.is_empty());
+        assert!(!metadata.subscription_entries[2].available);
     }
 
     #[test]

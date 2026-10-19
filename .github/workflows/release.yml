@@ -41,8 +41,10 @@ jobs:
         run: |
           $branding = Get-Content -Raw branding.json | ConvertFrom-Json
           $releaseTag = $env:RELEASE_TAG
-          if ($releaseTag -notmatch '^v\d+\.\d+\.\d+$') { throw "Release tag must use the vMAJOR.MINOR.PATCH format: $releaseTag" }
-          $tagVersion = $releaseTag -replace '^v', ''
+          $releaseInfoJson = & python scripts/release_channel.py --tag $releaseTag
+          if ($LASTEXITCODE -ne 0) { throw "Release tag is not a valid supported SemVer tag: $releaseTag" }
+          $releaseInfo = $releaseInfoJson | ConvertFrom-Json
+          $tagVersion = $releaseInfo.version
           $cargoText = Get-Content -Raw Cargo.toml
           $cargoMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"([^"]+)"')
           if (-not $cargoMatch.Success) { throw "Could not read the workspace version from Cargo.toml." }
@@ -97,4 +99,10 @@ jobs:
           foreach ($asset in $assets) {
             if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Expected release asset is missing: $asset" }
           }
-          gh release create $env:RELEASE_TAG @assets --generate-notes --title $env:RELEASE_TAG --prerelease
+          $releaseArguments = @('release', 'create', $env:RELEASE_TAG) + $assets + @('--generate-notes', '--title', $env:RELEASE_TAG)
+          $releaseInfoJson = & python scripts/release_channel.py --tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw "Release tag is not a valid supported SemVer tag: $env:RELEASE_TAG" }
+          $releaseInfo = $releaseInfoJson | ConvertFrom-Json
+          if ($releaseInfo.channel -eq 'preview') { $releaseArguments += '--prerelease' }
+          & gh @releaseArguments
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed with exit code $LASTEXITCODE." }

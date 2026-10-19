@@ -24,6 +24,12 @@ Modern yt-dlp requires both its external JavaScript challenge solver scripts and
 
 This is an engineering inventory, not a legal opinion. A release must use the exact build and notices that were reviewed, and must not switch to a GPL/nonfree FFmpeg variant without updating the decision and redistribution materials.
 
+## Rust dependency license and source policy
+
+`deny.toml` is the machine-checked policy for the Rust dependency graph used by the x64 Windows build. The CI security workflow runs `cargo deny check licenses sources` against the committed lockfile, including development and build dependencies. It allows the permissive license identifiers present in the current locked Windows graph and the workspace's declared `GPL-3.0-or-later` license. Slint's `GPL-3.0-only` option is permitted only for the current Slint crate family; its commercial `LicenseRef` alternatives are not globally allowed. An added license identifier must be reviewed and explicitly approved before updating the policy.
+
+All registry dependencies must come from the crates.io index. Git dependencies are denied; a future Git dependency must be explicitly allowlisted and pinned to a full revision after review. This source check covers Cargo crates only. The separately bundled yt-dlp, Deno, FFmpeg, and FFprobe binaries remain governed by `dependencies.json`, `THIRD_PARTY_NOTICES.md`, and the binary update procedure above.
+
 ## Update process
 
 1. Review upstream release notes and supported runtime requirements.

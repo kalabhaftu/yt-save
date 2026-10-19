@@ -1,0 +1,53 @@
+# Rust dependency license and source policy for cargo-deny 0.20.x.
+# Keep this allow list aligned with the licenses currently declared by the
+# locked dependency graph; new licenses and non-crates.io sources require review.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[licenses]
+include-dev = true
+include-build = true
+unused-allowed-license = "warn"
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSL-1.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Slint publishes a license expression offering GPL-3.0-only alongside two
+# proprietary LicenseRef alternatives. This project uses Slint's GPL option;
+# allow only that option, and only for the Slint crate family. Do not allow the
+# LicenseRef alternatives globally.
+exceptions = [
+    { crate = "i-slint-backend-selector", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-backend-winit", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-common", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-compiler", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-core", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-core-macros", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-renderer-femtovg", allow = ["GPL-3.0-only"] },
+    { crate = "i-slint-renderer-software", allow = ["GPL-3.0-only"] },
+    { crate = "slint", allow = ["GPL-3.0-only"] },
+    { crate = "slint-build", allow = ["GPL-3.0-only"] },
+    { crate = "slint-macros", allow = ["GPL-3.0-only"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

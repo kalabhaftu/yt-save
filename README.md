@@ -76,6 +76,8 @@ Package the application with both source definitions:
 
 `scripts/build_windows_package.ps1` builds the app, assembles verified dependencies under `target\package\bin`, and invokes WiX and Inno Setup. It reports missing packaging tools rather than producing placeholder installers. The GitHub release workflow installs the tools and publishes installers only after all build steps succeed.
 
+New plain `vMAJOR.MINOR.PATCH` tags publish stable releases; SemVer prerelease tags such as `v1.2.0-preview.1` publish preview releases. Existing releases retain their previously selected GitHub channel. The current app does not yet include an application-update checker; its Engine Status updater applies only to yt-dlp.
+
 Both installers use the same per-machine program location and per-user application data location. An installer marker prevents MSI and Inno Setup installs from being layered over each other; uninstall the current package before switching installer types. Uninstall removes application files but preserves downloaded media and application data.
 
 ## Development

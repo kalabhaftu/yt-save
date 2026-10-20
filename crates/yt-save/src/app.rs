@@ -207,6 +207,11 @@ struct PlaylistSubscriptionCheckGuard {
     window: slint::Weak<MainWindow>,
 }
 
+struct BatchEnqueueGuard {
+    active: Arc<AtomicBool>,
+    window: slint::Weak<MainWindow>,
+}
+
 impl PlaylistSubscriptionCheckGuard {
     fn start(active: &Arc<AtomicBool>, window: slint::Weak<MainWindow>) -> Option<Self> {
         active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
@@ -227,6 +232,31 @@ impl Drop for PlaylistSubscriptionCheckGuard {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak.upgrade() {
                 window.set_subscription_checking(false);
+            }
+        });
+    }
+}
+
+impl BatchEnqueueGuard {
+    fn start(active: &Arc<AtomicBool>, window: slint::Weak<MainWindow>) -> Option<Self> {
+        active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        let weak = window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_batch_enqueue_in_progress(true);
+            }
+        });
+        Some(Self { active: active.clone(), window })
+    }
+}
+
+impl Drop for BatchEnqueueGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        let weak = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_batch_enqueue_in_progress(false);
             }
         });
     }
@@ -1485,6 +1515,8 @@ pub fn run() -> Result<()> {
     let enqueue_queue_wake = queue_wake.clone();
     let update_dispatch_gate = Arc::new(AsyncMutex::new(()));
     let enqueue_dispatch_gate = update_dispatch_gate.clone();
+    let batch_dispatch_gate = enqueue_dispatch_gate.clone();
+    let batch_shutdown = enqueue_shutdown_started.clone();
     let _ = runtime.block_on(recover_pending(&store))?;
     let dispatcher_shutdown_started = shutdown_started.clone();
     let dispatcher_shutdown_committed = shutdown_committed.clone();
@@ -2983,6 +3015,234 @@ pub fn run() -> Result<()> {
             };
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status(preset_status));
+            queue_wake.notify_one();
+        });
+    });
+
+    let batch_store = store.clone();
+    let batch_engine = engine.clone();
+    let batch_events = events_tx.clone();
+    let batch_wake = queue_wake.clone();
+    let batch_handle = handle.clone();
+    let batch_window = window.as_weak();
+    let batch_in_progress = Arc::new(AtomicBool::new(false));
+    let batch_in_progress_handler = batch_in_progress.clone();
+    window.on_enqueue_batch_requested(move |submitted_urls| {
+        if batch_shutdown.load(Ordering::Acquire) {
+            let _ =
+                batch_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
+        let parsed = match parse_batch_urls(&submitted_urls) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                let _ = batch_events.send(UiEvent::Status(message));
+                return;
+            }
+        };
+        let total_count = parsed.urls.len() + parsed.issues.len();
+        let inspection_count = parsed.urls.len();
+        let Some((
+            audio_only,
+            subtitle_only,
+            selected_subtitle_languages,
+            selected_subtitle_format,
+            include_auto_subtitles,
+            selected_format,
+            selected_quality,
+            selected_video_quality,
+            selected_directory,
+            schedule_enabled,
+            schedule_local_time,
+        )) = batch_window.upgrade().map(|window| {
+            (
+                window.get_audio_only(),
+                window.get_subtitle_only(),
+                window.get_subtitle_languages().to_string(),
+                window.get_subtitle_format().to_string(),
+                window.get_include_auto_subtitles(),
+                window.get_audio_format().to_string(),
+                window.get_audio_quality().to_string(),
+                window.get_video_quality().to_string(),
+                window.get_download_directory().to_string(),
+                window.get_schedule_download(),
+                window.get_schedule_local_time().to_string(),
+            )
+        })
+        else {
+            let _ = batch_events
+                .send(UiEvent::Status("The download window is unavailable.".to_owned()));
+            return;
+        };
+        let scheduled_at = if schedule_enabled {
+            match parse_local_schedule(&schedule_local_time, now()) {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    let _ = batch_events.send(UiEvent::Status(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let normalized_subtitle_languages = if subtitle_only {
+            match normalize_subtitle_languages(&selected_subtitle_languages) {
+                Some(languages) => languages,
+                None => {
+                    let _ = batch_events.send(UiEvent::Status(
+                        "Enter one or more subtitle language codes, such as en or en,fr."
+                            .to_owned(),
+                    ));
+                    return;
+                }
+            }
+        } else {
+            "en".to_owned()
+        };
+        let download_presets = DownloadPresets::from_ui_values(
+            audio_only,
+            &selected_format,
+            &selected_quality,
+            &selected_video_quality,
+        );
+        let subtitle_format =
+            SubtitleFormat::from_database_value(&selected_subtitle_format).unwrap_or_default();
+        let Some(batch_guard) =
+            BatchEnqueueGuard::start(&batch_in_progress_handler, batch_window.clone())
+        else {
+            let _ = batch_events.send(UiEvent::Status(
+                "A media-link batch is already being checked.".to_owned(),
+            ));
+            return;
+        };
+        let store = batch_store.clone();
+        let engine = batch_engine.clone();
+        let events = batch_events.clone();
+        let queue_wake = batch_wake.clone();
+        let dispatch_gate = batch_dispatch_gate.clone();
+        let shutdown = batch_shutdown.clone();
+        batch_handle.spawn(async move {
+            let _batch_guard = batch_guard;
+            let destination = match tokio::task::spawn_blocking(move || {
+                validate_download_directory(Path::new(&selected_directory))
+            })
+            .await
+            {
+                Ok(Ok(path)) => path,
+                Ok(Err(error)) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not use the selected save folder: {error}"
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not validate the selected save folder: {error}"
+                    )));
+                    return;
+                }
+            };
+            let settings = BatchDownloadSettings {
+                presets: if subtitle_only {
+                    DownloadPresets { mode: DownloadMode::SubtitlesOnly, ..download_presets }
+                } else {
+                    download_presets
+                },
+                subtitle_languages: normalized_subtitle_languages,
+                subtitle_format,
+                include_auto_subtitles,
+                scheduled_at,
+                download_directory: destination.to_string_lossy().into_owned(),
+            };
+            let mut issues = parsed.issues;
+            let mut records = Vec::with_capacity(parsed.urls.len());
+            for (index, item) in parsed.urls.into_iter().enumerate() {
+                if shutdown.load(Ordering::Acquire) {
+                    let _ = events.send(UiEvent::Status(
+                        "Batch checking stopped because Yt Save is shutting down; no links from this batch were queued."
+                            .to_owned(),
+                    ));
+                    return;
+                }
+                let _ = events.send(UiEvent::Status(format!(
+                    "Checking link on line {} ({} of {}) before adding the batch…",
+                    item.line_number,
+                    index + 1,
+                    inspection_count
+                )));
+                match engine.inspect(&item.url).await {
+                    Ok(metadata) if metadata.is_playlist => {
+                        issues.push(format!(
+                            "line {}: playlist links need entry review; add them separately",
+                            item.line_number
+                        ));
+                    }
+                    Ok(metadata) => {
+                        if settings.presets.mode == DownloadMode::SubtitlesOnly {
+                            let mut available = metadata.manual_subtitle_languages.clone();
+                            if settings.include_auto_subtitles {
+                                available
+                                    .extend(metadata.automatic_subtitle_languages.iter().cloned());
+                            }
+                            if !subtitle_languages_available(
+                                &settings.subtitle_languages,
+                                &available,
+                            ) {
+                                issues.push(format!(
+                                    "line {}: selected subtitle language(s) are unavailable",
+                                    item.line_number
+                                ));
+                                continue;
+                            }
+                        }
+                        records.push(queued_batch_record(
+                            item.url,
+                            metadata.title,
+                            metadata.source,
+                            now(),
+                            &settings,
+                        ));
+                    }
+                    Err(_) => {
+                        issues.push(format!(
+                            "line {}: yt-dlp could not read this media link",
+                            item.line_number
+                        ));
+                    }
+                }
+            }
+
+            if records.is_empty() {
+                let _ = events.send(UiEvent::Status(batch_result_status(
+                    0,
+                    total_count,
+                    &issues,
+                    scheduled_at,
+                )));
+                return;
+            }
+            let queued_count = records.len();
+            let _dispatch_guard = dispatch_gate.lock().await;
+            if shutdown.load(Ordering::Acquire) {
+                let _ = events.send(UiEvent::Status(
+                    "The links were not queued because Yt Save is shutting down.".to_owned(),
+                ));
+                return;
+            }
+            if let Err(error) = store.save_downloads(records).await {
+                error!(%error, "persist validated media URL batch");
+                let _ = events.send(UiEvent::Refresh);
+                let _ = events
+                    .send(UiEvent::Status(format!("Could not save the media link batch: {error}")));
+                return;
+            }
+            let preset_save_error = store.set_download_presets(download_presets, now()).await.err();
+            let mut status = batch_result_status(queued_count, total_count, &issues, scheduled_at);
+            if let Some(error) = preset_save_error {
+                status.push_str(&format!(" New download presets could not be saved: {error}"));
+            }
+            let _ = events.send(UiEvent::Refresh);
+            let _ = events.send(UiEvent::Status(status));
             queue_wake.notify_one();
         });
     });
@@ -5699,6 +5959,117 @@ fn validate_url(value: &str) -> std::result::Result<String, String> {
     Ok(parsed.to_string())
 }
 
+const MAX_BATCH_URLS: usize = 100;
+
+#[derive(Debug, PartialEq, Eq)]
+struct BatchUrl {
+    line_number: usize,
+    url: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedBatchUrls {
+    urls: Vec<BatchUrl>,
+    issues: Vec<String>,
+}
+
+fn parse_batch_urls(value: &str) -> std::result::Result<ParsedBatchUrls, String> {
+    let mut parsed = ParsedBatchUrls { urls: Vec::new(), issues: Vec::new() };
+    let mut seen = HashSet::new();
+    let mut nonempty_lines = 0;
+
+    for (index, line) in value.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        nonempty_lines += 1;
+        if nonempty_lines > MAX_BATCH_URLS {
+            return Err(format!("Paste no more than {MAX_BATCH_URLS} media URLs at a time."));
+        }
+
+        match validate_url(line) {
+            Ok(url) if seen.insert(url.clone()) => {
+                parsed.urls.push(BatchUrl { line_number: index + 1, url });
+            }
+            Ok(_) => parsed.issues.push(format!("line {}: duplicate URL skipped", index + 1)),
+            Err(message) => parsed.issues.push(format!("line {}: {message}", index + 1)),
+        }
+    }
+
+    if parsed.urls.is_empty() {
+        let detail = parsed.issues.first().map_or_else(
+            || "Paste one HTTP(S) media URL per line.".to_owned(),
+            |issue| format!("No valid media URLs found. {issue}."),
+        );
+        return Err(detail);
+    }
+
+    Ok(parsed)
+}
+
+#[derive(Clone)]
+struct BatchDownloadSettings {
+    presets: DownloadPresets,
+    subtitle_languages: String,
+    subtitle_format: SubtitleFormat,
+    include_auto_subtitles: bool,
+    scheduled_at: Option<i64>,
+    download_directory: String,
+}
+
+fn queued_batch_record(
+    url: String,
+    title: String,
+    source: String,
+    created_at: i64,
+    settings: &BatchDownloadSettings,
+) -> DownloadRecord {
+    let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, created_at);
+    record.title = title;
+    record.source = source;
+    record.download_mode = settings.presets.mode;
+    record.audio_format = settings.presets.audio_format;
+    record.audio_quality = settings.presets.audio_quality;
+    record.video_quality = settings.presets.video_quality;
+    record.subtitle_languages = settings.subtitle_languages.clone();
+    record.subtitle_format = settings.subtitle_format;
+    record.include_auto_subtitles = settings.include_auto_subtitles;
+    record.scheduled_at = settings.scheduled_at;
+    record.download_directory = settings.download_directory.clone();
+    if settings.scheduled_at.is_some() {
+        record.status = "Waiting for schedule".to_owned();
+    }
+    record
+}
+
+fn batch_result_status(
+    queued_count: usize,
+    total_count: usize,
+    issues: &[String],
+    scheduled_at: Option<i64>,
+) -> String {
+    let mut message = if queued_count == 0 {
+        "No media links were added.".to_owned()
+    } else if let Some(timestamp) = scheduled_at {
+        format!(
+            "Scheduled {queued_count} of {total_count} links for {} local time.",
+            format_local_schedule(timestamp)
+        )
+    } else {
+        format!("Added {queued_count} of {total_count} links to the queue.")
+    };
+
+    if !issues.is_empty() {
+        message.push_str(" Skipped: ");
+        message.push_str(&issues.iter().take(4).cloned().collect::<Vec<_>>().join("; "));
+        if issues.len() > 4 {
+            message.push_str(&format!("; and {} more", issues.len() - 4));
+        }
+    }
+    message
+}
+
 fn row_views(records: &[DownloadRecord]) -> Vec<DownloadRowData> {
     row_views_filtered(records, "")
 }
@@ -7645,6 +8016,77 @@ mod tests {
         );
         assert!(validate_url("file:///C:/private.mp4").is_err());
         assert!(validate_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn batch_url_parser_handles_crlf_blanks_duplicates_and_line_errors() {
+        let parsed = parse_batch_urls(
+            "\r\n https://Media.example/watch/one \r\nhttps://media.example/watch/one\nftp://media.example/audio\nnot a url\nhttps://peer.example/video\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.urls,
+            [
+                BatchUrl { line_number: 2, url: "https://media.example/watch/one".to_owned() },
+                BatchUrl { line_number: 6, url: "https://peer.example/video".to_owned() },
+            ]
+        );
+        assert_eq!(
+            parsed.issues,
+            [
+                "line 3: duplicate URL skipped",
+                "line 4: Only http and https media URLs are accepted.",
+                "line 5: Enter a complete http or https URL.",
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_url_parser_rejects_empty_and_oversized_batches() {
+        assert!(parse_batch_urls("\n  \r\n").is_err());
+        assert!(
+            parse_batch_urls("file:///C:/private.mp4\nnot a URL").unwrap_err().contains("line 1")
+        );
+
+        let oversized = std::iter::repeat_n("https://media.example/watch", MAX_BATCH_URLS + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_batch_urls(&oversized).unwrap_err().contains("no more than 100"));
+    }
+
+    #[test]
+    fn queued_batch_records_snapshot_download_settings_and_schedule() {
+        let settings = BatchDownloadSettings {
+            presets: DownloadPresets::from_ui_values(true, "mp3", "192k", "720p"),
+            subtitle_languages: "en,fr".to_owned(),
+            subtitle_format: SubtitleFormat::Srt,
+            include_auto_subtitles: true,
+            scheduled_at: Some(2_000_000_000),
+            download_directory: "C:\\Users\\Example\\Downloads".to_owned(),
+        };
+
+        let record = queued_batch_record(
+            "https://media.example/audio".to_owned(),
+            "Audio title".to_owned(),
+            "Media example".to_owned(),
+            1_900_000_000,
+            &settings,
+        );
+
+        assert_eq!(record.url, "https://media.example/audio");
+        assert_eq!(record.title, "Audio title");
+        assert_eq!(record.source, "Media example");
+        assert_eq!(record.download_mode, settings.presets.mode);
+        assert_eq!(record.audio_format, settings.presets.audio_format);
+        assert_eq!(record.audio_quality, settings.presets.audio_quality);
+        assert_eq!(record.video_quality, settings.presets.video_quality);
+        assert_eq!(record.subtitle_languages, settings.subtitle_languages);
+        assert_eq!(record.subtitle_format, settings.subtitle_format);
+        assert!(record.include_auto_subtitles);
+        assert_eq!(record.scheduled_at, settings.scheduled_at);
+        assert_eq!(record.status, "Waiting for schedule");
+        assert_eq!(record.download_directory, settings.download_directory);
     }
 
     #[test]

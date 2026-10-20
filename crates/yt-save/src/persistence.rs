@@ -2714,6 +2714,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_batch_write_rolls_back_when_a_later_record_is_invalid() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        let first =
+            DownloadRecord::queued("first".to_owned(), "https://example.test/first".to_owned(), 10);
+        let mut invalid = DownloadRecord::queued(
+            "invalid".to_owned(),
+            "https://example.test/invalid".to_owned(),
+            11,
+        );
+        invalid.downloaded_bytes = Some(u64::MAX);
+        let last =
+            DownloadRecord::queued("last".to_owned(), "https://example.test/last".to_owned(), 12);
+
+        assert!(store.save_downloads(vec![first, invalid, last]).await.is_err());
+        assert!(store.list_downloads().await.unwrap().is_empty());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn reordering_pending_rows_does_not_reuse_active_queue_ranks() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
         let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();

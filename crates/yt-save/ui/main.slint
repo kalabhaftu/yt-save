@@ -1,4 +1,4 @@
-import { ComboBox, ListView } from "std-widgets.slint";
+import { ComboBox, ListView, TextEdit } from "std-widgets.slint";
 
 struct DownloadRowData {
     id: string,
@@ -97,6 +97,9 @@ export component MainWindow inherits Window {
     background: #0c0e15;
 
     in-out property <string> url-input: "";
+    in-out property <bool> multiple-links-mode: false;
+    in-out property <string> batch-url-input: "";
+    in-out property <bool> batch-enqueue-in-progress: false;
     in-out property <bool> audio-only: false;
     in-out property <bool> subtitle-only: false;
     in-out property <string> subtitle-languages: "en";
@@ -165,6 +168,7 @@ export component MainWindow inherits Window {
 
     callback analyze-requested(string);
     callback enqueue-requested(string);
+    callback enqueue-batch-requested(string);
     callback playlist-entry-toggle-requested(int);
     callback playlist-selection-set-requested(bool);
     callback playlist-range-selection-requested(string, string);
@@ -896,7 +900,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 388px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 38px : 0px);
+                        height: 388px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 38px : 0px) + (root.multiple-links-mode ? 100px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -905,7 +909,24 @@ export component MainWindow inherits Window {
                         VerticalLayout {
                             padding: 18px;
                             spacing: 8px;
-                            Text { text: "New download"; color: #eff0f7; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                height: 34px;
+                                Text {
+                                    text: "New download";
+                                    color: #eff0f7;
+                                    font-size: 15px;
+                                    font-weight: 600;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                ActionButton {
+                                    label: root.multiple-links-mode ? "Single URL" : "Add multiple links";
+                                    is-enabled: !root.batch-enqueue-in-progress;
+                                    button-height: 30px;
+                                    button-min-width: 132px;
+                                    clicked => { root.multiple-links-mode = !root.multiple-links-mode; }
+                                }
+                            }
                             if root.clipboard-candidate != "" : HorizontalLayout {
                                 height: 30px;
                                 spacing: 8px;
@@ -920,10 +941,15 @@ export component MainWindow inherits Window {
                                 }
                                 ActionButton {
                                     label: "Use";
+                                    is-enabled: !root.batch-enqueue-in-progress;
                                     button-height: 28px;
                                     button-min-width: 54px;
                                     clicked => {
-                                        root.url-input = root.clipboard-candidate;
+                                        if root.multiple-links-mode {
+                                            root.batch-url-input = root.batch-url-input == "" ? root.clipboard-candidate : root.batch-url-input + "\n" + root.clipboard-candidate;
+                                        } else {
+                                            root.url-input = root.clipboard-candidate;
+                                        }
                                         root.clipboard-candidate = "";
                                     }
                                 }
@@ -934,7 +960,46 @@ export component MainWindow inherits Window {
                                     clicked => { root.clipboard-candidate-dismissed(); }
                                 }
                             }
-                            HorizontalLayout {
+                            if root.multiple-links-mode : VerticalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    height: 96px;
+                                    border-radius: 9px;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    TextEdit {
+                                        text <=> root.batch-url-input;
+                                        x: 12px;
+                                        y: 8px;
+                                        width: parent.width - 24px;
+                                        height: parent.height - 16px;
+                                        placeholder-text: "Paste one HTTP(S) media URL per line";
+                                        accessible-placeholder-text: "Paste up to 100 HTTP or HTTPS media URLs, one per line";
+                                        font-size: 13px;
+                                        enabled: !root.batch-enqueue-in-progress;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    height: 38px;
+                                    Text {
+                                        text: "Up to 100 links. Playlist URLs must be reviewed separately.";
+                                        color: #8f98ae;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    ActionButton {
+                                        label: root.batch-enqueue-in-progress ? "Checking links…" : "Add links to queue";
+                                        primary: true;
+                                        is-enabled: !root.batch-enqueue-in-progress;
+                                        button-height: 36px;
+                                        button-min-width: 156px;
+                                        clicked => { root.enqueue-batch-requested(root.batch-url-input); }
+                                    }
+                                }
+                            }
+                            if !root.multiple-links-mode : HorizontalLayout {
                                 spacing: 10px;
                                 Rectangle {
                                     border-radius: 9px;

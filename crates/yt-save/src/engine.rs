@@ -28,6 +28,7 @@ const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
 const SUBTITLE_OUTPUT_PREFIX: &str = "__YT_SAVE_SUBTITLE_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
+pub(crate) const PLAYLIST_PAGE_SIZE: usize = 50;
 
 #[derive(Debug)]
 struct RetryableEngineError(String);
@@ -225,7 +226,32 @@ impl DownloadEngine {
         playlist_index: Option<i64>,
         signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
-        self.inspect_with_playlist_limit_cancellable(url, playlist_index, Some(50), signal).await
+        self.inspect_with_playlist_limit_cancellable(url, playlist_index, None, Some(50), signal)
+            .await
+    }
+
+    pub(crate) async fn inspect_playlist_page(
+        &self,
+        url: &str,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<MediaMetadata> {
+        validate_playlist_page_range(start_index, end_index)?;
+        let (_signal_sender, mut signal) = watch::channel(JobSignal::Continue);
+        match self
+            .inspect_with_playlist_limit_cancellable(
+                url,
+                None,
+                Some(start_index),
+                Some(end_index),
+                &mut signal,
+            )
+            .await?
+        {
+            EngineOutcome::Completed(metadata) => Ok(metadata),
+            EngineOutcome::Paused => bail!("playlist inspection was paused"),
+            EngineOutcome::Canceled => bail!("playlist inspection was canceled"),
+        }
     }
 
     pub(crate) async fn inspect_playlist_for_subscription(
@@ -233,7 +259,10 @@ impl DownloadEngine {
         url: &str,
     ) -> Result<MediaMetadata> {
         let (_signal_sender, mut signal) = watch::channel(JobSignal::Continue);
-        match self.inspect_with_playlist_limit_cancellable(url, None, None, &mut signal).await? {
+        match self
+            .inspect_with_playlist_limit_cancellable(url, None, None, None, &mut signal)
+            .await?
+        {
             EngineOutcome::Completed(metadata) => Ok(metadata),
             EngineOutcome::Paused => bail!("playlist inspection was paused"),
             EngineOutcome::Canceled => bail!("playlist inspection was canceled"),
@@ -244,6 +273,7 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
+        playlist_start: Option<usize>,
         playlist_end: Option<usize>,
         signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
@@ -253,11 +283,8 @@ impl DownloadEngine {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
         self.require_yt_dlp()?;
-        let mut command = if let Some(limit) = playlist_end {
-            self.inspect_command(url, playlist_index, Some(limit))?
-        } else {
-            self.inspect_command(url, playlist_index, None)?
-        };
+        let mut command =
+            self.inspect_command(url, playlist_index, playlist_start, playlist_end)?;
         debug!(host = url_host(url), "requesting yt-dlp metadata");
         let mut child = command.spawn().context("start yt-dlp metadata extraction")?;
         let stdout = child.stdout.take().context("open yt-dlp metadata stdout")?;
@@ -548,10 +575,19 @@ impl DownloadEngine {
         &self,
         url: &str,
         playlist_index: Option<i64>,
+        playlist_start: Option<usize>,
         playlist_end: Option<usize>,
     ) -> Result<Command> {
+        match (playlist_start, playlist_end) {
+            (Some(start), Some(end)) => validate_playlist_page_range(start, end)?,
+            (Some(_), None) => bail!("a playlist page requires both start and end indexes"),
+            (None, _) => {}
+        }
         let mut command = self.base_command();
         command.arg("--no-warnings").arg("--skip-download").arg("--flat-playlist");
+        if let Some(playlist_start) = playlist_start {
+            command.arg("--playlist-start").arg(playlist_start.to_string());
+        }
         if let Some(playlist_end) = playlist_end {
             command.arg("--playlist-end").arg(playlist_end.to_string());
         }
@@ -569,6 +605,20 @@ fn validate_output_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("download destination is unavailable: {}", path.display()))?;
     if !metadata.is_dir() {
         bail!("download destination is not a folder: {}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_playlist_page_range(start_index: usize, end_index: usize) -> Result<()> {
+    if start_index == 0 {
+        bail!("playlist indexes start at 1");
+    }
+    let page_size = end_index
+        .checked_sub(start_index)
+        .and_then(|width| width.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("playlist end index must be at or after its start index"))?;
+    if page_size > PLAYLIST_PAGE_SIZE {
+        bail!("playlist pages cannot contain more than {PLAYLIST_PAGE_SIZE} entries");
     }
     Ok(())
 }
@@ -891,6 +941,59 @@ mod tests {
     }
 
     #[test]
+    fn playlist_page_inspection_uses_global_ranges_and_rejects_unsafe_ranges() {
+        let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let yt_dlp = root.join("yt-dlp.exe");
+        std::fs::write(&yt_dlp, b"test executable placeholder").unwrap();
+        let dependencies = DependencyPaths {
+            directory: root.clone(),
+            yt_dlp,
+            deno: root.join("deno.exe"),
+            ffmpeg: root.join("ffmpeg.exe"),
+            ffprobe: root.join("ffprobe.exe"),
+        };
+        let engine = DownloadEngine::new(dependencies, root.clone());
+        let args = |start, end| {
+            engine
+                .inspect_command("https://example.test/playlist", None, Some(start), Some(end))
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for (start, end) in [(51, 100), (101, 150)] {
+            let arguments = args(start, end);
+            let start_flag =
+                arguments.iter().position(|argument| argument == "--playlist-start").unwrap();
+            let end_flag =
+                arguments.iter().position(|argument| argument == "--playlist-end").unwrap();
+            assert_eq!(
+                arguments.get(start_flag + 1).map(String::as_str),
+                Some(start.to_string().as_str())
+            );
+            assert_eq!(
+                arguments.get(end_flag + 1).map(String::as_str),
+                Some(end.to_string().as_str())
+            );
+        }
+
+        assert!(
+            engine.inspect_command("https://example.test/list", None, Some(0), Some(50)).is_err()
+        );
+        assert!(
+            engine.inspect_command("https://example.test/list", None, Some(51), Some(50)).is_err()
+        );
+        assert!(
+            engine.inspect_command("https://example.test/list", None, Some(1), Some(51)).is_err()
+        );
+        assert!(engine.inspect_command("https://example.test/list", None, Some(1), None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bundled_deno_is_passed_to_yt_dlp_for_full_javascript_support() {
         let root = std::env::temp_dir().join(format!("yt-save-engine-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1127,18 +1230,22 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let ordinary_inspection =
-            args(engine.inspect_command("https://example.test/playlist", None, Some(50)).unwrap());
+        let ordinary_inspection = args(
+            engine.inspect_command("https://example.test/playlist", None, None, Some(50)).unwrap(),
+        );
         assert!(!ordinary_inspection.iter().any(|arg| arg == "--playlist-items"));
 
         let selected_inspection = args(
-            engine.inspect_command("https://example.test/playlist", Some(7), Some(50)).unwrap(),
+            engine
+                .inspect_command("https://example.test/playlist", Some(7), None, Some(50))
+                .unwrap(),
         );
         let inspection_end =
             selected_inspection.iter().position(|arg| arg == "--playlist-end").unwrap();
         assert_eq!(selected_inspection.get(inspection_end + 1).map(String::as_str), Some("50"));
-        let subscription_inspection =
-            args(engine.inspect_command("https://example.test/playlist", None, None).unwrap());
+        let subscription_inspection = args(
+            engine.inspect_command("https://example.test/playlist", None, None, None).unwrap(),
+        );
         assert!(!subscription_inspection.iter().any(|arg| arg == "--playlist-end"));
         let selected_download = args(
             engine
@@ -1154,7 +1261,9 @@ mod tests {
             assert_eq!(arguments.get(option + 1).map(String::as_str), Some("7"));
         }
 
-        assert!(engine.inspect_command("https://example.test/list", Some(0), Some(50)).is_err());
+        assert!(
+            engine.inspect_command("https://example.test/list", Some(0), None, Some(50)).is_err()
+        );
         assert!(
             engine
                 .download_command(

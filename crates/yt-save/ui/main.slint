@@ -154,6 +154,8 @@ export component MainWindow inherits Window {
     in-out property <int> selectable-playlist-count: 0;
     in-out property <string> playlist-selection-summary: "";
     in-out property <bool> show-playlist-range-controls: false;
+    in-out property <bool> playlist-page-loading: false;
+    in-out property <bool> playlist-has-more-entries: false;
     in-out property <string> playlist-range-start: "1";
     in-out property <string> playlist-range-end: "50";
     in property <[DownloadRowData]> downloads: [];
@@ -166,6 +168,7 @@ export component MainWindow inherits Window {
     callback playlist-entry-toggle-requested(int);
     callback playlist-selection-set-requested(bool);
     callback playlist-range-selection-requested(string, string);
+    callback playlist-load-more-requested();
     callback enqueue-selected-playlist-entries-requested();
     callback subscribe-playlist-requested();
     callback subscriptions-view-requested(bool);
@@ -1295,9 +1298,9 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 ActionButton {
-                                    label: "Select all";
+                                    label: "Select loaded";
                                     button-height: 30px;
-                                    button-min-width: 82px;
+                                    button-min-width: 98px;
                                     is-enabled: root.selectable-playlist-count > root.selected-playlist-count;
                                     clicked => { root.playlist-selection-set-requested(true); }
                                 }
@@ -1371,7 +1374,7 @@ export component MainWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                 }
-                                Text { text: "Select a range within the visible playlist preview."; color: #747d96; font-size: 10px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                Text { text: "Missing entries in the range load automatically (up to 50 at a time)."; color: #747d96; font-size: 10px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
                                 ActionButton {
                                     label: "Select range";
                                     button-height: 28px;
@@ -1380,7 +1383,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             if root.analyzed-is-playlist : ListView {
-                                height: root.show-playlist-range-controls ? 111px : 145px;
+                                height: root.show-playlist-range-controls ? 91px : 125px;
                                 for entry in root.playlist-entries: Rectangle {
                                     height: 30px;
                                     background: entry.selected ? #22243a : #121722;
@@ -1410,10 +1413,25 @@ export component MainWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.analyzed-is-playlist : Text {
-                                text: "The preview is capped at 50 entries. Playlist items are queued only after you select them.";
-                                color: #727b92;
-                                font-size: 10px;
+                            if root.analyzed-is-playlist : HorizontalLayout {
+                                height: 26px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.playlist-has-more-entries
+                                        ? "Selections stay checked as more entries load."
+                                        : "All available entries in this playlist are loaded.";
+                                    color: #727b92;
+                                    font-size: 10px;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                if root.playlist-has-more-entries : ActionButton {
+                                    label: root.playlist-page-loading ? "Loading…" : "Load next 50";
+                                    button-height: 24px;
+                                    button-min-width: 108px;
+                                    is-enabled: !root.playlist-page-loading;
+                                    clicked => { root.playlist-load-more-requested(); }
+                                }
                             }
                         }
                     }

@@ -26,8 +26,8 @@ use crate::{
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{
-        DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, ProgressUpdate,
-        is_retryable_engine_error,
+        DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, PLAYLIST_PAGE_SIZE,
+        ProgressUpdate, is_retryable_engine_error,
     },
     history::download_history_csv,
     model::{
@@ -73,6 +73,13 @@ enum UiEvent {
         request_id: u64,
         source_url: String,
         metadata: Box<MediaMetadata>,
+    },
+    PlaylistPage {
+        request_id: u64,
+        start_index: usize,
+        end_index: usize,
+        select_range: Option<(i64, i64)>,
+        result: std::result::Result<Box<MediaMetadata>, String>,
     },
 }
 
@@ -167,11 +174,24 @@ impl Drop for ActiveJobRegistration {
 
 #[derive(Clone)]
 struct PlaylistSelectionState {
+    request_id: u64,
     source_url: String,
     source: String,
     title: String,
     entries: Vec<PlaylistEntry>,
     selected: Vec<bool>,
+    next_page_start: usize,
+    has_more_entries: bool,
+    loading_page: bool,
+}
+
+#[derive(Clone)]
+struct PlaylistPageLoader {
+    selection_state: Arc<Mutex<Option<PlaylistSelectionState>>>,
+    engine: DownloadEngine,
+    handle: tokio::runtime::Handle,
+    events: mpsc::UnboundedSender<UiEvent>,
+    weak_window: slint::Weak<MainWindow>,
 }
 
 #[derive(Clone, Default)]
@@ -264,13 +284,42 @@ fn playlist_entry_rows(selection: &PlaylistSelectionState) -> Vec<PlaylistEntryR
         .collect()
 }
 
-fn selection_summary(selected_count: usize, selectable_count: usize) -> SharedString {
-    if selectable_count == 0 {
-        SharedString::from("No entries have a valid playlist index for selection.")
+fn playlist_selection_summary(selection: &PlaylistSelectionState) -> SharedString {
+    if selection.selectable_count() == 0 {
+        SharedString::from("No entries with valid indexes have been loaded.")
     } else {
         SharedString::from(format!(
-            "Selected {selected_count} of {selectable_count} selectable entries."
+            "Selected {} of {} loaded entries.",
+            selection.selected_count(),
+            selection.selectable_count()
         ))
+    }
+}
+
+fn merge_playlist_page(selection: &mut PlaylistSelectionState, entries: Vec<PlaylistEntry>) {
+    for entry in entries {
+        let duplicate = entry.playlist_index.is_some_and(|index| {
+            selection.entries.iter().any(|loaded| loaded.playlist_index == Some(index))
+        });
+        if !duplicate {
+            selection.entries.push(entry);
+            selection.selected.push(false);
+        }
+    }
+
+    let mut combined = selection
+        .entries
+        .drain(..)
+        .zip(selection.selected.drain(..))
+        .enumerate()
+        .collect::<Vec<_>>();
+    combined.sort_by_key(|(order, (entry, _))| match entry.playlist_index {
+        Some(index) => (0_u8, index, *order),
+        None => (1_u8, i64::MAX, *order),
+    });
+    for (_, (entry, selected)) in combined {
+        selection.entries.push(entry);
+        selection.selected.push(selected);
     }
 }
 
@@ -400,6 +449,60 @@ fn subscription_check_frequency_label(interval_seconds: i64) -> &'static str {
         PLAYLIST_CHECK_INTERVAL_7_DAYS => "Weekly",
         _ => "Manual",
     }
+}
+
+fn request_playlist_page(
+    loader: &PlaylistPageLoader,
+    request_id: u64,
+    start_index: usize,
+    end_index: usize,
+    select_range: Option<(i64, i64)>,
+) -> std::result::Result<(), String> {
+    let requested_count = end_index.saturating_sub(start_index).saturating_add(1);
+    if start_index == 0 || end_index < start_index || requested_count > PLAYLIST_PAGE_SIZE {
+        return Err(format!(
+            "Load no more than {PLAYLIST_PAGE_SIZE} playlist entries per request."
+        ));
+    }
+    let source_url = {
+        let mut state = loader
+            .selection_state
+            .lock()
+            .map_err(|_| "Playlist selection state is unavailable.".to_owned())?;
+        let selection = state
+            .as_mut()
+            .filter(|selection| selection.request_id == request_id)
+            .ok_or_else(|| "Analyze a playlist before loading more entries.".to_owned())?;
+        if selection.loading_page {
+            return Err("A playlist page is already loading.".to_owned());
+        }
+        selection.loading_page = true;
+        selection.source_url.clone()
+    };
+
+    if let Some(window) = loader.weak_window.upgrade() {
+        window.set_playlist_page_loading(true);
+    }
+    let _ = loader
+        .events
+        .send(UiEvent::Status(format!("Loading playlist indexes {start_index}–{end_index}…")));
+    let engine = loader.engine.clone();
+    let events = loader.events.clone();
+    loader.handle.spawn(async move {
+        let result = engine
+            .inspect_playlist_page(&source_url, start_index, end_index)
+            .await
+            .map(Box::new)
+            .map_err(|error| error.to_string());
+        let _ = events.send(UiEvent::PlaylistPage {
+            request_id,
+            start_index,
+            end_index,
+            select_range,
+            result,
+        });
+    });
+    Ok(())
 }
 
 fn subscription_check_frequency_seconds(label: &str) -> Option<i64> {
@@ -1024,6 +1127,8 @@ pub fn run() -> Result<()> {
                             window.set_selectable_playlist_count(0);
                             window.set_playlist_selection_summary(SharedString::default());
                             window.set_show_playlist_range_controls(false);
+                            window.set_playlist_page_loading(false);
+                            window.set_playlist_has_more_entries(false);
                         }
                     });
                 }
@@ -1038,7 +1143,7 @@ pub fn run() -> Result<()> {
                         format!(" · {} formats", metadata.format_count)
                     };
                     let playlist_summary = metadata.playlist_count.map_or(String::new(), |count| {
-                        format!(" · {count} entries in preview; preview capped at 50")
+                        format!(" · {count} entries loaded")
                     });
                     let subtitle_summary = if metadata.is_playlist {
                         String::new()
@@ -1068,12 +1173,17 @@ pub fn run() -> Result<()> {
                     let is_playlist = metadata.is_playlist;
                     let preview_state = if is_playlist {
                         let entries = metadata.playlist_entries;
+                        let loaded_count = metadata.playlist_count.unwrap_or(entries.len());
                         Some(PlaylistSelectionState {
+                            request_id,
                             source_url,
                             source: metadata.source,
                             title: title.clone(),
                             selected: vec![false; entries.len()],
                             entries,
+                            next_page_start: PLAYLIST_PAGE_SIZE.saturating_add(1),
+                            has_more_entries: loaded_count >= PLAYLIST_PAGE_SIZE,
+                            loading_page: false,
                         })
                     } else {
                         None
@@ -1082,6 +1192,10 @@ pub fn run() -> Result<()> {
                         preview_state.as_ref().map(playlist_entry_rows).unwrap_or_default();
                     let selectable_count =
                         preview_state.as_ref().map_or(0, PlaylistSelectionState::selectable_count);
+                    let preview_summary =
+                        preview_state.as_ref().map(playlist_selection_summary).unwrap_or_default();
+                    let has_more_entries =
+                        preview_state.as_ref().is_some_and(|state| state.has_more_entries);
                     if let Ok(mut state) = event_playlist_selection.lock() {
                         *state = preview_state;
                     }
@@ -1094,12 +1208,90 @@ pub fn run() -> Result<()> {
                             window.set_selected_playlist_count(0);
                             window.set_selectable_playlist_count(selectable_count as i32);
                             window.set_show_playlist_range_controls(false);
-                            window.set_playlist_selection_summary(selection_summary(
-                                0,
-                                selectable_count,
-                            ));
+                            window.set_playlist_selection_summary(preview_summary);
+                            window.set_playlist_page_loading(false);
+                            window.set_playlist_has_more_entries(has_more_entries);
                         }
                     });
+                }
+                UiEvent::PlaylistPage {
+                    request_id,
+                    start_index,
+                    end_index,
+                    select_range,
+                    result,
+                } => {
+                    if request_id != latest_analysis_id {
+                        continue;
+                    }
+                    let Ok(mut state) = event_playlist_selection.lock() else { continue };
+                    let Some(selection) = state.as_mut() else { continue };
+                    if selection.request_id != request_id {
+                        continue;
+                    }
+                    selection.loading_page = false;
+                    let status = match result {
+                        Ok(metadata) => {
+                            let metadata = *metadata;
+                            let entry_count =
+                                metadata.playlist_count.unwrap_or(metadata.playlist_entries.len());
+                            merge_playlist_page(selection, metadata.playlist_entries);
+                            if let Some((first, last)) = select_range {
+                                let _ = select_playlist_range(selection, first, last);
+                                let selected_in_range = selection
+                                    .entries
+                                    .iter()
+                                    .zip(selection.selected.iter())
+                                    .filter(|(entry, selected)| {
+                                        **selected
+                                            && entry.playlist_index.is_some_and(|index| {
+                                                (first..=last).contains(&index)
+                                            })
+                                    })
+                                    .count();
+                                if start_index == selection.next_page_start {
+                                    selection.next_page_start = end_index.saturating_add(1);
+                                    selection.has_more_entries = entry_count
+                                        >= end_index.saturating_sub(start_index).saturating_add(1);
+                                }
+                                if selected_in_range == 0 {
+                                    format!(
+                                        "No selectable playlist entries were returned for indexes {start_index}–{end_index}."
+                                    )
+                                } else {
+                                    format!(
+                                        "Selected {selected_in_range} playlist entries from indexes {start_index}–{end_index}."
+                                    )
+                                }
+                            } else {
+                                if start_index == selection.next_page_start {
+                                    selection.next_page_start = end_index.saturating_add(1);
+                                    selection.has_more_entries = entry_count
+                                        >= end_index.saturating_sub(start_index).saturating_add(1);
+                                }
+                                format!(
+                                    "Loaded playlist indexes {start_index}–{end_index}; {} selectable entries are loaded.",
+                                    selection.selectable_count()
+                                )
+                            }
+                        }
+                        Err(error) => format!("Could not load playlist entries: {error}"),
+                    };
+                    let rows = playlist_entry_rows(selection);
+                    let selected_count = selection.selected_count();
+                    let selectable_count = selection.selectable_count();
+                    let summary = playlist_selection_summary(selection);
+                    let has_more = selection.has_more_entries;
+                    drop(state);
+                    if let Some(window) = weak_window.upgrade() {
+                        window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
+                        window.set_selected_playlist_count(selected_count as i32);
+                        window.set_selectable_playlist_count(selectable_count as i32);
+                        window.set_playlist_selection_summary(summary);
+                        window.set_playlist_page_loading(false);
+                        window.set_playlist_has_more_entries(has_more);
+                        window.set_status_message(status.into());
+                    }
                 }
             }
         }
@@ -2809,14 +3001,12 @@ pub fn run() -> Result<()> {
         let rows = playlist_entry_rows(selection);
         let selected_count = selection.selected_count();
         let selectable_count = selection.selectable_count();
+        let summary = playlist_selection_summary(selection);
         if let Some(window) = toggle_window.upgrade() {
             window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
             window.set_selected_playlist_count(selected_count as i32);
             window.set_selectable_playlist_count(selectable_count as i32);
-            window.set_playlist_selection_summary(selection_summary(
-                selected_count,
-                selectable_count,
-            ));
+            window.set_playlist_selection_summary(summary);
         }
     });
 
@@ -2829,20 +3019,41 @@ pub fn run() -> Result<()> {
         let rows = playlist_entry_rows(selection);
         let selected_count = selection.selected_count();
         let selectable_count = selection.selectable_count();
+        let summary = playlist_selection_summary(selection);
         if let Some(window) = set_selection_window.upgrade() {
             window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
             window.set_selected_playlist_count(selected_count as i32);
             window.set_selectable_playlist_count(selectable_count as i32);
-            window.set_playlist_selection_summary(selection_summary(
-                selected_count,
-                selectable_count,
-            ));
+            window.set_playlist_selection_summary(summary);
+        }
+    });
+
+    let playlist_page_loader = PlaylistPageLoader {
+        selection_state: playlist_selection.clone(),
+        engine: engine.clone(),
+        handle: handle.clone(),
+        events: events_tx.clone(),
+        weak_window: window.as_weak(),
+    };
+    let load_more_loader = playlist_page_loader.clone();
+    window.on_playlist_load_more_requested(move || {
+        let requested = load_more_loader.selection_state.lock().ok().and_then(|state| {
+            let selection = state.as_ref()?;
+            selection.has_more_entries.then_some((selection.request_id, selection.next_page_start))
+        });
+        let Some((request_id, start_index)) = requested else { return };
+        let end_index = start_index.saturating_add(PLAYLIST_PAGE_SIZE.saturating_sub(1));
+        if let Err(error) =
+            request_playlist_page(&load_more_loader, request_id, start_index, end_index, None)
+        {
+            let _ = load_more_loader.events.send(UiEvent::Status(error));
         }
     });
 
     let range_selection_state = playlist_selection.clone();
     let range_selection_window = window.as_weak();
     let range_selection_events = events_tx.clone();
+    let range_page_loader = playlist_page_loader;
     window.on_playlist_range_selection_requested(move |first, last| {
         let first_index = match first.as_str().parse::<i64>() {
             Ok(index) if index > 0 => index,
@@ -2861,29 +3072,70 @@ pub fn run() -> Result<()> {
                 return;
             }
         };
+        if last_index.saturating_sub(first_index).saturating_add(1)
+            > i64::try_from(PLAYLIST_PAGE_SIZE).unwrap_or(i64::MAX)
+        {
+            let _ = range_selection_events.send(UiEvent::Status(format!(
+                "Select ranges of at most {PLAYLIST_PAGE_SIZE} entries at a time."
+            )));
+            return;
+        }
         let Ok(mut state) = range_selection_state.lock() else { return };
         let Some(selection) = state.as_mut() else {
             let _ = range_selection_events
                 .send(UiEvent::Status("Analyze a playlist before selecting a range.".to_owned()));
             return;
         };
+        let request_id = selection.request_id;
+        let missing_entries = (first_index..=last_index).any(|index| {
+            !selection.entries.iter().any(|entry| entry.playlist_index == Some(index))
+        });
+        if missing_entries {
+            drop(state);
+            let start_index = match usize::try_from(first_index) {
+                Ok(index) => index,
+                Err(_) => {
+                    let _ = range_selection_events.send(UiEvent::Status(
+                        "The starting playlist index is too large.".to_owned(),
+                    ));
+                    return;
+                }
+            };
+            let end_index = match usize::try_from(last_index) {
+                Ok(index) => index,
+                Err(_) => {
+                    let _ = range_selection_events.send(UiEvent::Status(
+                        "The ending playlist index is too large.".to_owned(),
+                    ));
+                    return;
+                }
+            };
+            if let Err(error) = request_playlist_page(
+                &range_page_loader,
+                request_id,
+                start_index,
+                end_index,
+                Some((first_index, last_index)),
+            ) {
+                let _ = range_selection_events.send(UiEvent::Status(error));
+            }
+            return;
+        }
         if !select_playlist_range(selection, first_index, last_index) {
             let _ = range_selection_events.send(UiEvent::Status(
-                "That range contains no selectable entries in the visible preview.".to_owned(),
+                "That range contains no selectable playlist entries.".to_owned(),
             ));
             return;
         }
         let rows = playlist_entry_rows(selection);
         let selected_count = selection.selected_count();
         let selectable_count = selection.selectable_count();
+        let summary = playlist_selection_summary(selection);
         if let Some(window) = range_selection_window.upgrade() {
             window.set_playlist_entries(ModelRc::new(VecModel::from(rows)));
             window.set_selected_playlist_count(selected_count as i32);
             window.set_selectable_playlist_count(selectable_count as i32);
-            window.set_playlist_selection_summary(selection_summary(
-                selected_count,
-                selectable_count,
-            ));
+            window.set_playlist_selection_summary(summary);
         }
         let _ = range_selection_events.send(UiEvent::Status(format!(
             "Selected available entries from playlist index {first_index} to {last_index}."
@@ -6368,6 +6620,7 @@ mod tests {
     #[test]
     fn playlist_select_all_and_none_ignore_entries_without_indexes() {
         let mut selection = PlaylistSelectionState {
+            request_id: 1,
             source_url: "https://example.test/playlist".to_owned(),
             source: "Example".to_owned(),
             title: "Example playlist".to_owned(),
@@ -6377,6 +6630,9 @@ mod tests {
                 PlaylistEntry { playlist_index: Some(3), title: "Third".to_owned() },
             ],
             selected: vec![false, false, false],
+            next_page_start: 51,
+            has_more_entries: true,
+            loading_page: false,
         };
 
         set_playlist_selection(&mut selection, true);
@@ -6392,6 +6648,7 @@ mod tests {
     #[test]
     fn playlist_range_selection_adds_only_available_indexes_inclusive() {
         let mut selection = PlaylistSelectionState {
+            request_id: 1,
             source_url: "https://example.test/playlist".to_owned(),
             source: "Example".to_owned(),
             title: "Example playlist".to_owned(),
@@ -6403,6 +6660,9 @@ mod tests {
                 PlaylistEntry { playlist_index: Some(5), title: "Fifth".to_owned() },
             ],
             selected: vec![true, false, false, false, false],
+            next_page_start: 51,
+            has_more_entries: true,
+            loading_page: false,
         };
 
         assert!(select_playlist_range(&mut selection, 2, 4));
@@ -6410,6 +6670,49 @@ mod tests {
         assert!(!select_playlist_range(&mut selection, 0, 2));
         assert!(!select_playlist_range(&mut selection, 5, 4));
         assert!(!select_playlist_range(&mut selection, 7, 9));
+    }
+
+    #[test]
+    fn playlist_pages_keep_selection_and_ignore_duplicate_global_indexes() {
+        let mut selection = PlaylistSelectionState {
+            request_id: 7,
+            source_url: "https://example.test/playlist".to_owned(),
+            source: "Example".to_owned(),
+            title: "Example playlist".to_owned(),
+            entries: vec![
+                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
+                PlaylistEntry { playlist_index: Some(2), title: "Second".to_owned() },
+            ],
+            selected: vec![false, true],
+            next_page_start: 51,
+            has_more_entries: true,
+            loading_page: false,
+        };
+
+        merge_playlist_page(
+            &mut selection,
+            vec![
+                PlaylistEntry { playlist_index: Some(51), title: "Fifty first".to_owned() },
+                PlaylistEntry { playlist_index: Some(52), title: "Fifty second".to_owned() },
+            ],
+        );
+        assert!(select_playlist_range(&mut selection, 51, 52));
+        merge_playlist_page(
+            &mut selection,
+            vec![
+                PlaylistEntry { playlist_index: Some(51), title: "Duplicate page copy".to_owned() },
+                PlaylistEntry { playlist_index: Some(52), title: "Fifty second".to_owned() },
+                PlaylistEntry { playlist_index: Some(53), title: "Fifty third".to_owned() },
+            ],
+        );
+
+        assert_eq!(
+            selection.entries.iter().filter_map(|entry| entry.playlist_index).collect::<Vec<_>>(),
+            [1, 2, 51, 52, 53]
+        );
+        assert_eq!(selection.entries[2].title, "Fifty first");
+        assert_eq!(selection.selected, [false, true, true, true, false]);
+        assert_eq!(selection.selected_count(), 3);
     }
 
     #[tokio::test]

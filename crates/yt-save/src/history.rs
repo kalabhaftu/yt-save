@@ -1,6 +1,6 @@
 use crate::model::DownloadRecord;
 
-const HISTORY_COLUMNS: [&str; 28] = [
+const HISTORY_COLUMNS: [&str; 29] = [
     "id",
     "url",
     "queue_order",
@@ -13,6 +13,7 @@ const HISTORY_COLUMNS: [&str; 28] = [
     "audio_format",
     "audio_quality",
     "video_quality",
+    "exact_format_id",
     "download_directory",
     "title",
     "source",
@@ -48,6 +49,7 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.audio_format.as_database_value().to_owned(),
             record.audio_quality.as_database_value().to_owned(),
             record.video_quality.as_database_value().to_owned(),
+            record.selected_format_id.clone().unwrap_or_default(),
             record.download_directory.clone(),
             record.title.clone(),
             record.source.clone(),
@@ -126,12 +128,15 @@ mod tests {
         record.speed_bytes_per_second = Some(32.5);
         record.eta_seconds = Some(5);
         record.scheduled_at = Some(1_700_000_030);
+        record.selected_format_id = Some("format-137".to_owned());
         record.output_path = Some("C:\\Media\\item.mp4".to_owned());
         record.updated_at = 1_700_000_060;
 
         let csv = download_history_csv(&[record]);
 
         assert!(csv.contains("\"job-1\",\"https://example.test/watch?id=1\",\"3\",\"1\",\"7\""));
+        assert!(csv.contains("\"video_quality\",\"exact_format_id\""));
+        assert!(csv.contains("\"best\",\"format-137\""));
         assert!(csv.contains("\"A \"\"quoted\"\", title\r\ncontinued\""));
         assert!(csv.contains(
             "\"Example, site\",\"Completed\",\"100.00\",\"1024\",\"2048\",\"32.50\",\"5\""

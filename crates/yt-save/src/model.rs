@@ -379,6 +379,8 @@ pub struct MediaMetadata {
     pub duration_seconds: Option<f64>,
     pub thumbnail: Option<String>,
     pub format_count: usize,
+    #[serde(default)]
+    pub formats: Vec<MediaFormatOption>,
     pub is_playlist: bool,
     pub playlist_count: Option<usize>,
     #[serde(default)]
@@ -389,6 +391,140 @@ pub struct MediaMetadata {
     pub manual_subtitle_languages: Vec<String>,
     #[serde(default)]
     pub automatic_subtitle_languages: Vec<String>,
+}
+
+/// Safe, displayable metadata for one yt-dlp format. Stream URLs and request details are omitted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaFormatOption {
+    pub id: String,
+    pub extension: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub size_bytes: Option<u64>,
+    pub size_is_estimate: bool,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+}
+
+impl MediaFormatOption {
+    pub fn supports_mode(&self, mode: DownloadMode) -> bool {
+        let has_video = self.video_codec.is_some();
+        let has_audio = self.audio_codec.is_some();
+        match mode {
+            DownloadMode::Video => has_video && has_audio,
+            DownloadMode::VideoOnly => has_video && !has_audio,
+            DownloadMode::AudioOnly => has_audio && !has_video,
+            DownloadMode::SubtitlesOnly => false,
+        }
+    }
+
+    pub fn choice_label(&self) -> String {
+        let extension = if self.extension.is_empty() { "unknown" } else { &self.extension };
+        let resolution = match (self.width, self.height) {
+            (Some(width), Some(height)) => format!("{width}×{height}"),
+            (_, Some(height)) => format!("{height}p"),
+            _ => "resolution unknown".to_owned(),
+        };
+        let streams = match (self.video_codec.is_some(), self.audio_codec.is_some()) {
+            (true, true) => "video + audio",
+            (true, false) => "video only",
+            (false, true) => "audio only",
+            (false, false) => "no media streams",
+        };
+        let codecs = match (&self.video_codec, &self.audio_codec) {
+            (Some(video), Some(audio)) => {
+                format!("{} + {}", compact_codec(video), compact_codec(audio))
+            }
+            (Some(video), None) => compact_codec(video),
+            (None, Some(audio)) => compact_codec(audio),
+            (None, None) => "codec unknown".to_owned(),
+        };
+        let fps = self.fps.map(|fps| format!(" · {fps} fps")).unwrap_or_default();
+        let size = self.size_bytes.map_or_else(String::new, |bytes| {
+            format!(
+                " · {}{}",
+                if self.size_is_estimate { "≈" } else { "" },
+                format_bytes(Some(bytes))
+            )
+        });
+        format!(
+            "{} · {} · {} · {} · {}{fps}{size}",
+            self.id, extension, resolution, streams, codecs
+        )
+    }
+}
+
+pub fn format_is_available(
+    formats: &[MediaFormatOption],
+    format_id: &str,
+    mode: DownloadMode,
+) -> bool {
+    formats.iter().any(|format| format.id == format_id && format.supports_mode(mode))
+}
+
+fn compact_codec(value: &str) -> String {
+    let compact = value.chars().take(18).collect::<String>();
+    if compact.len() < value.len() { format!("{compact}…") } else { compact }
+}
+
+pub fn is_safe_format_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+fn parse_media_format(value: &serde_json::Value) -> Option<MediaFormatOption> {
+    let id = text(value, "format_id")?;
+    if !is_safe_format_id(&id) {
+        return None;
+    }
+    let codec = |field: &str| {
+        text(value, field)
+            .filter(|codec| !codec.trim().is_empty() && !codec.eq_ignore_ascii_case("none"))
+            .map(|codec| {
+                codec.chars().filter(|character| !character.is_control()).take(64).collect()
+            })
+    };
+    let size_bytes = value
+        .get("filesize")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| value.get("filesize_approx").and_then(serde_json::Value::as_u64));
+    let size_is_estimate =
+        value.get("filesize").and_then(serde_json::Value::as_u64).is_none() && size_bytes.is_some();
+    Some(MediaFormatOption {
+        id,
+        extension: text(value, "ext")
+            .map(|extension| extension.to_ascii_lowercase())
+            .filter(|extension| {
+                !extension.is_empty()
+                    && extension.len() <= 16
+                    && extension.chars().all(|character| character.is_ascii_alphanumeric())
+            })
+            .unwrap_or_default(),
+        width: value
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
+        height: value
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
+        fps: value
+            .get("fps")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|fps| fps.is_finite() && (0.0..=1000.0).contains(fps)),
+        size_bytes,
+        size_is_estimate,
+        video_codec: codec("vcodec"),
+        audio_codec: codec("acodec"),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -481,6 +617,11 @@ impl MediaMetadata {
                 .get("formats")
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, Vec::len),
+            formats: first_entry
+                .get("formats")
+                .and_then(serde_json::Value::as_array)
+                .map(|formats| formats.iter().take(100).filter_map(parse_media_format).collect())
+                .unwrap_or_default(),
             is_playlist,
             playlist_count: entries.map(Vec::len),
             playlist_entries,
@@ -531,6 +672,8 @@ pub struct DownloadRecord {
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
     pub video_quality: VideoQuality,
+    /// Media-specific yt-dlp format ID; never stores its signed stream URL.
+    pub selected_format_id: Option<String>,
     /// Destination directory captured when this queue item was added.
     pub download_directory: String,
     pub title: String,
@@ -571,6 +714,7 @@ impl DownloadRecord {
             audio_format: AudioFormat::Original,
             audio_quality: AudioQuality::Best,
             video_quality: VideoQuality::Best,
+            selected_format_id: None,
             download_directory: String::new(),
             title: "Waiting for media details".to_owned(),
             source: String::new(),
@@ -658,6 +802,61 @@ mod tests {
         assert_eq!(parsed.title, "Playlist");
         assert_eq!(parsed.playlist_entries.len(), 2);
         assert_eq!(parsed.playlist_entries[0].playlist_index, None);
+    }
+
+    #[test]
+    fn format_parser_keeps_display_metadata_and_discards_signed_urls() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"id":"format-sample","title":"Formats","formats":[{"format_id":"137","ext":"mp4","width":1920,"height":1080,"fps":30,"filesize_approx":12000000,"vcodec":"avc1.640028","acodec":"none","url":"https://cdn.example.test/media?token=secret-signed-token"},{"format_id":"140","ext":"m4a","vcodec":"none","acodec":"mp4a.40.2","filesize":4000000,"url":"https://cdn.example.test/audio?token=another-secret"},{"format_id":"bad/id","ext":"mp4","vcodec":"avc1","acodec":"none"}]}"#,
+        )
+        .unwrap();
+        let parsed = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &value,
+            "https://example.test/watch",
+            None,
+        );
+
+        assert_eq!(parsed.format_count, 3);
+        assert_eq!(parsed.formats.len(), 2);
+        assert_eq!(parsed.formats[0].id, "137");
+        assert!(parsed.formats[0].size_is_estimate);
+        assert!(parsed.formats[0].supports_mode(DownloadMode::VideoOnly));
+        assert!(!parsed.formats[0].supports_mode(DownloadMode::Video));
+        assert!(parsed.formats[1].supports_mode(DownloadMode::AudioOnly));
+        assert!(!parsed.formats[1].supports_mode(DownloadMode::VideoOnly));
+        let serialized = serde_json::to_string(&parsed.formats).unwrap();
+        assert!(!serialized.contains("cdn.example.test"));
+        assert!(!serialized.contains("signed-token"));
+        assert!(!serialized.contains("another-secret"));
+    }
+
+    #[test]
+    fn format_id_validation_rejects_argument_syntax() {
+        for valid in ["137", "dash-1", "format_audio.2"] {
+            assert!(is_safe_format_id(valid), "expected {valid:?} to be safe");
+        }
+        assert!(is_safe_format_id(&"a".repeat(128)));
+        for invalid in ["", "-", "137/140", "137+best", "--exec", "a b", "x\n--format"] {
+            assert!(!is_safe_format_id(invalid), "expected {invalid:?} to be rejected");
+        }
+        assert!(!is_safe_format_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn exact_format_must_still_exist_and_match_the_download_mode() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"id":"format-sample","formats":[{"format_id":"video-1","vcodec":"avc1","acodec":"none"},{"format_id":"audio-1","vcodec":"none","acodec":"opus"}]}"#,
+        )
+        .unwrap();
+        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &value,
+            "https://example.test/watch",
+            None,
+        );
+        assert!(format_is_available(&metadata.formats, "video-1", DownloadMode::VideoOnly));
+        assert!(!format_is_available(&metadata.formats, "video-1", DownloadMode::Video));
+        assert!(!format_is_available(&metadata.formats, "retired-id", DownloadMode::VideoOnly));
+        assert!(!format_is_available(&metadata.formats, "audio-1", DownloadMode::VideoOnly));
     }
 
     #[test]

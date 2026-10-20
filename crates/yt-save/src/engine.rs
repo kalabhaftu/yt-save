@@ -20,7 +20,7 @@ use crate::{
     dependencies::DependencyPaths,
     model::{
         AudioFormat, AudioQuality, DownloadMode, MediaMetadata, SubtitleFormat, VideoQuality,
-        normalize_subtitle_languages,
+        is_safe_format_id, normalize_subtitle_languages,
     },
 };
 
@@ -56,6 +56,7 @@ pub(crate) struct DownloadOptions {
     include_auto_subtitles: bool,
     concurrent_fragments: usize,
     output_directory: Option<PathBuf>,
+    selected_format_id: Option<String>,
 }
 
 impl DownloadOptions {
@@ -74,6 +75,7 @@ impl DownloadOptions {
             include_auto_subtitles: false,
             concurrent_fragments: 1,
             output_directory: None,
+            selected_format_id: None,
         }
     }
 
@@ -84,6 +86,11 @@ impl DownloadOptions {
 
     pub(crate) fn with_output_directory(mut self, output_directory: PathBuf) -> Self {
         self.output_directory = Some(output_directory);
+        self
+    }
+
+    pub(crate) fn with_selected_format_id(mut self, selected_format_id: Option<String>) -> Self {
+        self.selected_format_id = selected_format_id;
         self
     }
 
@@ -483,6 +490,16 @@ impl DownloadEngine {
         let output_directory =
             options.output_directory.as_deref().unwrap_or(&self.output_directory);
         validate_output_directory(output_directory)?;
+        if let Some(format_id) = options.selected_format_id.as_deref() {
+            if !is_safe_format_id(format_id) {
+                bail!(
+                    "The selected format ID is invalid. Analyze the link again and choose another format."
+                );
+            }
+            if options.mode == DownloadMode::SubtitlesOnly {
+                bail!("Exact media formats cannot be selected for subtitle-only downloads.");
+            }
+        }
         let mut command = self.base_command();
         command
             .arg("--no-warnings")
@@ -504,19 +521,31 @@ impl DownloadEngine {
             DownloadMode::Video => {
                 command
                     .arg("--format")
-                    .arg(options.video_quality.yt_dlp_format())
+                    .arg(
+                        options
+                            .selected_format_id
+                            .as_deref()
+                            .unwrap_or_else(|| options.video_quality.yt_dlp_format()),
+                    )
                     .arg("--print")
                     .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
             }
             DownloadMode::VideoOnly => {
                 command
                     .arg("--format")
-                    .arg(options.video_quality.yt_dlp_video_only_format())
+                    .arg(
+                        options
+                            .selected_format_id
+                            .as_deref()
+                            .unwrap_or_else(|| options.video_quality.yt_dlp_video_only_format()),
+                    )
                     .arg("--print")
                     .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
             }
             DownloadMode::AudioOnly => {
-                command.arg("--format").arg("bestaudio");
+                command
+                    .arg("--format")
+                    .arg(options.selected_format_id.as_deref().unwrap_or("bestaudio"));
                 if let Some(format) = options.audio_format.yt_dlp_name() {
                     let missing = match (
                         self.dependencies.ffmpeg.is_file(),
@@ -1443,6 +1472,40 @@ mod tests {
                 matches!(arg.as_str(), "--extract-audio" | "--audio-format" | "--audio-quality")
             }));
         }
+        for (mode, format_id) in [
+            (DownloadMode::Video, "combined-1"),
+            (DownloadMode::VideoOnly, "video-137"),
+            (DownloadMode::AudioOnly, "audio-140"),
+        ] {
+            let arguments = engine
+                .download_command(
+                    "https://example.test/media",
+                    None,
+                    DownloadOptions::new(mode, AudioFormat::Original, AudioQuality::Best)
+                        .with_selected_format_id(Some(format_id.to_owned())),
+                )
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let format_flag = arguments.iter().position(|arg| arg == "--format").unwrap();
+            assert_eq!(arguments.get(format_flag + 1).map(String::as_str), Some(format_id));
+        }
+        assert!(
+            engine
+                .download_command(
+                    "https://example.test/media",
+                    None,
+                    DownloadOptions::new(
+                        DownloadMode::Video,
+                        AudioFormat::Original,
+                        AudioQuality::Best,
+                    )
+                    .with_selected_format_id(Some("137/140".to_owned())),
+                )
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

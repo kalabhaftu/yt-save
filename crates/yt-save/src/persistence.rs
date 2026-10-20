@@ -173,7 +173,8 @@ impl Store {
                     subtitle_languages TEXT NOT NULL DEFAULT 'en',
                     subtitle_format TEXT NOT NULL DEFAULT 'vtt',
                     include_auto_subtitles INTEGER NOT NULL DEFAULT 0,
-                    scheduled_at INTEGER
+                    scheduled_at INTEGER,
+                    selected_format_id TEXT
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -279,6 +280,7 @@ impl Store {
                 ("subtitle_format", "TEXT NOT NULL DEFAULT 'vtt'"),
                 ("include_auto_subtitles", "INTEGER NOT NULL DEFAULT 0"),
                 ("scheduled_at", "INTEGER"),
+                ("selected_format_id", "TEXT"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -2081,7 +2083,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             playlist_group_id, playlist_group_title,
             download_mode, audio_format, audio_quality, video_quality,
             download_directory, queue_rank, priority, retry_attempts, next_retry_at,
-            subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
+            subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
+            selected_format_id
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -2091,7 +2094,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             coalesce((SELECT max(queue_rank) FROM downloads
                       WHERE priority = :priority), 0) + 1024,
             :priority, :retry_attempts, :next_retry_at,
-            :subtitle_languages, :subtitle_format, :include_auto_subtitles, :scheduled_at
+            :subtitle_languages, :subtitle_format, :include_auto_subtitles, :scheduled_at,
+            :selected_format_id
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -2113,7 +2117,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             subtitle_languages=excluded.subtitle_languages,
             subtitle_format=excluded.subtitle_format,
             include_auto_subtitles=excluded.include_auto_subtitles,
-            scheduled_at=excluded.scheduled_at",
+            scheduled_at=excluded.scheduled_at,
+            selected_format_id=excluded.selected_format_id",
         named_params! {
             ":id": record.id,
             ":url": record.url,
@@ -2144,6 +2149,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":subtitle_format": record.subtitle_format.as_database_value(),
             ":include_auto_subtitles": record.include_auto_subtitles,
             ":scheduled_at": record.scheduled_at,
+            ":selected_format_id": record.selected_format_id,
         },
     )?;
     Ok(())
@@ -2217,7 +2223,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
-                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
+                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
+                selected_format_id
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -2253,6 +2260,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 subtitle_format: subtitle_format_from_row(row, 27)?,
                 include_auto_subtitles: row.get(28)?,
                 scheduled_at: row.get(29)?,
+                selected_format_id: row.get(30)?,
             })
         })
         .optional()?;
@@ -2276,7 +2284,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 playlist_group_id, playlist_group_title,
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
-                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at
+                subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
+                selected_format_id
          FROM downloads
         ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN 0 ELSE 1 END,
                   CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN priority ELSE 0 END DESC,
@@ -2316,6 +2325,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             subtitle_format: subtitle_format_from_row(row, 27)?,
             include_auto_subtitles: row.get(28)?,
             scheduled_at: row.get(29)?,
+            selected_format_id: row.get(30)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -2776,6 +2786,7 @@ mod tests {
         record.status = "Failed".to_owned();
         record.download_mode = DownloadMode::VideoOnly;
         record.video_quality = VideoQuality::P1440;
+        record.selected_format_id = Some("video-137".to_owned());
         store.save_download(record).await.unwrap();
         drop(store);
 
@@ -2783,6 +2794,7 @@ mod tests {
         let retried = reopened.retry_download("video-retry", 20).await.unwrap().unwrap();
         assert_eq!(retried.download_mode, DownloadMode::VideoOnly);
         assert_eq!(retried.video_quality, VideoQuality::P1440);
+        assert_eq!(retried.selected_format_id.as_deref(), Some("video-137"));
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -3156,6 +3168,7 @@ mod tests {
         assert_eq!(legacy.audio_format, AudioFormat::Original);
         assert_eq!(legacy.audio_quality, AudioQuality::Best);
         assert_eq!(legacy.video_quality, VideoQuality::Best);
+        assert_eq!(legacy.selected_format_id, None);
         assert_eq!(legacy.download_directory, legacy_default);
         assert_eq!(legacy.retry_attempts, 0);
         assert_eq!(legacy.next_retry_at, None);
@@ -3193,6 +3206,7 @@ mod tests {
         assert_eq!(selected.audio_format, AudioFormat::M4a);
         assert_eq!(selected.audio_quality, AudioQuality::K192);
         assert_eq!(selected.video_quality, VideoQuality::P720);
+        assert_eq!(selected.selected_format_id, None);
         assert_eq!(
             selected.download_directory,
             temp_dir.join("Selected").to_string_lossy().into_owned()

@@ -19,6 +19,8 @@ use tokio::{
 use tracing::{error, info};
 use uuid::Uuid;
 
+const AUTOMATIC_FORMAT_CHOICE: &str = "Automatic (quality preset)";
+
 use crate::{
     AppTray, ClipboardPopup, DownloadRowData, LibraryRowData, MainWindow, PlaylistEntryRowData,
     PlaylistSubscriptionEntryRowData, PlaylistSubscriptionRowData,
@@ -31,9 +33,10 @@ use crate::{
     },
     history::download_history_csv,
     model::{
-        DownloadMode, DownloadPresets, DownloadRecord, MediaMetadata, PlaylistEntry,
-        PlaylistMediaEntry, SubtitleFormat, format_bytes, format_duration,
-        normalize_subtitle_languages, subtitle_languages_available,
+        DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
+        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, format_bytes, format_duration,
+        format_is_available, is_safe_format_id, normalize_subtitle_languages,
+        subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
@@ -72,6 +75,8 @@ enum UiEvent {
     Metadata {
         request_id: u64,
         source_url: String,
+        display_url: String,
+        selection_mode: DownloadMode,
         metadata: Box<MediaMetadata>,
     },
     PlaylistPage {
@@ -1153,6 +1158,14 @@ pub fn run() -> Result<()> {
                             window.set_analyzed_title(SharedString::default());
                             window.set_analyzed_details(SharedString::default());
                             window.set_analyzed_is_playlist(false);
+                            window.set_format_choices(ModelRc::new(VecModel::from(vec![
+                                SharedString::from(AUTOMATIC_FORMAT_CHOICE),
+                            ])));
+                            window.set_selected_format(SharedString::from(AUTOMATIC_FORMAT_CHOICE));
+                            window.set_format_choice_mode(SharedString::default());
+                            window.set_format_choice_source_url(SharedString::default());
+                            window.set_format_choice_display_url(SharedString::default());
+                            window.set_format_choice_list_truncated(false);
                             window.set_playlist_entries(ModelRc::new(VecModel::from(Vec::new())));
                             window.set_selected_playlist_count(0);
                             window.set_selectable_playlist_count(0);
@@ -1163,11 +1176,22 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
-                UiEvent::Metadata { request_id, source_url, metadata } => {
+                UiEvent::Metadata {
+                    request_id,
+                    source_url,
+                    display_url,
+                    selection_mode,
+                    metadata,
+                } => {
                     if request_id != latest_analysis_id {
                         continue;
                     }
                     let metadata = *metadata;
+                    let format_choices = media_format_choice_labels(&metadata.formats, selection_mode);
+                    let format_choice_mode = selection_mode.as_database_value().to_owned();
+                    let format_choice_source_url = source_url.clone();
+                    let format_choice_display_url = display_url.clone();
+                    let format_choice_list_truncated = metadata.format_count > 100;
                     let format_summary = if metadata.is_playlist {
                         String::new()
                     } else {
@@ -1235,6 +1259,12 @@ pub fn run() -> Result<()> {
                             window.set_analyzed_title(title.into());
                             window.set_analyzed_details(details.into());
                             window.set_analyzed_is_playlist(is_playlist);
+                            window.set_format_choices(ModelRc::new(VecModel::from(format_choices)));
+                            window.set_selected_format(SharedString::from(AUTOMATIC_FORMAT_CHOICE));
+                            window.set_format_choice_mode(format_choice_mode.into());
+                            window.set_format_choice_source_url(format_choice_source_url.into());
+                            window.set_format_choice_display_url(format_choice_display_url.into());
+                            window.set_format_choice_list_truncated(format_choice_list_truncated);
                             window.set_playlist_entries(ModelRc::new(VecModel::from(preview_rows)));
                             window.set_selected_playlist_count(0);
                             window.set_selectable_playlist_count(selectable_count as i32);
@@ -1469,6 +1499,7 @@ pub fn run() -> Result<()> {
     let analysis_generation = Arc::new(AtomicU64::new(0));
     let analyze_generation = analysis_generation.clone();
     let analyze_shutdown_started = shutdown_started.clone();
+    let analyze_window = window.as_weak();
     window.on_analyze_requested(move |submitted_url| {
         if analyze_shutdown_started.load(Ordering::Acquire) {
             let _ = analyze_events
@@ -1477,6 +1508,7 @@ pub fn run() -> Result<()> {
         }
         let request_id = analyze_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = analyze_events.send(UiEvent::ClearPreview { request_id });
+        let display_url = submitted_url.to_string();
         let url = match validate_url(&submitted_url) {
             Ok(url) => url,
             Err(message) => {
@@ -1484,6 +1516,20 @@ pub fn run() -> Result<()> {
                 return;
             }
         };
+        let selection_mode = analyze_window
+            .upgrade()
+            .map(|window| {
+                if window.get_subtitle_only() {
+                    DownloadMode::SubtitlesOnly
+                } else if window.get_video_only() {
+                    DownloadMode::VideoOnly
+                } else if window.get_audio_only() {
+                    DownloadMode::AudioOnly
+                } else {
+                    DownloadMode::Video
+                }
+            })
+            .unwrap_or_default();
         let _ = analyze_events.send(UiEvent::Status("Reading media details…".to_owned()));
         let engine = analyze_engine.clone();
         let events = analyze_events.clone();
@@ -1494,6 +1540,8 @@ pub fn run() -> Result<()> {
                     let _ = events.send(UiEvent::Metadata {
                         request_id,
                         source_url: url,
+                        display_url,
+                        selection_mode,
                         metadata: Box::new(metadata),
                     });
                 }
@@ -2824,6 +2872,7 @@ pub fn run() -> Result<()> {
                 queue_events.send(UiEvent::Status("The application is shutting down.".to_owned()));
             return;
         }
+        let display_url = submitted_url.to_string();
         let url = match validate_url(&submitted_url) {
             Ok(url) => url,
             Err(message) => {
@@ -2844,11 +2893,11 @@ pub fn run() -> Result<()> {
             selected_subtitle_format,
             include_auto_subtitles,
             selected_format,
+            (selected_exact_format, format_choice_mode, format_choice_source_url),
             selected_quality,
             selected_video_quality,
             selected_directory,
-            schedule_enabled,
-            schedule_local_time,
+            (schedule_enabled, schedule_local_time),
         ) = enqueue_window
             .upgrade()
             .map(|window| {
@@ -2860,11 +2909,15 @@ pub fn run() -> Result<()> {
                     window.get_subtitle_format().to_string(),
                     window.get_include_auto_subtitles(),
                     window.get_audio_format().to_string(),
+                    (
+                        window.get_selected_format().to_string(),
+                        window.get_format_choice_mode().to_string(),
+                        window.get_format_choice_source_url().to_string(),
+                    ),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
                     window.get_download_directory().to_string(),
-                    window.get_schedule_download(),
-                    window.get_schedule_local_time().to_string(),
+                    (window.get_schedule_download(), window.get_schedule_local_time().to_string()),
                 )
             })
             .unwrap_or_default();
@@ -2906,6 +2959,19 @@ pub fn run() -> Result<()> {
         } else {
             download_presets.mode
         };
+        let selected_format_id = match selected_format_id_from_ui(
+            &selected_exact_format,
+            &format_choice_source_url,
+            &format_choice_mode,
+            &inspection_url,
+            record.download_mode,
+        ) {
+            Ok(format_id) => format_id,
+            Err(message) => {
+                let _ = queue_events.send(UiEvent::Status(message.to_owned()));
+                return;
+            }
+        };
         record.audio_format = download_presets.audio_format;
         record.audio_quality = download_presets.audio_quality;
         record.video_quality = download_presets.video_quality;
@@ -2937,6 +3003,8 @@ pub fn run() -> Result<()> {
                         let _ = events.send(UiEvent::Metadata {
                             request_id,
                             source_url: inspection_url,
+                            display_url,
+                            selection_mode: record.download_mode,
                             metadata: Box::new(metadata),
                         });
                         let _ = events.send(UiEvent::Status(playlist_message.to_owned()));
@@ -2951,6 +3019,16 @@ pub fn run() -> Result<()> {
                     return;
                 }
                 Ok(metadata) => {
+                    if let Some(format_id) = selected_format_id.as_deref() {
+                        if !format_is_available(&metadata.formats, format_id, record.download_mode) {
+                            let _ = events.send(UiEvent::Status(
+                                "The selected format is no longer available for this link. Analyze it again and choose another format."
+                                    .to_owned(),
+                            ));
+                            return;
+                        }
+                        record.selected_format_id = Some(format_id.to_owned());
+                    }
                     if record.download_mode == DownloadMode::SubtitlesOnly {
                         let mut available = metadata.manual_subtitle_languages.clone();
                         if record.include_auto_subtitles {
@@ -4606,6 +4684,14 @@ fn queue_clipboard_candidate(url: String, audio_only: bool, context: ClipboardPo
         window.set_audio_only(audio_only);
         window.set_video_only(false);
         window.set_subtitle_only(false);
+        window.set_format_choices(ModelRc::new(VecModel::from(vec![SharedString::from(
+            AUTOMATIC_FORMAT_CHOICE,
+        )])));
+        window.set_selected_format(SharedString::from(AUTOMATIC_FORMAT_CHOICE));
+        window.set_format_choice_mode(SharedString::default());
+        window.set_format_choice_source_url(SharedString::default());
+        window.set_format_choice_display_url(SharedString::default());
+        window.set_format_choice_list_truncated(false);
         window.set_status_message("Checking the copied link before adding it to the queue…".into());
         if let Err(error) = window.show() {
             error!(%error, "show window to add copied link");
@@ -5596,6 +5682,30 @@ async fn run_download_job(
                 finish_requested_stop(active, store, events).await;
                 return;
             }
+            if let Some(format_id) = active.selected_format_id.as_deref()
+                && !format_is_available(&metadata.formats, format_id, active.download_mode)
+            {
+                active.status = "Failed".to_owned();
+                active.error = Some(
+                    "The selected format is no longer available. Remove this item, analyze the link again, and add a new item with another format."
+                        .to_owned(),
+                );
+                active.updated_at = now();
+                let message = active.error.clone().unwrap_or_default();
+                match finish_failed_job(active.clone(), &store).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = events.send(UiEvent::Refresh);
+                        return;
+                    }
+                    Err(error) => {
+                        error!(%error, job_id = %active.id, "persist stale format failure")
+                    }
+                }
+                let _ = events.send(UiEvent::Refresh);
+                let _ = events.send(UiEvent::Status(message));
+                return;
+            }
             active.title = metadata.title;
             active.source = metadata.source;
             active.status = "Downloading".to_owned();
@@ -5711,6 +5821,7 @@ async fn run_download_job(
             active.playlist_index,
             DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
                 .with_video_quality(active.video_quality)
+                .with_selected_format_id(active.selected_format_id.clone())
                 .with_concurrent_fragments(concurrent_fragments)
                 .with_subtitle_options(
                     active.subtitle_languages.clone(),
@@ -6483,14 +6594,30 @@ fn row_view_with_queue_position(
             _ => record.url.clone(),
         }
     };
-    let selection = match record.download_mode {
-        DownloadMode::Video => format!("Video · {}", record.video_quality.label()),
-        DownloadMode::VideoOnly => format!("Video only · {}", record.video_quality.label()),
-        DownloadMode::AudioOnly if record.audio_format.supports_quality_setting() => {
+    let selection = match (record.download_mode, record.selected_format_id.as_deref()) {
+        (DownloadMode::Video, Some(format_id)) => format!("Video + audio · Format {format_id}"),
+        (DownloadMode::VideoOnly, Some(format_id)) => format!("Video only · Format {format_id}"),
+        (DownloadMode::AudioOnly, Some(format_id))
+            if record.audio_format.supports_quality_setting() =>
+        {
+            format!(
+                "Audio · {} · {} · Format {format_id}",
+                record.audio_format.label(),
+                record.audio_quality.label()
+            )
+        }
+        (DownloadMode::AudioOnly, Some(format_id)) => {
+            format!("Audio · {} · Format {format_id}", record.audio_format.label())
+        }
+        (DownloadMode::Video, None) => format!("Video · {}", record.video_quality.label()),
+        (DownloadMode::VideoOnly, None) => {
+            format!("Video only · {}", record.video_quality.label())
+        }
+        (DownloadMode::AudioOnly, None) if record.audio_format.supports_quality_setting() => {
             format!("Audio · {} · {}", record.audio_format.label(), record.audio_quality.label())
         }
-        DownloadMode::AudioOnly => format!("Audio · {}", record.audio_format.label()),
-        DownloadMode::SubtitlesOnly => format!(
+        (DownloadMode::AudioOnly, None) => format!("Audio · {}", record.audio_format.label()),
+        (DownloadMode::SubtitlesOnly, _) => format!(
             "Subtitles · {} · {}{}",
             record.subtitle_languages,
             record.subtitle_format.as_database_value().to_uppercase(),
@@ -6518,6 +6645,48 @@ fn row_view_with_queue_position(
         playlist_group_id: SharedString::from(group_id),
         playlist_group_action: SharedString::from(group_action),
     }
+}
+
+fn media_format_choice_labels(
+    formats: &[MediaFormatOption],
+    mode: DownloadMode,
+) -> Vec<SharedString> {
+    let mut labels = vec![SharedString::from(AUTOMATIC_FORMAT_CHOICE)];
+    let mut seen = HashSet::new();
+    for format in formats.iter().filter(|format| format.supports_mode(mode)) {
+        if seen.insert(format.id.as_str()) && labels.len() <= 100 {
+            labels.push(format.choice_label().into());
+        }
+    }
+    labels
+}
+
+fn selected_format_id_from_ui(
+    selection: &str,
+    analyzed_url: &str,
+    analyzed_mode: &str,
+    queued_url: &str,
+    queued_mode: DownloadMode,
+) -> std::result::Result<Option<String>, &'static str> {
+    if selection == AUTOMATIC_FORMAT_CHOICE {
+        return Ok(None);
+    }
+    if analyzed_url != queued_url || analyzed_mode != queued_mode.as_database_value() {
+        return Err(
+            "Analyze this link again in the selected download mode before choosing an exact format.",
+        );
+    }
+    let Some((format_id, _)) = selection.split_once(" · ") else {
+        return Err(
+            "The selected format is invalid. Analyze the link again and choose another format.",
+        );
+    };
+    if !is_safe_format_id(format_id) {
+        return Err(
+            "The selected format is invalid. Analyze the link again and choose another format.",
+        );
+    }
+    Ok(Some(format_id.to_owned()))
 }
 
 fn now() -> i64 {
@@ -8025,8 +8194,113 @@ mod tests {
         );
         video.download_mode = DownloadMode::VideoOnly;
         video.video_quality = crate::model::VideoQuality::P720;
+        video.selected_format_id = Some("video-137".to_owned());
         let row = row_view_with_queue_position(&video, "", "", "");
-        assert!(row.detail.as_str().starts_with("Video only · 720p · "));
+        assert!(row.detail.as_str().starts_with("Video only · Format video-137 · "));
+    }
+
+    #[test]
+    fn format_choices_include_only_formats_compatible_with_the_analyzed_mode() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"id":"sample","formats":[{"format_id":"av","ext":"mp4","vcodec":"avc1","acodec":"none"},{"format_id":"aa","ext":"m4a","vcodec":"none","acodec":"aac"},{"format_id":"muxed","ext":"mp4","vcodec":"avc1","acodec":"aac"}]}"#,
+        )
+        .unwrap();
+        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
+            &value,
+            "https://example.test/watch",
+            None,
+        );
+        let video_only = media_format_choice_labels(&metadata.formats, DownloadMode::VideoOnly);
+        let video = media_format_choice_labels(&metadata.formats, DownloadMode::Video);
+        let audio = media_format_choice_labels(&metadata.formats, DownloadMode::AudioOnly);
+
+        assert_eq!(video_only.len(), 2);
+        assert!(video_only[0].as_str().starts_with("Automatic"));
+        assert!(video_only[1].as_str().starts_with("av · "));
+        assert_eq!(video.len(), 2);
+        assert!(video[1].as_str().starts_with("muxed · "));
+        assert_eq!(audio.len(), 2);
+        assert!(audio[1].as_str().starts_with("aa · "));
+    }
+
+    #[test]
+    fn exact_format_queue_choice_requires_the_current_url_and_mode() {
+        let selection = "137 · mp4 · 1080p · video only · avc1";
+        assert_eq!(
+            selected_format_id_from_ui(
+                selection,
+                "https://example.test/watch",
+                "video_only",
+                "https://example.test/watch",
+                DownloadMode::VideoOnly,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("137")
+        );
+        assert!(
+            selected_format_id_from_ui(
+                selection,
+                "https://example.test/old",
+                "video_only",
+                "https://example.test/watch",
+                DownloadMode::VideoOnly,
+            )
+            .is_err()
+        );
+        assert!(
+            selected_format_id_from_ui(
+                selection,
+                "https://example.test/watch",
+                "video",
+                "https://example.test/watch",
+                DownloadMode::VideoOnly,
+            )
+            .is_err()
+        );
+        assert!(
+            selected_format_id_from_ui(
+                "137/140 · combined",
+                "https://example.test/watch",
+                "video",
+                "https://example.test/watch",
+                DownloadMode::Video,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            selected_format_id_from_ui(
+                AUTOMATIC_FORMAT_CHOICE,
+                "https://example.test/old",
+                "audio",
+                "https://example.test/watch",
+                DownloadMode::Video,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_format_menu_exposes_all_parsed_choices_up_to_the_display_cap() {
+        let formats = (0..120)
+            .map(|index| MediaFormatOption {
+                id: format!("video-{index}"),
+                extension: "mp4".to_owned(),
+                width: Some(1920),
+                height: Some(1080),
+                fps: None,
+                size_bytes: None,
+                size_is_estimate: false,
+                video_codec: Some("avc1".to_owned()),
+                audio_codec: None,
+            })
+            .collect::<Vec<_>>();
+
+        let choices = media_format_choice_labels(&formats, DownloadMode::VideoOnly);
+
+        assert_eq!(choices.len(), 101);
+        assert!(choices[100].as_str().starts_with("video-99 · "));
     }
 
     #[test]

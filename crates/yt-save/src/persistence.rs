@@ -9,7 +9,7 @@ use crate::{
     app_update::AppUpdateChannel,
     model::{
         AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
-        VideoQuality,
+        VideoQuality, normalize_download_speed_limit,
     },
 };
 
@@ -174,7 +174,8 @@ impl Store {
                     subtitle_format TEXT NOT NULL DEFAULT 'vtt',
                     include_auto_subtitles INTEGER NOT NULL DEFAULT 0,
                     scheduled_at INTEGER,
-                    selected_format_id TEXT
+                    selected_format_id TEXT,
+                    download_speed_limit_bytes_per_second INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE INDEX IF NOT EXISTS idx_downloads_updated_at
                     ON downloads(updated_at DESC);
@@ -281,6 +282,7 @@ impl Store {
                 ("include_auto_subtitles", "INTEGER NOT NULL DEFAULT 0"),
                 ("scheduled_at", "INTEGER"),
                 ("selected_format_id", "TEXT"),
+                ("download_speed_limit_bytes_per_second", "INTEGER NOT NULL DEFAULT 0"),
             ] {
                 let exists = {
                     let mut statement = connection.prepare("PRAGMA table_info(downloads)")?;
@@ -902,11 +904,14 @@ impl Store {
                 let audio_format = setting_value(connection, "new_download_audio_format")?;
                 let audio_quality = setting_value(connection, "new_download_audio_quality")?;
                 let video_quality = setting_value(connection, "new_download_video_quality")?;
+                let speed_limit =
+                    setting_value(connection, "new_download_speed_limit_bytes_per_second")?;
                 Ok(DownloadPresets::from_database_values(
                     mode.as_deref(),
                     audio_format.as_deref(),
                     audio_quality.as_deref(),
                     video_quality.as_deref(),
+                    speed_limit.as_deref(),
                 ))
             })
         })
@@ -1300,7 +1305,7 @@ impl Store {
         Ok(())
     }
 
-    /// Updates New download defaults atomically; queue rows and retries are untouched.
+    /// Updates New download format defaults atomically; the speed cap is persisted independently.
     pub async fn set_download_presets(
         &self,
         presets: DownloadPresets,
@@ -1309,7 +1314,7 @@ impl Store {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             store.with_connection(|connection| {
-                let [(_, mode), (_, audio_format), (_, audio_quality), (_, video_quality)] =
+                let [(_, mode), (_, audio_format), (_, audio_quality), (_, video_quality), _] =
                     presets.database_values();
                 connection.execute(
                     "INSERT INTO app_settings (key, value, updated_at)
@@ -1333,6 +1338,31 @@ impl Store {
         })
         .await
         .context("join preset write")??;
+        Ok(())
+    }
+
+    /// Saves the selected download-rate cap for future queue items.
+    pub async fn set_download_speed_limit(
+        &self,
+        bytes_per_second: u64,
+        updated_at: i64,
+    ) -> Result<()> {
+        let bytes_per_second = normalize_download_speed_limit(bytes_per_second).to_string();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('new_download_speed_limit_bytes_per_second', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": bytes_per_second, ":updated": updated_at },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join download speed-limit setting write")??;
         Ok(())
     }
 
@@ -2084,7 +2114,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             download_mode, audio_format, audio_quality, video_quality,
             download_directory, queue_rank, priority, retry_attempts, next_retry_at,
             subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-            selected_format_id
+            selected_format_id, download_speed_limit_bytes_per_second
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -2095,7 +2125,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
                       WHERE priority = :priority), 0) + 1024,
             :priority, :retry_attempts, :next_retry_at,
             :subtitle_languages, :subtitle_format, :include_auto_subtitles, :scheduled_at,
-            :selected_format_id
+            :selected_format_id, :speed_limit
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -2118,7 +2148,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             subtitle_format=excluded.subtitle_format,
             include_auto_subtitles=excluded.include_auto_subtitles,
             scheduled_at=excluded.scheduled_at,
-            selected_format_id=excluded.selected_format_id",
+            selected_format_id=excluded.selected_format_id,
+            download_speed_limit_bytes_per_second=excluded.download_speed_limit_bytes_per_second",
         named_params! {
             ":id": record.id,
             ":url": record.url,
@@ -2150,6 +2181,9 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":include_auto_subtitles": record.include_auto_subtitles,
             ":scheduled_at": record.scheduled_at,
             ":selected_format_id": record.selected_format_id,
+            ":speed_limit": i64::try_from(normalize_download_speed_limit(
+                record.download_speed_limit_bytes_per_second,
+            ))?,
         },
     )?;
     Ok(())
@@ -2224,7 +2258,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
                 subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-                selected_format_id
+                selected_format_id, download_speed_limit_bytes_per_second
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -2261,6 +2295,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 include_auto_subtitles: row.get(28)?,
                 scheduled_at: row.get(29)?,
                 selected_format_id: row.get(30)?,
+                download_speed_limit_bytes_per_second: download_speed_limit_from_row(row, 31)?,
             })
         })
         .optional()?;
@@ -2285,7 +2320,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
                 subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-                selected_format_id
+                selected_format_id, download_speed_limit_bytes_per_second
          FROM downloads
         ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN 0 ELSE 1 END,
                   CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN priority ELSE 0 END DESC,
@@ -2326,6 +2361,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             include_auto_subtitles: row.get(28)?,
             scheduled_at: row.get(29)?,
             selected_format_id: row.get(30)?,
+            download_speed_limit_bytes_per_second: download_speed_limit_from_row(row, 31)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -2349,6 +2385,11 @@ fn audio_quality_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<Audio
 fn video_quality_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<VideoQuality> {
     let value: String = row.get(index)?;
     VideoQuality::from_database_value(&value).ok_or_else(|| invalid_enum_value(index, &value))
+}
+
+fn download_speed_limit_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    Ok(u64::try_from(value).map(normalize_download_speed_limit).unwrap_or_default())
 }
 
 fn subtitle_format_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<SubtitleFormat> {
@@ -2809,23 +2850,31 @@ mod tests {
             audio_format: AudioFormat::Flac,
             audio_quality: AudioQuality::K192,
             video_quality: VideoQuality::P1440,
+            download_speed_limit_bytes_per_second: 500_000,
         };
         store.set_download_presets(audio_presets, 10).await.unwrap();
+        store.set_download_speed_limit(2_000_000, 15).await.unwrap();
         drop(store);
 
         let store = Store::open(db_path.clone()).unwrap();
-        assert_eq!(store.load_download_presets().await.unwrap(), audio_presets);
+        let audio_presets_with_speed =
+            DownloadPresets { download_speed_limit_bytes_per_second: 2_000_000, ..audio_presets };
+        assert_eq!(store.load_download_presets().await.unwrap(), audio_presets_with_speed);
         let presets = DownloadPresets {
             mode: DownloadMode::VideoOnly,
             audio_format: AudioFormat::Flac,
             audio_quality: AudioQuality::K192,
             video_quality: VideoQuality::P1440,
+            download_speed_limit_bytes_per_second: 500_000,
         };
         store.set_download_presets(presets, 20).await.unwrap();
         drop(store);
 
         let reopened = Store::open(db_path).unwrap();
-        assert_eq!(reopened.load_download_presets().await.unwrap(), presets);
+        assert_eq!(
+            reopened.load_download_presets().await.unwrap(),
+            DownloadPresets { download_speed_limit_bytes_per_second: 2_000_000, ..presets }
+        );
         reopened
             .with_connection(|connection| {
                 connection.execute(
@@ -2836,6 +2885,10 @@ mod tests {
                     "UPDATE app_settings SET value = '8k' WHERE key = 'new_download_video_quality'",
                     [],
                 )?;
+                connection.execute(
+                    "UPDATE app_settings SET value = '5000001' WHERE key = 'new_download_speed_limit_bytes_per_second'",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -2844,6 +2897,61 @@ mod tests {
         assert_eq!(recovered.audio_format, AudioFormat::Flac);
         assert_eq!(recovered.audio_quality, AudioQuality::Best);
         assert_eq!(recovered.video_quality, VideoQuality::Best);
+        assert_eq!(recovered.download_speed_limit_bytes_per_second, 0);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_preset_save_does_not_overwrite_newer_speed_limit_or_job_snapshot() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        let newer_speed_limit = 10_000_000;
+        let queued_speed_limit = 2_000_000;
+        store.set_download_speed_limit(newer_speed_limit, 20).await.unwrap();
+
+        let older_enqueue_presets = DownloadPresets {
+            mode: DownloadMode::AudioOnly,
+            audio_format: AudioFormat::Mp3,
+            audio_quality: AudioQuality::K192,
+            video_quality: VideoQuality::P720,
+            download_speed_limit_bytes_per_second: queued_speed_limit,
+        };
+        store.set_download_presets(older_enqueue_presets, 10).await.unwrap();
+
+        let mut queued = DownloadRecord::queued(
+            "older-speed-snapshot".to_owned(),
+            "https://example.test/media".to_owned(),
+            30,
+        );
+        queued.download_speed_limit_bytes_per_second = queued_speed_limit;
+        store.save_download(queued).await.unwrap();
+
+        let expected_current_presets = DownloadPresets {
+            download_speed_limit_bytes_per_second: newer_speed_limit,
+            ..older_enqueue_presets
+        };
+        assert_eq!(store.load_download_presets().await.unwrap(), expected_current_presets);
+        let saved_job = store
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == "older-speed-snapshot")
+            .unwrap();
+        assert_eq!(saved_job.download_speed_limit_bytes_per_second, queued_speed_limit);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(reopened.load_download_presets().await.unwrap(), expected_current_presets);
+        let reopened_job = reopened
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == "older-speed-snapshot")
+            .unwrap();
+        assert_eq!(reopened_job.download_speed_limit_bytes_per_second, queued_speed_limit);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -2951,6 +3059,7 @@ mod tests {
             audio_format: AudioFormat::Opus,
             audio_quality: AudioQuality::K128,
             video_quality: VideoQuality::P480,
+            download_speed_limit_bytes_per_second: 5_000_000,
         };
         let mut job = DownloadRecord::queued(
             "older-job".to_owned(),
@@ -2962,12 +3071,15 @@ mod tests {
         job.audio_format = job_presets.audio_format;
         job.audio_quality = job_presets.audio_quality;
         job.video_quality = job_presets.video_quality;
+        job.download_speed_limit_bytes_per_second =
+            job_presets.download_speed_limit_bytes_per_second;
         store.save_download(job).await.unwrap();
         let resume_presets = DownloadPresets {
             mode: DownloadMode::AudioOnly,
             audio_format: AudioFormat::M4a,
             audio_quality: AudioQuality::K192,
             video_quality: VideoQuality::P720,
+            download_speed_limit_bytes_per_second: 10_000_000,
         };
         let mut paused_job = DownloadRecord::queued(
             "paused-job".to_owned(),
@@ -2979,6 +3091,8 @@ mod tests {
         paused_job.audio_format = resume_presets.audio_format;
         paused_job.audio_quality = resume_presets.audio_quality;
         paused_job.video_quality = resume_presets.video_quality;
+        paused_job.download_speed_limit_bytes_per_second =
+            resume_presets.download_speed_limit_bytes_per_second;
         store.save_download(paused_job).await.unwrap();
 
         let current_form = DownloadPresets {
@@ -2986,18 +3100,25 @@ mod tests {
             audio_format: AudioFormat::Aac,
             audio_quality: AudioQuality::K320,
             video_quality: VideoQuality::P2160,
+            download_speed_limit_bytes_per_second: 25_000_000,
         };
+        store
+            .set_download_speed_limit(current_form.download_speed_limit_bytes_per_second, 19)
+            .await
+            .unwrap();
         store.set_download_presets(current_form, 20).await.unwrap();
         let retried = store.retry_download("older-job", 30).await.unwrap().unwrap();
         assert_eq!(retried.download_mode, job_presets.mode);
         assert_eq!(retried.audio_format, job_presets.audio_format);
         assert_eq!(retried.audio_quality, job_presets.audio_quality);
         assert_eq!(retried.video_quality, job_presets.video_quality);
+        assert_eq!(retried.download_speed_limit_bytes_per_second, 5_000_000);
         let resumed = store.resume_download("paused-job", 31).await.unwrap().unwrap();
         assert_eq!(resumed.download_mode, resume_presets.mode);
         assert_eq!(resumed.audio_format, resume_presets.audio_format);
         assert_eq!(resumed.audio_quality, resume_presets.audio_quality);
         assert_eq!(resumed.video_quality, resume_presets.video_quality);
+        assert_eq!(resumed.download_speed_limit_bytes_per_second, 10_000_000);
         assert_eq!(store.load_download_presets().await.unwrap(), current_form);
         drop(store);
 
@@ -3009,11 +3130,13 @@ mod tests {
         assert_eq!(saved_job.audio_format, job_presets.audio_format);
         assert_eq!(saved_job.audio_quality, job_presets.audio_quality);
         assert_eq!(saved_job.video_quality, job_presets.video_quality);
+        assert_eq!(saved_job.download_speed_limit_bytes_per_second, 5_000_000);
         let saved_paused_job = saved_jobs.iter().find(|job| job.id == "paused-job").unwrap();
         assert_eq!(saved_paused_job.download_mode, resume_presets.mode);
         assert_eq!(saved_paused_job.audio_format, resume_presets.audio_format);
         assert_eq!(saved_paused_job.audio_quality, resume_presets.audio_quality);
         assert_eq!(saved_paused_job.video_quality, resume_presets.video_quality);
+        assert_eq!(saved_paused_job.download_speed_limit_bytes_per_second, 10_000_000);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -3169,6 +3292,7 @@ mod tests {
         assert_eq!(legacy.audio_quality, AudioQuality::Best);
         assert_eq!(legacy.video_quality, VideoQuality::Best);
         assert_eq!(legacy.selected_format_id, None);
+        assert_eq!(legacy.download_speed_limit_bytes_per_second, 0);
         assert_eq!(legacy.download_directory, legacy_default);
         assert_eq!(legacy.retry_attempts, 0);
         assert_eq!(legacy.next_retry_at, None);
@@ -3186,6 +3310,7 @@ mod tests {
         selected.audio_format = AudioFormat::M4a;
         selected.audio_quality = AudioQuality::K192;
         selected.video_quality = VideoQuality::P720;
+        selected.download_speed_limit_bytes_per_second = 5_000_000;
         selected.download_directory = temp_dir.join("Selected").to_string_lossy().into_owned();
         store.save_download(selected).await.unwrap();
         drop(store);
@@ -3206,6 +3331,7 @@ mod tests {
         assert_eq!(selected.audio_format, AudioFormat::M4a);
         assert_eq!(selected.audio_quality, AudioQuality::K192);
         assert_eq!(selected.video_quality, VideoQuality::P720);
+        assert_eq!(selected.download_speed_limit_bytes_per_second, 5_000_000);
         assert_eq!(selected.selected_format_id, None);
         assert_eq!(
             selected.download_directory,

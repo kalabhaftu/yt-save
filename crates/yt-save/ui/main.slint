@@ -121,6 +121,7 @@ export component MainWindow inherits Window {
     in-out property <bool> confirm-cancel-all: false;
     in-out property <string> max-concurrent-downloads: "1";
     in-out property <string> concurrent-fragments: "1";
+    in-out property <string> download-speed-limit: "Unlimited";
     in-out property <string> auto-retry-attempts: "3";
     in-out property <string> history-search: "";
     in-out property <bool> show-library: false;
@@ -224,6 +225,7 @@ export component MainWindow inherits Window {
     callback download-priority-requested(string, int);
     callback max-concurrent-downloads-requested(string);
     callback concurrent-fragments-requested(string);
+    callback download-speed-limit-requested(string);
     callback auto-retry-attempts-requested(string);
     callback open-output-requested(string);
     callback reveal-output-requested(string);
@@ -241,6 +243,10 @@ export component MainWindow inherits Window {
 
     changed concurrent-fragments => {
         root.concurrent-fragments-requested(root.concurrent-fragments);
+    }
+
+    changed download-speed-limit => {
+        root.download-speed-limit-requested(root.download-speed-limit);
     }
 
     changed auto-retry-attempts => {
@@ -1648,6 +1654,18 @@ export component MainWindow inherits Window {
                                 width: 64px;
                                 height: 32px;
                             }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        HorizontalLayout {
+                            height: 32px;
+                            Text { text: "Per-download speed cap"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                            ComboBox {
+                                model: ["Unlimited", "250 KB/s", "500 KB/s", "1 MB/s", "2 MB/s", "5 MB/s", "10 MB/s", "25 MB/s", "50 MB/s"];
+                                current-value <=> root.download-speed-limit;
+                                width: 112px;
+                                height: 30px;
+                            }
+                            Text { text: "Each job has its own cap; parallel jobs can exceed it together"; color: #727b92; font-size: 10px; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
                         }
                         HorizontalLayout {

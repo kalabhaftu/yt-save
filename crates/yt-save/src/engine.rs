@@ -20,7 +20,8 @@ use crate::{
     dependencies::DependencyPaths,
     model::{
         AudioFormat, AudioQuality, DownloadMode, MediaMetadata, SubtitleFormat, VideoQuality,
-        is_safe_format_id, normalize_subtitle_languages,
+        download_speed_limit_argument, is_safe_format_id, normalize_download_speed_limit,
+        normalize_subtitle_languages,
     },
 };
 
@@ -55,6 +56,7 @@ pub(crate) struct DownloadOptions {
     subtitle_format: SubtitleFormat,
     include_auto_subtitles: bool,
     concurrent_fragments: usize,
+    download_speed_limit_bytes_per_second: u64,
     output_directory: Option<PathBuf>,
     selected_format_id: Option<String>,
 }
@@ -74,6 +76,7 @@ impl DownloadOptions {
             subtitle_format: SubtitleFormat::Vtt,
             include_auto_subtitles: false,
             concurrent_fragments: 1,
+            download_speed_limit_bytes_per_second: 0,
             output_directory: None,
             selected_format_id: None,
         }
@@ -96,6 +99,12 @@ impl DownloadOptions {
 
     pub(crate) fn with_concurrent_fragments(mut self, concurrent_fragments: usize) -> Self {
         self.concurrent_fragments = concurrent_fragments.clamp(1, 8);
+        self
+    }
+
+    pub(crate) fn with_download_speed_limit(mut self, bytes_per_second: u64) -> Self {
+        self.download_speed_limit_bytes_per_second =
+            normalize_download_speed_limit(bytes_per_second);
         self
     }
 
@@ -517,6 +526,11 @@ impl DownloadEngine {
             .arg(format!("home:{}", output_directory.display()))
             .arg("--output")
             .arg(OUTPUT_TEMPLATE);
+        if let Some(rate) =
+            download_speed_limit_argument(options.download_speed_limit_bytes_per_second)
+        {
+            command.arg("--limit-rate").arg(rate);
+        }
         match options.mode {
             DownloadMode::Video => {
                 command
@@ -1091,9 +1105,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!arguments.iter().any(|argument| argument == "--playlist-items"));
         assert!(arguments.iter().any(|argument| argument == "--continue"));
+        assert!(!arguments.iter().any(|argument| argument == "--limit-rate"));
         let fragment_flag =
             arguments.iter().position(|argument| argument == "--concurrent-fragments").unwrap();
         assert_eq!(arguments.get(fragment_flag + 1).map(String::as_str), Some("4"));
+
+        let limited_arguments = engine
+            .download_command(
+                "https://example.test/watch/123",
+                None,
+                DownloadOptions::default().with_download_speed_limit(2_000_000),
+            )
+            .unwrap()
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let rate_flag =
+            limited_arguments.iter().position(|argument| argument == "--limit-rate").unwrap();
+        assert_eq!(limited_arguments.get(rate_flag + 1).map(String::as_str), Some("2000000"));
 
         let output_flag = arguments.iter().position(|argument| argument == "--output").unwrap();
         assert_eq!(arguments.get(output_flag + 1).map(String::as_str), Some(OUTPUT_TEMPLATE));

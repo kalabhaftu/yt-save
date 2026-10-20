@@ -34,9 +34,9 @@ use crate::{
     history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
-        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, format_bytes, format_duration,
-        format_is_available, is_safe_format_id, normalize_subtitle_languages,
-        subtitle_languages_available,
+        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_from_label,
+        download_speed_limit_label, format_bytes, format_duration, format_is_available,
+        is_safe_format_id, normalize_subtitle_languages, subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
@@ -830,6 +830,9 @@ pub fn run() -> Result<()> {
     window.set_video_quality(download_presets.video_quality.label().into());
     window.set_max_concurrent_downloads(max_concurrent_downloads.to_string().into());
     window.set_concurrent_fragments(concurrent_fragments.to_string().into());
+    window.set_download_speed_limit(
+        download_speed_limit_label(download_presets.download_speed_limit_bytes_per_second).into(),
+    );
     window.set_auto_retry_attempts(
         if auto_retry_attempts == 0 { "Off".to_owned() } else { auto_retry_attempts.to_string() }
             .into(),
@@ -2704,6 +2707,7 @@ pub fn run() -> Result<()> {
             audio_format,
             audio_quality,
             video_quality,
+            speed_limit_label,
             directory,
             scheduled,
             local_time,
@@ -2717,6 +2721,7 @@ pub fn run() -> Result<()> {
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
+                    window.get_download_speed_limit().to_string(),
                     window.get_download_directory().to_string(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
@@ -2747,7 +2752,8 @@ pub fn run() -> Result<()> {
             &audio_format,
             &audio_quality,
             &video_quality,
-        );
+        )
+        .with_download_speed_limit_label(&speed_limit_label);
         let store = queue_subscription_store.clone();
         let review = queue_subscription_review.clone();
         let weak_window = queue_subscription_window.clone();
@@ -2793,6 +2799,8 @@ pub fn run() -> Result<()> {
                     record.audio_format = presets.audio_format;
                     record.audio_quality = presets.audio_quality;
                     record.video_quality = presets.video_quality;
+                    record.download_speed_limit_bytes_per_second =
+                        presets.download_speed_limit_bytes_per_second;
                     record.scheduled_at = scheduled_at;
                     if scheduled_at.is_some() {
                         record.status = "Waiting for schedule".to_owned();
@@ -2896,7 +2904,7 @@ pub fn run() -> Result<()> {
             (selected_exact_format, format_choice_mode, format_choice_source_url),
             selected_quality,
             selected_video_quality,
-            selected_directory,
+            (selected_speed_limit, selected_directory),
             (schedule_enabled, schedule_local_time),
         ) = enqueue_window
             .upgrade()
@@ -2916,7 +2924,10 @@ pub fn run() -> Result<()> {
                     ),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
-                    window.get_download_directory().to_string(),
+                    (
+                        window.get_download_speed_limit().to_string(),
+                        window.get_download_directory().to_string(),
+                    ),
                     (window.get_schedule_download(), window.get_schedule_local_time().to_string()),
                 )
             })
@@ -2953,7 +2964,8 @@ pub fn run() -> Result<()> {
             &selected_format,
             &selected_quality,
             &selected_video_quality,
-        );
+        )
+        .with_download_speed_limit_label(&selected_speed_limit);
         record.download_mode = if subtitle_only {
             DownloadMode::SubtitlesOnly
         } else {
@@ -2975,6 +2987,8 @@ pub fn run() -> Result<()> {
         record.audio_format = download_presets.audio_format;
         record.audio_quality = download_presets.audio_quality;
         record.video_quality = download_presets.video_quality;
+        record.download_speed_limit_bytes_per_second =
+            download_presets.download_speed_limit_bytes_per_second;
         record.subtitle_languages = normalized_subtitle_languages;
         record.subtitle_format = SubtitleFormat::from_database_value(&selected_subtitle_format)
             .unwrap_or_default();
@@ -3137,6 +3151,7 @@ pub fn run() -> Result<()> {
             selected_format,
             selected_quality,
             selected_video_quality,
+            selected_speed_limit,
             selected_directory,
             schedule_enabled,
             schedule_local_time,
@@ -3151,6 +3166,7 @@ pub fn run() -> Result<()> {
                 window.get_audio_format().to_string(),
                 window.get_audio_quality().to_string(),
                 window.get_video_quality().to_string(),
+                window.get_download_speed_limit().to_string(),
                 window.get_download_directory().to_string(),
                 window.get_schedule_download(),
                 window.get_schedule_local_time().to_string(),
@@ -3192,7 +3208,8 @@ pub fn run() -> Result<()> {
             &selected_format,
             &selected_quality,
             &selected_video_quality,
-        );
+        )
+        .with_download_speed_limit_label(&selected_speed_limit);
         let subtitle_format =
             SubtitleFormat::from_database_value(&selected_subtitle_format).unwrap_or_default();
         let Some(batch_guard) =
@@ -3543,6 +3560,7 @@ pub fn run() -> Result<()> {
             selected_format,
             selected_quality,
             selected_video_quality,
+            selected_speed_limit,
             selected_directory,
             schedule_enabled,
             schedule_local_time,
@@ -3555,6 +3573,7 @@ pub fn run() -> Result<()> {
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
+                window.get_download_speed_limit().to_string(),
                     window.get_download_directory().to_string(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
@@ -3578,7 +3597,8 @@ pub fn run() -> Result<()> {
             &selected_format,
             &selected_quality,
             &selected_video_quality,
-        );
+        )
+        .with_download_speed_limit_label(&selected_speed_limit);
         let _ = selected_queue_events.send(UiEvent::Status(format!(
             "Adding {} selected playlist entries to the queue…",
             selected_entries.len()
@@ -3627,6 +3647,8 @@ pub fn run() -> Result<()> {
                 record.audio_format = download_presets.audio_format;
                 record.audio_quality = download_presets.audio_quality;
                 record.video_quality = download_presets.video_quality;
+                record.download_speed_limit_bytes_per_second =
+                    download_presets.download_speed_limit_bytes_per_second;
                 record.scheduled_at = scheduled_at;
                 if scheduled_at.is_some() {
                     record.status = "Waiting for schedule".to_owned();
@@ -3900,6 +3922,60 @@ pub fn run() -> Result<()> {
                     }
                     let _ = events.send(UiEvent::Status(format!(
                         "Could not save the fragment concurrency limit: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
+    let speed_limit_store = store.clone();
+    let speed_limit_events = events_tx.clone();
+    let speed_limit_handle = handle.clone();
+    let speed_limit_generation = Arc::new(AtomicU64::new(0));
+    let speed_limit_write_lock = Arc::new(AsyncMutex::new(()));
+    let speed_limit_window = window.as_weak();
+    window.on_download_speed_limit_requested(move |label| {
+        let bytes_per_second = download_speed_limit_from_label(&label);
+        let generation_state = speed_limit_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = speed_limit_write_lock.clone();
+        let store = speed_limit_store.clone();
+        let events = speed_limit_events.clone();
+        let weak_window = speed_limit_window.clone();
+        speed_limit_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let previous = store
+                .load_download_presets()
+                .await
+                .map(|presets| presets.download_speed_limit_bytes_per_second)
+                .unwrap_or_default();
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            match store.set_download_speed_limit(bytes_per_second, now()).await {
+                Ok(()) => {
+                    let label = download_speed_limit_label(bytes_per_second);
+                    let _ = events.send(UiEvent::Status(if bytes_per_second == 0 {
+                        "Download speed is unlimited for new queue items.".to_owned()
+                    } else {
+                        format!("New queue items are limited to {label}.")
+                    }));
+                }
+                Err(error) => {
+                    error!(%error, "save download speed limit");
+                    if generation_state.load(Ordering::Acquire) == generation {
+                        let previous_value = download_speed_limit_label(previous).to_owned().into();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_download_speed_limit(previous_value);
+                            }
+                        });
+                    }
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save the download speed limit: {error}"
                     )));
                 }
             }
@@ -5823,6 +5899,7 @@ async fn run_download_job(
                 .with_video_quality(active.video_quality)
                 .with_selected_format_id(active.selected_format_id.clone())
                 .with_concurrent_fragments(concurrent_fragments)
+                .with_download_speed_limit(active.download_speed_limit_bytes_per_second)
                 .with_subtitle_options(
                     active.subtitle_languages.clone(),
                     active.subtitle_format,
@@ -6157,6 +6234,8 @@ fn queued_batch_record(
     record.audio_format = settings.presets.audio_format;
     record.audio_quality = settings.presets.audio_quality;
     record.video_quality = settings.presets.video_quality;
+    record.download_speed_limit_bytes_per_second =
+        settings.presets.download_speed_limit_bytes_per_second;
     record.subtitle_languages = settings.subtitle_languages.clone();
     record.subtitle_format = settings.subtitle_format;
     record.include_auto_subtitles = settings.include_auto_subtitles;
@@ -6624,13 +6703,21 @@ fn row_view_with_queue_position(
             if record.include_auto_subtitles { " · auto captions" } else { " · manual captions" }
         ),
     };
+    let speed_limit = if record.download_speed_limit_bytes_per_second == 0 {
+        String::new()
+    } else {
+        format!(
+            " · Max {}",
+            download_speed_limit_label(record.download_speed_limit_bytes_per_second)
+        )
+    };
     let playlist_group = record
         .playlist_group_title
         .as_deref()
         .filter(|title| !title.is_empty())
         .map(|title| format!("Playlist · {title} · "))
         .unwrap_or_default();
-    let details = format!("{playlist_group}{selection} · {details}");
+    let details = format!("{playlist_group}{selection}{speed_limit} · {details}");
     DownloadRowData {
         id: SharedString::from(record.id.as_str()),
         title: SharedString::from(record.title.as_str()),
@@ -8357,7 +8444,8 @@ mod tests {
     #[test]
     fn queued_batch_records_snapshot_download_settings_and_schedule() {
         let settings = BatchDownloadSettings {
-            presets: DownloadPresets::from_ui_values(true, false, "mp3", "192k", "720p"),
+            presets: DownloadPresets::from_ui_values(true, false, "mp3", "192k", "720p")
+                .with_download_speed_limit_label("2 MB/s"),
             subtitle_languages: "en,fr".to_owned(),
             subtitle_format: SubtitleFormat::Srt,
             include_auto_subtitles: true,
@@ -8380,6 +8468,7 @@ mod tests {
         assert_eq!(record.audio_format, settings.presets.audio_format);
         assert_eq!(record.audio_quality, settings.presets.audio_quality);
         assert_eq!(record.video_quality, settings.presets.video_quality);
+        assert_eq!(record.download_speed_limit_bytes_per_second, 2_000_000);
         assert_eq!(record.subtitle_languages, settings.subtitle_languages);
         assert_eq!(record.subtitle_format, settings.subtitle_format);
         assert!(record.include_auto_subtitles);
@@ -8457,7 +8546,12 @@ mod tests {
             audio_format: AudioFormat::Flac,
             audio_quality: AudioQuality::K320,
             video_quality: VideoQuality::P1440,
+            download_speed_limit_bytes_per_second: 2_000_000,
         };
+        store
+            .set_download_speed_limit(saved_presets.download_speed_limit_bytes_per_second, 1)
+            .await
+            .unwrap();
         store.set_download_presets(saved_presets, 1).await.unwrap();
         let queued = DownloadRecord::queued(
             "queued".to_owned(),

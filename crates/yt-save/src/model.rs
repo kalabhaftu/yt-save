@@ -1,5 +1,52 @@
 use serde::{Deserialize, Serialize};
 
+pub const DOWNLOAD_SPEED_LIMIT_CHOICES: [u64; 9] =
+    [0, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000];
+
+pub fn normalize_download_speed_limit(bytes_per_second: u64) -> u64 {
+    if DOWNLOAD_SPEED_LIMIT_CHOICES.contains(&bytes_per_second) { bytes_per_second } else { 0 }
+}
+
+pub fn download_speed_limit_from_database(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(normalize_download_speed_limit)
+        .unwrap_or_default()
+}
+
+pub fn download_speed_limit_from_label(value: &str) -> u64 {
+    match value {
+        "250 KB/s" => 250_000,
+        "500 KB/s" => 500_000,
+        "1 MB/s" => 1_000_000,
+        "2 MB/s" => 2_000_000,
+        "5 MB/s" => 5_000_000,
+        "10 MB/s" => 10_000_000,
+        "25 MB/s" => 25_000_000,
+        "50 MB/s" => 50_000_000,
+        _ => 0,
+    }
+}
+
+pub fn download_speed_limit_label(bytes_per_second: u64) -> &'static str {
+    match normalize_download_speed_limit(bytes_per_second) {
+        250_000 => "250 KB/s",
+        500_000 => "500 KB/s",
+        1_000_000 => "1 MB/s",
+        2_000_000 => "2 MB/s",
+        5_000_000 => "5 MB/s",
+        10_000_000 => "10 MB/s",
+        25_000_000 => "25 MB/s",
+        50_000_000 => "50 MB/s",
+        _ => "Unlimited",
+    }
+}
+
+pub fn download_speed_limit_argument(bytes_per_second: u64) -> Option<String> {
+    let bytes_per_second = normalize_download_speed_limit(bytes_per_second);
+    (bytes_per_second != 0).then(|| bytes_per_second.to_string())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DownloadMode {
     #[default]
@@ -316,6 +363,7 @@ pub struct DownloadPresets {
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
     pub video_quality: VideoQuality,
+    pub download_speed_limit_bytes_per_second: u64,
 }
 
 impl DownloadPresets {
@@ -324,6 +372,7 @@ impl DownloadPresets {
         audio_format: Option<&str>,
         audio_quality: Option<&str>,
         video_quality: Option<&str>,
+        download_speed_limit: Option<&str>,
     ) -> Self {
         Self {
             mode: mode.and_then(DownloadMode::from_database_value).unwrap_or_default(),
@@ -336,6 +385,9 @@ impl DownloadPresets {
             video_quality: video_quality
                 .and_then(VideoQuality::from_database_value)
                 .unwrap_or_default(),
+            download_speed_limit_bytes_per_second: download_speed_limit_from_database(
+                download_speed_limit,
+            ),
         }
     }
 
@@ -357,16 +409,26 @@ impl DownloadPresets {
             audio_format: AudioFormat::from_database_value(audio_format).unwrap_or_default(),
             audio_quality: AudioQuality::from_database_value(audio_quality).unwrap_or_default(),
             video_quality: VideoQuality::from_ui_label(video_quality).unwrap_or_default(),
+            download_speed_limit_bytes_per_second: 0,
         }
     }
 
-    pub fn database_values(self) -> [(&'static str, &'static str); 4] {
+    pub fn database_values(self) -> [(&'static str, String); 5] {
         [
-            ("new_download_mode", self.mode.as_database_value()),
-            ("new_download_audio_format", self.audio_format.as_database_value()),
-            ("new_download_audio_quality", self.audio_quality.as_database_value()),
-            ("new_download_video_quality", self.video_quality.as_database_value()),
+            ("new_download_mode", self.mode.as_database_value().to_owned()),
+            ("new_download_audio_format", self.audio_format.as_database_value().to_owned()),
+            ("new_download_audio_quality", self.audio_quality.as_database_value().to_owned()),
+            ("new_download_video_quality", self.video_quality.as_database_value().to_owned()),
+            (
+                "new_download_speed_limit_bytes_per_second",
+                self.download_speed_limit_bytes_per_second.to_string(),
+            ),
         ]
+    }
+
+    pub fn with_download_speed_limit_label(mut self, label: &str) -> Self {
+        self.download_speed_limit_bytes_per_second = download_speed_limit_from_label(label);
+        self
     }
 }
 
@@ -674,6 +736,8 @@ pub struct DownloadRecord {
     pub video_quality: VideoQuality,
     /// Media-specific yt-dlp format ID; never stores its signed stream URL.
     pub selected_format_id: Option<String>,
+    /// Maximum transfer rate captured when the queue item was added; zero means unlimited.
+    pub download_speed_limit_bytes_per_second: u64,
     /// Destination directory captured when this queue item was added.
     pub download_directory: String,
     pub title: String,
@@ -715,6 +779,7 @@ impl DownloadRecord {
             audio_quality: AudioQuality::Best,
             video_quality: VideoQuality::Best,
             selected_format_id: None,
+            download_speed_limit_bytes_per_second: 0,
             download_directory: String::new(),
             title: "Waiting for media details".to_owned(),
             source: String::new(),
@@ -1067,39 +1132,46 @@ mod tests {
             Some("flac"),
             Some("192k"),
             Some("1440p"),
+            Some("2000000"),
         );
         assert_eq!(saved.mode, DownloadMode::VideoOnly);
         assert_eq!(saved.audio_format, AudioFormat::Flac);
         assert_eq!(saved.audio_quality, AudioQuality::K192);
         assert_eq!(saved.video_quality, VideoQuality::P1440);
+        assert_eq!(saved.download_speed_limit_bytes_per_second, 2_000_000);
 
         let recovered = DownloadPresets::from_database_values(
             Some("invalid-mode"),
             Some("mp3"),
             Some("invalid-bitrate"),
             Some("720p"),
+            Some("5000001"),
         );
         assert_eq!(recovered.mode, DownloadMode::Video);
         assert_eq!(recovered.audio_format, AudioFormat::Mp3);
         assert_eq!(recovered.audio_quality, AudioQuality::Best);
         assert_eq!(recovered.video_quality, VideoQuality::P720);
+        assert_eq!(recovered.download_speed_limit_bytes_per_second, 0);
         assert_eq!(DownloadPresets::default(), recovered_default_presets());
     }
 
     #[test]
     fn new_download_presets_accept_ui_video_labels_and_stable_audio_values() {
-        let presets = DownloadPresets::from_ui_values(false, false, "opus", "320k", "2160p / 4K");
+        let presets = DownloadPresets::from_ui_values(false, false, "opus", "320k", "2160p / 4K")
+            .with_download_speed_limit_label("5 MB/s");
         assert_eq!(presets.mode, DownloadMode::Video);
         assert_eq!(presets.audio_format, AudioFormat::Opus);
         assert_eq!(presets.audio_quality, AudioQuality::K320);
         assert_eq!(presets.video_quality, VideoQuality::P2160);
+        assert_eq!(presets.download_speed_limit_bytes_per_second, 5_000_000);
         assert_eq!(
             presets.database_values(),
             [
-                ("new_download_mode", "video"),
-                ("new_download_audio_format", "opus"),
-                ("new_download_audio_quality", "320k"),
-                ("new_download_video_quality", "2160p"),
+                ("new_download_mode", "video".to_owned()),
+                ("new_download_audio_format", "opus".to_owned()),
+                ("new_download_audio_quality", "320k".to_owned()),
+                ("new_download_video_quality", "2160p".to_owned()),
+                ("new_download_speed_limit_bytes_per_second", "5000000".to_owned()),
             ]
         );
     }
@@ -1108,7 +1180,7 @@ mod tests {
     fn video_only_ui_preset_is_distinct_from_video_with_audio() {
         let presets = DownloadPresets::from_ui_values(false, true, "mp3", "320k", "720p");
         assert_eq!(presets.mode, DownloadMode::VideoOnly);
-        assert_eq!(presets.database_values()[0], ("new_download_mode", "video_only"));
+        assert_eq!(presets.database_values()[0], ("new_download_mode", "video_only".to_owned()));
         assert_eq!(
             DownloadPresets::from_ui_values(false, false, "original", "best", "Best").mode,
             DownloadMode::Video
@@ -1119,7 +1191,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_speed_limits_have_bounded_ui_database_and_engine_values() {
+        for (label, bytes_per_second, argument) in [
+            ("Unlimited", 0, None),
+            ("250 KB/s", 250_000, Some("250000")),
+            ("500 KB/s", 500_000, Some("500000")),
+            ("1 MB/s", 1_000_000, Some("1000000")),
+            ("2 MB/s", 2_000_000, Some("2000000")),
+            ("5 MB/s", 5_000_000, Some("5000000")),
+            ("10 MB/s", 10_000_000, Some("10000000")),
+            ("25 MB/s", 25_000_000, Some("25000000")),
+            ("50 MB/s", 50_000_000, Some("50000000")),
+        ] {
+            assert_eq!(download_speed_limit_from_label(label), bytes_per_second);
+            assert_eq!(download_speed_limit_label(bytes_per_second), label);
+            assert_eq!(
+                download_speed_limit_from_database(Some(&bytes_per_second.to_string())),
+                bytes_per_second
+            );
+            assert_eq!(download_speed_limit_argument(bytes_per_second).as_deref(), argument);
+        }
+        assert_eq!(download_speed_limit_from_label("100 MB/s"), 0);
+        assert_eq!(download_speed_limit_from_database(Some("100000000")), 0);
+        assert_eq!(download_speed_limit_from_database(Some("invalid")), 0);
+        assert_eq!(normalize_download_speed_limit(u64::MAX), 0);
+    }
+
     fn recovered_default_presets() -> DownloadPresets {
-        DownloadPresets::from_database_values(None, None, None, None)
+        DownloadPresets::from_database_values(None, None, None, None, None)
     }
 }

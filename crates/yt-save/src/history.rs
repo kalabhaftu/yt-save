@@ -1,6 +1,6 @@
 use crate::model::DownloadRecord;
 
-const HISTORY_COLUMNS: [&str; 29] = [
+const HISTORY_COLUMNS: [&str; 30] = [
     "id",
     "url",
     "queue_order",
@@ -14,6 +14,7 @@ const HISTORY_COLUMNS: [&str; 29] = [
     "audio_quality",
     "video_quality",
     "exact_format_id",
+    "download_speed_limit_bytes_per_second",
     "download_directory",
     "title",
     "source",
@@ -50,6 +51,7 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.audio_quality.as_database_value().to_owned(),
             record.video_quality.as_database_value().to_owned(),
             record.selected_format_id.clone().unwrap_or_default(),
+            record.download_speed_limit_bytes_per_second.to_string(),
             record.download_directory.clone(),
             record.title.clone(),
             record.source.clone(),
@@ -103,6 +105,7 @@ mod tests {
         let csv = download_history_csv(&[]);
 
         assert!(csv.starts_with("\"id\",\"url\",\"queue_order\""));
+        assert!(csv.contains("\"exact_format_id\",\"download_speed_limit_bytes_per_second\""));
         assert!(csv.ends_with(
             "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\",\"scheduled_at_unix\"\r\n"
         ));
@@ -129,6 +132,7 @@ mod tests {
         record.eta_seconds = Some(5);
         record.scheduled_at = Some(1_700_000_030);
         record.selected_format_id = Some("format-137".to_owned());
+        record.download_speed_limit_bytes_per_second = 2_000_000;
         record.output_path = Some("C:\\Media\\item.mp4".to_owned());
         record.updated_at = 1_700_000_060;
 
@@ -136,7 +140,7 @@ mod tests {
 
         assert!(csv.contains("\"job-1\",\"https://example.test/watch?id=1\",\"3\",\"1\",\"7\""));
         assert!(csv.contains("\"video_quality\",\"exact_format_id\""));
-        assert!(csv.contains("\"best\",\"format-137\""));
+        assert!(csv.contains("\"best\",\"format-137\",\"2000000\""));
         assert!(csv.contains("\"A \"\"quoted\"\", title\r\ncontinued\""));
         assert!(csv.contains(
             "\"Example, site\",\"Completed\",\"100.00\",\"1024\",\"2048\",\"32.50\",\"5\""

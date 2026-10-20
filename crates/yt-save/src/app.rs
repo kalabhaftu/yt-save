@@ -818,6 +818,7 @@ pub fn run() -> Result<()> {
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
     window.set_audio_only(download_presets.mode == DownloadMode::AudioOnly);
+    window.set_video_only(download_presets.mode == DownloadMode::VideoOnly);
     window.set_subtitle_only(download_presets.mode == DownloadMode::SubtitlesOnly);
     window.set_audio_format(download_presets.audio_format.as_database_value().into());
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
@@ -2650,6 +2651,7 @@ pub fn run() -> Result<()> {
         }
         let (
             audio_only,
+            video_only,
             subtitle_only,
             audio_format,
             audio_quality,
@@ -2662,6 +2664,7 @@ pub fn run() -> Result<()> {
             .map(|window| {
                 (
                     window.get_audio_only(),
+                    window.get_video_only(),
                     window.get_subtitle_only(),
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
@@ -2674,7 +2677,7 @@ pub fn run() -> Result<()> {
             .unwrap_or_default();
         if subtitle_only {
             let _ = queue_subscription_events.send(UiEvent::Status(
-                "Subtitle-only playlist batches are not available yet. Choose Video or Audio only."
+                "Subtitle-only playlist batches are not available yet. Choose Video + audio, Video only, or Audio only."
                     .to_owned(),
             ));
             return;
@@ -2692,6 +2695,7 @@ pub fn run() -> Result<()> {
         };
         let presets = DownloadPresets::from_ui_values(
             audio_only,
+            video_only,
             &audio_format,
             &audio_quality,
             &video_quality,
@@ -2834,6 +2838,7 @@ pub fn run() -> Result<()> {
         ));
         let (
             audio_only,
+            video_only,
             subtitle_only,
             selected_subtitle_languages,
             selected_subtitle_format,
@@ -2849,6 +2854,7 @@ pub fn run() -> Result<()> {
             .map(|window| {
                 (
                     window.get_audio_only(),
+                    window.get_video_only(),
                     window.get_subtitle_only(),
                     window.get_subtitle_languages().to_string(),
                     window.get_subtitle_format().to_string(),
@@ -2890,6 +2896,7 @@ pub fn run() -> Result<()> {
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
         let download_presets = DownloadPresets::from_ui_values(
             audio_only,
+            video_only,
             &selected_format,
             &selected_quality,
             &selected_video_quality,
@@ -3044,6 +3051,7 @@ pub fn run() -> Result<()> {
         let inspection_count = parsed.urls.len();
         let Some((
             audio_only,
+            video_only,
             subtitle_only,
             selected_subtitle_languages,
             selected_subtitle_format,
@@ -3057,6 +3065,7 @@ pub fn run() -> Result<()> {
         )) = batch_window.upgrade().map(|window| {
             (
                 window.get_audio_only(),
+                window.get_video_only(),
                 window.get_subtitle_only(),
                 window.get_subtitle_languages().to_string(),
                 window.get_subtitle_format().to_string(),
@@ -3101,6 +3110,7 @@ pub fn run() -> Result<()> {
         };
         let download_presets = DownloadPresets::from_ui_values(
             audio_only,
+            video_only,
             &selected_format,
             &selected_quality,
             &selected_video_quality,
@@ -3451,6 +3461,7 @@ pub fn run() -> Result<()> {
         }
         let (
             audio_only,
+            video_only,
             selected_format,
             selected_quality,
             selected_video_quality,
@@ -3462,6 +3473,7 @@ pub fn run() -> Result<()> {
             .map(|window| {
                 (
                     window.get_audio_only(),
+                    window.get_video_only(),
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
@@ -3484,6 +3496,7 @@ pub fn run() -> Result<()> {
         };
         let download_presets = DownloadPresets::from_ui_values(
             audio_only,
+            video_only,
             &selected_format,
             &selected_quality,
             &selected_video_quality,
@@ -4591,6 +4604,7 @@ fn queue_clipboard_candidate(url: String, audio_only: bool, context: ClipboardPo
     if let Some(window) = context.main_window.upgrade() {
         window.set_url_input(url.clone().into());
         window.set_audio_only(audio_only);
+        window.set_video_only(false);
         window.set_subtitle_only(false);
         window.set_status_message("Checking the copied link before adding it to the queue…".into());
         if let Err(error) = window.show() {
@@ -6225,7 +6239,7 @@ fn scan_library_entries(records: &[DownloadRecord]) -> Vec<LibraryCacheEntry> {
             };
             let path_available = metadata.is_some();
             let kind = match record.download_mode {
-                DownloadMode::Video => "Video",
+                DownloadMode::Video | DownloadMode::VideoOnly => "Video",
                 DownloadMode::AudioOnly => "Audio",
                 DownloadMode::SubtitlesOnly => "Subtitles",
             };
@@ -6471,6 +6485,7 @@ fn row_view_with_queue_position(
     };
     let selection = match record.download_mode {
         DownloadMode::Video => format!("Video · {}", record.video_quality.label()),
+        DownloadMode::VideoOnly => format!("Video only · {}", record.video_quality.label()),
         DownloadMode::AudioOnly if record.audio_format.supports_quality_setting() => {
             format!("Audio · {} · {}", record.audio_format.label(), record.audio_quality.label())
         }
@@ -7990,7 +8005,7 @@ mod tests {
     }
 
     #[test]
-    fn row_view_labels_audio_output_and_selected_format() {
+    fn row_view_labels_audio_output_and_video_only_selection() {
         let mut record = DownloadRecord::queued(
             "audio-job".to_owned(),
             "https://example.test/media".to_owned(),
@@ -8002,6 +8017,16 @@ mod tests {
         let row = row_view_with_queue_position(&record, "", "", "");
 
         assert!(row.detail.as_str().starts_with("Audio · MP3 · Best · "));
+
+        let mut video = DownloadRecord::queued(
+            "video-only-job".to_owned(),
+            "https://example.test/video".to_owned(),
+            11,
+        );
+        video.download_mode = DownloadMode::VideoOnly;
+        video.video_quality = crate::model::VideoQuality::P720;
+        let row = row_view_with_queue_position(&video, "", "", "");
+        assert!(row.detail.as_str().starts_with("Video only · 720p · "));
     }
 
     #[test]
@@ -8058,7 +8083,7 @@ mod tests {
     #[test]
     fn queued_batch_records_snapshot_download_settings_and_schedule() {
         let settings = BatchDownloadSettings {
-            presets: DownloadPresets::from_ui_values(true, "mp3", "192k", "720p"),
+            presets: DownloadPresets::from_ui_values(true, false, "mp3", "192k", "720p"),
             subtitle_languages: "en,fr".to_owned(),
             subtitle_format: SubtitleFormat::Srt,
             include_auto_subtitles: true,
@@ -8154,7 +8179,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
         let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
         let saved_presets = DownloadPresets {
-            mode: DownloadMode::AudioOnly,
+            mode: DownloadMode::VideoOnly,
             audio_format: AudioFormat::Flac,
             audio_quality: AudioQuality::K320,
             video_quality: VideoQuality::P1440,
@@ -8172,7 +8197,7 @@ mod tests {
         );
         active.status = "Downloading".to_owned();
         active.playlist_index = Some(3);
-        active.download_mode = DownloadMode::AudioOnly;
+        active.download_mode = DownloadMode::VideoOnly;
         active.audio_format = AudioFormat::Opus;
         active.audio_quality = AudioQuality::K192;
         active.video_quality = VideoQuality::P720;
@@ -8236,7 +8261,7 @@ mod tests {
         assert_eq!(recovered_active.status, "Queued");
         assert_eq!(recovered_active.downloaded_bytes, Some(75));
         assert_eq!(recovered_active.playlist_index, Some(3));
-        assert_eq!(recovered_active.download_mode, DownloadMode::AudioOnly);
+        assert_eq!(recovered_active.download_mode, DownloadMode::VideoOnly);
         assert_eq!(recovered_active.audio_format, AudioFormat::Opus);
         assert_eq!(recovered_active.audio_quality, AudioQuality::K192);
         assert_eq!(recovered_active.video_quality, VideoQuality::P720);

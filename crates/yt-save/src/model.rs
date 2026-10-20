@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum DownloadMode {
     #[default]
     Video,
+    VideoOnly,
     AudioOnly,
     SubtitlesOnly,
 }
@@ -12,6 +13,7 @@ impl DownloadMode {
     pub fn as_database_value(self) -> &'static str {
         match self {
             Self::Video => "video",
+            Self::VideoOnly => "video_only",
             Self::AudioOnly => "audio",
             Self::SubtitlesOnly => "subtitles",
         }
@@ -20,6 +22,7 @@ impl DownloadMode {
     pub fn from_database_value(value: &str) -> Option<Self> {
         match value {
             "video" => Some(Self::Video),
+            "video_only" => Some(Self::VideoOnly),
             "audio" => Some(Self::AudioOnly),
             "subtitles" => Some(Self::SubtitlesOnly),
             _ => None,
@@ -278,6 +281,20 @@ impl VideoQuality {
         }
     }
 
+    /// Selects a video stream without an audio stream, preserving the requested height cap.
+    pub fn yt_dlp_video_only_format(self) -> &'static str {
+        match self {
+            Self::Best => "bestvideo",
+            Self::P2160 => "bestvideo[height<=2160]",
+            Self::P1440 => "bestvideo[height<=1440]",
+            Self::P1080 => "bestvideo[height<=1080]",
+            Self::P720 => "bestvideo[height<=720]",
+            Self::P480 => "bestvideo[height<=480]",
+            Self::P360 => "bestvideo[height<=360]",
+            Self::Lowest => "worstvideo",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Best => "Best",
@@ -324,12 +341,19 @@ impl DownloadPresets {
 
     pub fn from_ui_values(
         audio_only: bool,
+        video_only: bool,
         audio_format: &str,
         audio_quality: &str,
         video_quality: &str,
     ) -> Self {
         Self {
-            mode: if audio_only { DownloadMode::AudioOnly } else { DownloadMode::Video },
+            mode: if audio_only {
+                DownloadMode::AudioOnly
+            } else if video_only {
+                DownloadMode::VideoOnly
+            } else {
+                DownloadMode::Video
+            },
             audio_format: AudioFormat::from_database_value(audio_format).unwrap_or_default(),
             audio_quality: AudioQuality::from_database_value(audio_quality).unwrap_or_default(),
             video_quality: VideoQuality::from_ui_label(video_quality).unwrap_or_default(),
@@ -758,6 +782,7 @@ mod tests {
     fn persisted_audio_choices_have_stable_database_values() {
         for (mode, value) in [
             (DownloadMode::Video, "video"),
+            (DownloadMode::VideoOnly, "video_only"),
             (DownloadMode::AudioOnly, "audio"),
             (DownloadMode::SubtitlesOnly, "subtitles"),
         ] {
@@ -819,18 +844,32 @@ mod tests {
             assert_eq!(quality.as_database_value(), stored);
             assert_eq!(quality.yt_dlp_format(), format);
         }
+        for (quality, format) in [
+            (VideoQuality::Best, "bestvideo"),
+            (VideoQuality::P2160, "bestvideo[height<=2160]"),
+            (VideoQuality::P1440, "bestvideo[height<=1440]"),
+            (VideoQuality::P1080, "bestvideo[height<=1080]"),
+            (VideoQuality::P720, "bestvideo[height<=720]"),
+            (VideoQuality::P480, "bestvideo[height<=480]"),
+            (VideoQuality::P360, "bestvideo[height<=360]"),
+            (VideoQuality::Lowest, "worstvideo"),
+        ] {
+            assert_eq!(quality.yt_dlp_video_only_format(), format);
+            assert!(!format.contains("audio"));
+            assert!(!format.contains("/"));
+        }
         assert_eq!(VideoQuality::from_database_value("8k"), None);
     }
 
     #[test]
     fn new_download_presets_parse_valid_values_and_fall_back_per_setting() {
         let saved = DownloadPresets::from_database_values(
-            Some("audio"),
+            Some("video_only"),
             Some("flac"),
             Some("192k"),
             Some("1440p"),
         );
-        assert_eq!(saved.mode, DownloadMode::AudioOnly);
+        assert_eq!(saved.mode, DownloadMode::VideoOnly);
         assert_eq!(saved.audio_format, AudioFormat::Flac);
         assert_eq!(saved.audio_quality, AudioQuality::K192);
         assert_eq!(saved.video_quality, VideoQuality::P1440);
@@ -850,7 +889,7 @@ mod tests {
 
     #[test]
     fn new_download_presets_accept_ui_video_labels_and_stable_audio_values() {
-        let presets = DownloadPresets::from_ui_values(false, "opus", "320k", "2160p / 4K");
+        let presets = DownloadPresets::from_ui_values(false, false, "opus", "320k", "2160p / 4K");
         assert_eq!(presets.mode, DownloadMode::Video);
         assert_eq!(presets.audio_format, AudioFormat::Opus);
         assert_eq!(presets.audio_quality, AudioQuality::K320);
@@ -863,6 +902,21 @@ mod tests {
                 ("new_download_audio_quality", "320k"),
                 ("new_download_video_quality", "2160p"),
             ]
+        );
+    }
+
+    #[test]
+    fn video_only_ui_preset_is_distinct_from_video_with_audio() {
+        let presets = DownloadPresets::from_ui_values(false, true, "mp3", "320k", "720p");
+        assert_eq!(presets.mode, DownloadMode::VideoOnly);
+        assert_eq!(presets.database_values()[0], ("new_download_mode", "video_only"));
+        assert_eq!(
+            DownloadPresets::from_ui_values(false, false, "original", "best", "Best").mode,
+            DownloadMode::Video
+        );
+        assert_eq!(
+            DownloadPresets::from_ui_values(true, true, "original", "best", "Best").mode,
+            DownloadMode::AudioOnly
         );
     }
 

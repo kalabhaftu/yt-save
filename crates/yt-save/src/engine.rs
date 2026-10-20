@@ -508,6 +508,13 @@ impl DownloadEngine {
                     .arg("--print")
                     .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
             }
+            DownloadMode::VideoOnly => {
+                command
+                    .arg("--format")
+                    .arg(options.video_quality.yt_dlp_video_only_format())
+                    .arg("--print")
+                    .arg(format!("after_move:{OUTPUT_PREFIX}%(filepath)s"));
+            }
             DownloadMode::AudioOnly => {
                 command.arg("--format").arg("bestaudio");
                 if let Some(format) = options.audio_format.yt_dlp_name() {
@@ -842,6 +849,10 @@ fn readable_error(value: &str) -> String {
         || message.contains("login required")
     {
         "This media may require an account or may be private.".to_owned()
+    } else if message.contains("requested format is not available")
+        || message.contains("requested formats are not available")
+    {
+        "No available media format matches the selected download mode and quality. Choose a lower quality or another mode.".to_owned()
     } else if message.trim().is_empty() {
         "yt-dlp exited without an error message.".to_owned()
     } else {
@@ -1397,6 +1408,41 @@ mod tests {
                 Some(quality.yt_dlp_format())
             );
         }
+        for quality in [
+            VideoQuality::Best,
+            VideoQuality::P2160,
+            VideoQuality::P1440,
+            VideoQuality::P1080,
+            VideoQuality::P720,
+            VideoQuality::P480,
+            VideoQuality::P360,
+            VideoQuality::Lowest,
+        ] {
+            let arguments = engine
+                .download_command(
+                    "https://example.test/video-only",
+                    None,
+                    DownloadOptions::new(
+                        DownloadMode::VideoOnly,
+                        AudioFormat::Original,
+                        AudioQuality::Best,
+                    )
+                    .with_video_quality(quality),
+                )
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let format_flag = arguments.iter().position(|arg| arg == "--format").unwrap();
+            let selector = arguments.get(format_flag + 1).map(String::as_str).unwrap();
+            assert_eq!(selector, quality.yt_dlp_video_only_format());
+            assert!(!selector.contains("audio"));
+            assert!(!selector.contains('/'));
+            assert!(!arguments.iter().any(|arg| {
+                matches!(arg.as_str(), "--extract-audio" | "--audio-format" | "--audio-quality")
+            }));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1488,6 +1534,14 @@ mod tests {
         assert_eq!(
             readable_error("ERROR: Unsupported URL: https://example.test/x"),
             "yt-dlp does not currently support this URL."
+        );
+    }
+
+    #[test]
+    fn unavailable_format_error_explains_that_the_selected_mode_or_quality_must_change() {
+        assert_eq!(
+            readable_error("ERROR: [site] Requested format is not available. Use --list-formats"),
+            "No available media format matches the selected download mode and quality. Choose a lower quality or another mode."
         );
     }
 

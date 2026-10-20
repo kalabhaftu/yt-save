@@ -101,6 +101,7 @@ export component MainWindow inherits Window {
     in-out property <string> batch-url-input: "";
     in-out property <bool> batch-enqueue-in-progress: false;
     in-out property <bool> audio-only: false;
+    in-out property <bool> video-only: false;
     in-out property <bool> subtitle-only: false;
     in-out property <string> subtitle-languages: "en";
     in-out property <string> subtitle-format: "vtt";
@@ -1051,25 +1052,32 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 ActionButton {
-                                    label: "Video";
-                                    primary: !root.audio-only && !root.subtitle-only;
+                                    label: "Video + audio";
+                                    primary: !root.audio-only && !root.video-only && !root.subtitle-only;
                                     button-height: 30px;
-                                    button-min-width: 86px;
-                                    clicked => { root.audio-only = false; root.subtitle-only = false; }
+                                    button-min-width: 112px;
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = false; }
+                                }
+                                ActionButton {
+                                    label: "Video only";
+                                    primary: root.video-only;
+                                    button-height: 30px;
+                                    button-min-width: 96px;
+                                    clicked => { root.audio-only = false; root.video-only = true; root.subtitle-only = false; }
                                 }
                                 ActionButton {
                                     label: "Audio only";
                                     primary: root.audio-only;
                                     button-height: 30px;
                                     button-min-width: 102px;
-                                    clicked => { root.audio-only = true; root.subtitle-only = false; }
+                                    clicked => { root.audio-only = true; root.video-only = false; root.subtitle-only = false; }
                                 }
                                 ActionButton {
                                     label: "Subtitles";
                                     primary: root.subtitle-only;
                                     button-height: 30px;
                                     button-min-width: 98px;
-                                    clicked => { root.audio-only = false; root.subtitle-only = true; }
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = true; }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
@@ -1329,7 +1337,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 height: 12px;
-                                text: root.schedule-download ? (root.subtitle-only ? "Yt Save must be running at the scheduled time. Captions are external sidecars." : "Yt Save must be running at the scheduled local time.") : root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? "Video presets cap requested resolution; availability depends on site formats." : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                text: root.schedule-download ? (root.subtitle-only ? "Yt Save must be running at the scheduled time. Captions are external sidecars." : "Yt Save must be running at the scheduled local time.") : root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? (root.video-only ? "Video only selects a video stream; the requested height cap is strict and may be unavailable." : "Video + audio presets cap requested resolution; availability depends on site formats.") : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
                                 color: #747d96;
                                 font-size: 10px;
                                 overflow: elide;

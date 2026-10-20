@@ -2764,7 +2764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_quality_survives_reopen_and_retry_for_video_jobs() {
+    async fn video_only_mode_and_quality_survive_reopen_and_retry() {
         let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
         let db_path = temp_dir.join("state.sqlite");
         let store = Store::open(db_path.clone()).unwrap();
@@ -2774,13 +2774,14 @@ mod tests {
             10,
         );
         record.status = "Failed".to_owned();
+        record.download_mode = DownloadMode::VideoOnly;
         record.video_quality = VideoQuality::P1440;
         store.save_download(record).await.unwrap();
         drop(store);
 
         let reopened = Store::open(db_path).unwrap();
         let retried = reopened.retry_download("video-retry", 20).await.unwrap().unwrap();
-        assert_eq!(retried.download_mode, DownloadMode::Video);
+        assert_eq!(retried.download_mode, DownloadMode::VideoOnly);
         assert_eq!(retried.video_quality, VideoQuality::P1440);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
@@ -2791,13 +2792,24 @@ mod tests {
         let db_path = temp_dir.join("state.sqlite");
         let store = Store::open(db_path.clone()).unwrap();
         assert_eq!(store.load_download_presets().await.unwrap(), DownloadPresets::default());
-        let presets = DownloadPresets {
+        let audio_presets = DownloadPresets {
             mode: DownloadMode::AudioOnly,
             audio_format: AudioFormat::Flac,
             audio_quality: AudioQuality::K192,
             video_quality: VideoQuality::P1440,
         };
-        store.set_download_presets(presets, 10).await.unwrap();
+        store.set_download_presets(audio_presets, 10).await.unwrap();
+        drop(store);
+
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_download_presets().await.unwrap(), audio_presets);
+        let presets = DownloadPresets {
+            mode: DownloadMode::VideoOnly,
+            audio_format: AudioFormat::Flac,
+            audio_quality: AudioQuality::K192,
+            video_quality: VideoQuality::P1440,
+        };
+        store.set_download_presets(presets, 20).await.unwrap();
         drop(store);
 
         let reopened = Store::open(db_path).unwrap();
@@ -2816,7 +2828,7 @@ mod tests {
             })
             .unwrap();
         let recovered = reopened.load_download_presets().await.unwrap();
-        assert_eq!(recovered.mode, DownloadMode::AudioOnly);
+        assert_eq!(recovered.mode, DownloadMode::VideoOnly);
         assert_eq!(recovered.audio_format, AudioFormat::Flac);
         assert_eq!(recovered.audio_quality, AudioQuality::Best);
         assert_eq!(recovered.video_quality, VideoQuality::Best);
@@ -3592,7 +3604,7 @@ mod tests {
             "https://example.test/media".to_owned(),
             10,
         );
-        queued.download_mode = crate::model::DownloadMode::AudioOnly;
+        queued.download_mode = crate::model::DownloadMode::VideoOnly;
         queued.audio_format = crate::model::AudioFormat::Mp3;
         queued.audio_quality = crate::model::AudioQuality::K192;
         queued.video_quality = crate::model::VideoQuality::P480;
@@ -3621,7 +3633,7 @@ mod tests {
         assert_eq!(resumed.status, "Queued");
         assert_eq!(resumed.progress, 48.0);
         assert_eq!(resumed.downloaded_bytes, Some(480));
-        assert_eq!(resumed.download_mode, crate::model::DownloadMode::AudioOnly);
+        assert_eq!(resumed.download_mode, crate::model::DownloadMode::VideoOnly);
         assert_eq!(resumed.audio_format, crate::model::AudioFormat::Mp3);
         assert_eq!(resumed.audio_quality, crate::model::AudioQuality::K192);
         assert_eq!(resumed.video_quality, crate::model::VideoQuality::P480);

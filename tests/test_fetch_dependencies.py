@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 import zipfile
@@ -9,7 +10,7 @@ from pathlib import Path
 from urllib.request import HTTPRedirectHandler
 from unittest.mock import patch
 
-from scripts.fetch_dependencies import extract_component, fetch, safe_name
+from scripts.fetch_dependencies import MANIFEST, extract_component, fetch, safe_name, validate_manifest
 
 
 class FakeResponse(io.BytesIO):
@@ -104,6 +105,8 @@ class DependencyFetcherTests(unittest.TestCase):
             self.assertIsNone(request.get_header("Authorization"))
 
     def test_extracts_only_the_expected_deno_executable(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        component = next(item for item in manifest["components"] if item["id"] == "deno")
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             archive_path = root / "deno.zip"
@@ -112,9 +115,73 @@ class DependencyFetcherTests(unittest.TestCase):
             with zipfile.ZipFile(archive_path, "w") as archive:
                 archive.writestr("deno-x86_64/deno.exe", b"runtime")
                 archive.writestr("deno-x86_64/LICENSE.txt", b"license")
-            extract_component({"extract": "deno", "asset": "deno.zip"}, archive_path, output)
+            extract_component(component, archive_path, output)
             self.assertEqual((output / "deno.exe").read_bytes(), b"runtime")
-            self.assertEqual((output / "licenses" / "deno" / "LICENSE.txt").read_bytes(), b"license")
+            self.assertEqual(
+                (output / "licenses" / "deno" / "archive" / "deno-x86_64" / "LICENSE.txt").read_bytes(),
+                b"license",
+            )
+            copied_notices = {
+                notice["destination"]: (output / "licenses" / "deno" / notice["destination"]).read_bytes()
+                for notice in component["license_files"]
+            }
+            self.assertIn(b"MIT License", copied_notices["Deno-LICENSE.md"])
+            self.assertIn(
+                b"Apache License", copied_notices["TypeScript-Apache-2.0-LICENSE.txt"]
+            )
+            self.assertIn(b"Microsoft Corporation", copied_notices["Node-types-MIT-LICENSE.txt"])
+            self.assertIn(b"Undici contributors", copied_notices["Undici-MIT-LICENSE.txt"])
+            self.assertIn(
+                b"does not provide one consolidated notice bundle",
+                copied_notices["UPSTREAM-NOTICES.md"],
+            )
+
+    def test_extracts_ffmpeg_runtime_dlls_and_archive_license(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_path = root / "ffmpeg.zip"
+            output = root / "out"
+            output.mkdir()
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("ffmpeg/bin/ffmpeg.exe", b"ffmpeg")
+                archive.writestr("ffmpeg/bin/ffprobe.exe", b"ffprobe")
+                archive.writestr("ffmpeg/bin/avcodec-62.dll", b"runtime dll")
+                archive.writestr("ffmpeg/bin/ffplay.exe", b"unused executable")
+                archive.writestr("ffmpeg/LICENSE.txt", b"LGPL v3 license")
+            extract_component({"extract": "ffmpeg"}, archive_path, output)
+            self.assertEqual((output / "ffmpeg.exe").read_bytes(), b"ffmpeg")
+            self.assertEqual((output / "ffprobe.exe").read_bytes(), b"ffprobe")
+            self.assertEqual((output / "avcodec-62.dll").read_bytes(), b"runtime dll")
+            self.assertFalse((output / "ffplay.exe").exists())
+            self.assertEqual(
+                (output / "licenses" / "ffmpeg" / "LICENSE.txt").read_bytes(),
+                b"LGPL v3 license",
+            )
+
+    def test_manifest_declares_runtime_dependencies_and_verified_ffmpeg_provenance(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        validate_manifest(manifest)
+        self.assertTrue(
+            all(component["runtime_dependencies"] for component in manifest["components"])
+        )
+        ffmpeg = next(item for item in manifest["components"] if item["id"] == "ffmpeg")
+        self.assertEqual(
+            ffmpeg["url"],
+            "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/659413383",
+        )
+        self.assertEqual(
+            ffmpeg["sha256"],
+            "3a584c6017cd9c43716d13bb244e77cd7c89a71e1395bb244f7751a405e3b3fc",
+        )
+        self.assertIn("n8.1.3-18-g46d899d7a0-20261020", ffmpeg["version"])
+        self.assertIn("LGPL-3.0-or-later", ffmpeg["license"])
+        self.assertNotIn("LGPL-2.1", ffmpeg["license"])
+
+    def test_manifest_rejects_a_component_without_runtime_dependencies(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        manifest["components"][0].pop("runtime_dependencies")
+        with self.assertRaisesRegex(ValueError, "runtime_dependencies"):
+            validate_manifest(manifest)
 
 
 if __name__ == "__main__":

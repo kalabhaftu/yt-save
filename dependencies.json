@@ -12,6 +12,11 @@
       "license": "GPL-3.0-or-later; embedded yt-dlp-ejs is Unlicense with MIT/ISC notices",
       "license_url": "https://github.com/yt-dlp/yt-dlp#licensing",
       "update_policy": "Only change the pinned release after checksum and release-note review. The official Windows executable includes yt-dlp-ejs.",
+      "runtime_dependencies": [
+        "The official standalone executable has no Python runtime dependency and bundles yt-dlp-ejs.",
+        "Deno 2.3.0 or later is required for full YouTube JavaScript challenge support; this project bundles Deno and passes its explicit path with --js-runtimes deno:<path>.",
+        "FFmpeg and FFprobe are required for stream merging and media conversion; this project bundles them through the ffmpeg component."
+      ],
       "extract": "copy"
     },
     {
@@ -21,23 +26,39 @@
       "url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip",
       "sha256": "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238",
       "architecture": "x86_64",
-      "license": "MIT and bundled dependency licenses",
-      "license_url": "https://github.com/denoland/deno",
+      "license": "MIT for Deno; source-tree notices also cover bundled TypeScript (Apache-2.0), Node type definitions, Undici and WebGPU (MIT). The release ZIP has no notice bundle for compiled/transitive Rust/V8 dependencies.",
+      "license_url": "https://github.com/denoland/deno/blob/v2.9.7/LICENSE.md",
       "update_policy": "Pin an official Deno release archive, verify SHA-256, and update with the yt-dlp runtime compatibility floor checked.",
+      "runtime_dependencies": [
+        "Standalone Windows x86_64 MSVC executable; no separate JavaScript runtime dependency.",
+        "Used by yt-dlp for JavaScript challenge solving on YouTube; yt-dlp receives the bundled executable's absolute path."
+      ],
+      "license_files": [
+        { "source": "licenses/deno/LICENSE.md", "destination": "Deno-LICENSE.md" },
+        { "source": "licenses/deno/LICENSE.typescript.txt", "destination": "TypeScript-Apache-2.0-LICENSE.txt" },
+        { "source": "licenses/deno/LICENSE.node", "destination": "Node-types-MIT-LICENSE.txt" },
+        { "source": "licenses/deno/LICENSE.undici", "destination": "Undici-MIT-LICENSE.txt" },
+        { "source": "licenses/deno/LICENSE.webgpu.md", "destination": "WebGPU-MIT-LICENSE.md" },
+        { "source": "licenses/deno/UPSTREAM-NOTICES.md", "destination": "UPSTREAM-NOTICES.md" }
+      ],
       "extract": "deno"
     },
     {
       "id": "ffmpeg",
-      "version": "8.1 (BtbN n8.1 LGPL shared build)",
+      "version": "n8.1.3-18-g46d899d7a0-20261020 (BtbN LGPL shared build)",
       "asset": "ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
-      "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/647413501",
+      "url": "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/659413383",
       "accept": "application/octet-stream",
-      "sha256": "d670c3cd76f529d6a4e0de3a6f4732868ad02ddb8f52cfb0428c90aaa08abdee",
+      "sha256": "3a584c6017cd9c43716d13bb244e77cd7c89a71e1395bb244f7751a405e3b3fc",
       "architecture": "x86_64",
-      "license": "LGPL-2.1-or-later build variant; retain upstream notices and shared libraries",
+      "license": "LGPL-3.0-or-later shared build (ffmpeg -L; archive LICENSE.txt); --enable-version3 is set and GPL is not enabled. Retain all upstream notices and shared libraries.",
       "license_url": "https://ffmpeg.org/legal.html",
       "build_source": "https://github.com/BtbN/FFmpeg-Builds",
       "update_policy": "Pin the immutable GitHub release asset ID and digest, inspect the build configuration and license files, then refresh bundled DLLs and notices together.",
+      "runtime_dependencies": [
+        "The archive's bin DLLs are required by ffmpeg.exe and ffprobe.exe and are staged beside both executables.",
+        "FFmpeg and FFprobe are optional for basic extraction but required for stream merging and media conversion."
+      ],
       "extract": "ffmpeg"
     }
   ]

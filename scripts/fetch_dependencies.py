@@ -17,6 +17,72 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "dependencies.json"
 USER_AGENT = "Yt-Save-dependency-fetcher/1.0"
+REQUIRED_COMPONENT_FIELDS = {
+    "id",
+    "version",
+    "asset",
+    "url",
+    "sha256",
+    "architecture",
+    "license",
+    "license_url",
+    "update_policy",
+    "runtime_dependencies",
+    "extract",
+}
+
+
+def validate_manifest(manifest: dict) -> None:
+    if manifest.get("schema_version") != 1:
+        raise ValueError("unsupported or missing dependency manifest schema_version")
+    components = manifest.get("components")
+    if not isinstance(components, list) or not components:
+        raise ValueError("dependency manifest components must be a non-empty list")
+
+    seen_ids: set[str] = set()
+    for component in components:
+        if not isinstance(component, dict):
+            raise ValueError("each dependency component must be an object")
+        missing = REQUIRED_COMPONENT_FIELDS - component.keys()
+        if missing:
+            raise ValueError(
+                f"dependency component is missing required field(s): {', '.join(sorted(missing))}"
+            )
+        component_id = component["id"]
+        if not isinstance(component_id, str) or not component_id or component_id in seen_ids:
+            raise ValueError(f"dependency component id is empty or duplicated: {component_id!r}")
+        seen_ids.add(component_id)
+        runtime_dependencies = component["runtime_dependencies"]
+        if (
+            not isinstance(runtime_dependencies, list)
+            or not runtime_dependencies
+            or any(
+                not isinstance(value, str) or not value.strip()
+                for value in runtime_dependencies
+            )
+        ):
+            raise ValueError(f"{component_id} must declare non-empty runtime_dependencies")
+        digest = component["sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(c not in "0123456789abcdefABCDEF" for c in digest)
+        ):
+            raise ValueError(f"{component_id} must declare a 64-character SHA-256 digest")
+        license_files = component.get("license_files", [])
+        if not isinstance(license_files, list):
+            raise ValueError(f"{component_id} license_files must be a list")
+        for notice in license_files:
+            if (
+                not isinstance(notice, dict)
+                or not isinstance(notice.get("source"), str)
+                or not isinstance(notice.get("destination"), str)
+            ):
+                raise ValueError(f"{component_id} license_files entries need source and destination paths")
+            safe_name(notice["source"])
+            safe_name(notice["destination"])
+        if component["extract"] == "deno" and not license_files:
+            raise ValueError("Deno must declare the upstream license files copied into the package")
 
 
 def fetch(url: str, destination: Path, expected_hash: str, accept: str | None = None) -> None:
@@ -81,10 +147,28 @@ def extract_component(component: dict, archive_path: Path, output: Path) -> None
                 raise ValueError(f"expected one deno.exe in {component['asset']}")
             (output / "deno.exe").write_bytes(archive.read(candidates[0]))
             for entry, name in entries:
-                if name.name.lower() in {"license", "license.txt", "license.md", "third_party_licenses.txt"}:
-                    (output / "licenses" / "deno").mkdir(parents=True, exist_ok=True)
-                    destination = output / "licenses" / "deno" / name.name
+                basename = name.name.lower()
+                if (
+                    basename in {"license", "license.txt", "license.md", "third_party_licenses.txt"}
+                    or basename.startswith("license.")
+                    or basename.startswith("third_party_licenses.")
+                ):
+                    destination = output / "licenses" / "deno" / "archive" / Path(*name.parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(archive.read(entry))
+            for notice in component.get("license_files", []):
+                source_rel = safe_name(notice["source"])
+                destination_rel = safe_name(notice["destination"])
+                source = (ROOT / Path(*source_rel.parts)).resolve()
+                try:
+                    source.relative_to(ROOT)
+                except ValueError as error:
+                    raise ValueError(f"license source escapes repository root: {notice['source']}") from error
+                if not source.is_file():
+                    raise ValueError(f"declared license source is missing: {notice['source']}")
+                destination = output / "licenses" / "deno" / Path(*destination_rel.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
             return
 
         if extract == "ffmpeg":
@@ -115,6 +199,7 @@ def main() -> int:
     args = parser.parse_args()
 
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    validate_manifest(manifest)
     args.output.mkdir(parents=True, exist_ok=True)
     selected = set(args.component or [])
     known = {component["id"] for component in manifest["components"]}

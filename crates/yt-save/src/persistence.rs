@@ -5,9 +5,12 @@ use rusqlite::{
     Connection, OptionalExtension, Row, TransactionBehavior, named_params, types::Type,
 };
 
-use crate::model::{
-    AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
-    VideoQuality,
+use crate::{
+    app_update::AppUpdateChannel,
+    model::{
+        AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
+        VideoQuality,
+    },
 };
 
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
@@ -1205,6 +1208,46 @@ impl Store {
         })
         .await
         .context("join clipboard preference write")??;
+        Ok(())
+    }
+
+    /// Tray behavior is opt-in; an unset or invalid preference keeps normal window behavior.
+    pub async fn load_app_update_channel(&self) -> Result<AppUpdateChannel> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                Ok(AppUpdateChannel::from_database_value(
+                    setting_value(connection, "app_update_channel")?.as_deref(),
+                ))
+            })
+        })
+        .await
+        .context("join application update channel read")?
+    }
+
+    pub async fn set_app_update_channel(
+        &self,
+        channel: AppUpdateChannel,
+        updated_at: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('app_update_channel', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! {
+                        ":value": channel.database_value(),
+                        ":updated": updated_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join application update channel write")??;
         Ok(())
     }
 
@@ -2783,6 +2826,32 @@ mod tests {
         assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
         reopened.set_clipboard_monitoring_enabled(false, 20).await.unwrap();
         assert!(!reopened.load_clipboard_monitoring_enabled().await.unwrap());
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_update_channel_defaults_to_stable_and_persists_preview_choice() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite");
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_app_update_channel().await.unwrap(), AppUpdateChannel::Stable);
+
+        store.set_app_update_channel(AppUpdateChannel::Preview, 10).await.unwrap();
+        assert_eq!(store.load_app_update_channel().await.unwrap(), AppUpdateChannel::Preview);
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(reopened.load_app_update_channel().await.unwrap(), AppUpdateChannel::Preview);
+        reopened
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'unknown' WHERE key = 'app_update_channel'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reopened.load_app_update_channel().await.unwrap(), AppUpdateChannel::Stable);
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

@@ -1,4 +1,5 @@
 mod app;
+mod app_update;
 mod clipboard_monitor;
 mod dependencies;
 mod engine;
@@ -14,6 +15,12 @@ mod yt_dlp_update;
 slint::include_modules!();
 
 fn main() -> anyhow::Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("--yt-save-update-helper") {
+        let exit_code = app_update::run_update_helper(&arguments)?;
+        std::process::exit(exit_code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

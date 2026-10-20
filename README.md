@@ -36,6 +36,7 @@ Real application screenshots will be added after the first Windows UI validation
 - Lets users pause queued or active jobs and resume paused jobs. Active pause stops yt-dlp and its Windows process tree, preserves partial files, and resumes through yt-dlp's `--continue` option.
 - Automatically retries classified temporary network, server, and rate-limit failures with persisted exponential backoff. The retry limit is selectable from Off to five attempts; waits survive app restarts, release download worker slots, and cap at four minutes. Unsupported media, access failures, and missing tools are left for manual correction.
 - Checks the bundled yt-dlp, Deno, FFmpeg, and FFprobe executables at startup and reports their versions or launch failures; Deno is optional for other yt-dlp sites.
+- Checks Yt Save's public GitHub releases from a saved Stable or Preview channel, shows release notes, and downloads only the installer type used for the current installation after validating GitHub's SHA-256 asset digest. Installing is user-triggered and refuses handoff while active downloads remain; Windows upgrade and data-preservation acceptance remains pending.
 - Lets users open completed files with the operating system's registered media handler.
 - Provides a Library view of completed downloads, with local search, video/audio/subtitle/missing-file filters, sorting by date/title/size, file reveal, and relinking when a media file has moved. Library records point to the existing file; Yt Save does not copy it.
 - Starts with the user's Downloads folder under `Yt Save`; the default destination can be changed in the app.
@@ -76,7 +77,7 @@ Package the application with both source definitions:
 
 `scripts/build_windows_package.ps1` builds the app, assembles verified dependencies under `target\package\bin`, and invokes WiX and Inno Setup. It reports missing packaging tools rather than producing placeholder installers. The GitHub release workflow installs the tools and publishes installers only after all build steps succeed.
 
-New plain `vMAJOR.MINOR.PATCH` tags publish stable releases; SemVer prerelease tags such as `v1.2.0-preview.1` publish preview releases. Existing releases retain their previously selected GitHub channel. The current app does not yet include an application-update checker; its Engine Status updater applies only to yt-dlp.
+New plain `vMAJOR.MINOR.PATCH` tags publish stable releases; SemVer prerelease tags such as `v1.2.0-preview.1` publish preview releases. Existing releases retain their previously selected GitHub channel. The Application Updates card handles Yt Save releases separately from the Engine Status updater, which applies only to yt-dlp.
 
 Both installers use the same per-machine program location and per-user application data location. An installer marker prevents MSI and Inno Setup installs from being layered over each other; uninstall the current package before switching installer types. Uninstall removes application files but preserves downloaded media and application data.
 

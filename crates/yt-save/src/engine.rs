@@ -1,7 +1,10 @@
 use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
-    sync::RwLock,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, bail};
@@ -104,8 +107,9 @@ impl DownloadOptions {
 #[derive(Clone)]
 pub struct DownloadEngine {
     dependencies: DependencyPaths,
-    yt_dlp_path: std::sync::Arc<RwLock<PathBuf>>,
-    process_gate: std::sync::Arc<AsyncRwLock<()>>,
+    yt_dlp_path: Arc<RwLock<PathBuf>>,
+    process_gate: Arc<AsyncRwLock<()>>,
+    yt_dlp_processes_enabled: Arc<AtomicBool>,
     output_directory: PathBuf,
 }
 
@@ -152,11 +156,12 @@ pub(crate) enum JobSignal {
 
 impl DownloadEngine {
     pub fn new(dependencies: DependencyPaths, output_directory: PathBuf) -> Self {
-        let yt_dlp_path = std::sync::Arc::new(RwLock::new(dependencies.yt_dlp.clone()));
+        let yt_dlp_path = Arc::new(RwLock::new(dependencies.yt_dlp.clone()));
         Self {
             dependencies,
             yt_dlp_path,
-            process_gate: std::sync::Arc::new(AsyncRwLock::new(())),
+            process_gate: Arc::new(AsyncRwLock::new(())),
+            yt_dlp_processes_enabled: Arc::new(AtomicBool::new(true)),
             output_directory,
         }
     }
@@ -173,8 +178,27 @@ impl DownloadEngine {
         self.process_gate.write().await
     }
 
-    pub async fn lock_for_yt_dlp_process(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.process_gate.read().await
+    pub async fn lock_for_yt_dlp_process(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self.process_gate.read().await;
+        self.ensure_yt_dlp_processes_enabled()?;
+        Ok(guard)
+    }
+
+    pub fn stop_accepting_yt_dlp_processes(&self) {
+        self.yt_dlp_processes_enabled.store(false, Ordering::Release);
+    }
+
+    pub fn resume_accepting_yt_dlp_processes(&self) {
+        self.yt_dlp_processes_enabled.store(true, Ordering::Release);
+    }
+
+    fn ensure_yt_dlp_processes_enabled(&self) -> Result<()> {
+        if !self.yt_dlp_processes_enabled.load(Ordering::Acquire) {
+            bail!(
+                "Yt Save is preparing an application update and has stopped starting yt-dlp processes."
+            );
+        }
+        Ok(())
     }
 
     pub async fn inspect(&self, url: &str) -> Result<MediaMetadata> {
@@ -224,6 +248,7 @@ impl DownloadEngine {
         signal: &mut watch::Receiver<JobSignal>,
     ) -> Result<EngineOutcome<MediaMetadata>> {
         let _process_guard = self.process_gate.read().await;
+        self.ensure_yt_dlp_processes_enabled()?;
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
@@ -302,6 +327,7 @@ impl DownloadEngine {
         F: FnMut(ProgressUpdate) + Send,
     {
         let _process_guard = self.process_gate.read().await;
+        self.ensure_yt_dlp_processes_enabled()?;
         if signal_requested(signal) != JobSignal::Continue {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
@@ -790,6 +816,28 @@ fn url_host(value: &str) -> &str {
 mod tests {
     use super::*;
     use crate::dependencies::DependencyPaths;
+
+    #[tokio::test]
+    async fn update_shutdown_rejects_late_process_starts_and_can_recover() {
+        let engine = DownloadEngine::new(
+            DependencyPaths {
+                directory: PathBuf::new(),
+                yt_dlp: PathBuf::new(),
+                deno: PathBuf::new(),
+                ffmpeg: PathBuf::new(),
+                ffprobe: PathBuf::new(),
+            },
+            PathBuf::new(),
+        );
+
+        assert!(engine.ensure_yt_dlp_processes_enabled().is_ok());
+        engine.stop_accepting_yt_dlp_processes();
+        assert!(engine.ensure_yt_dlp_processes_enabled().is_err());
+        assert!(engine.lock_for_yt_dlp_process().await.is_err());
+        engine.resume_accepting_yt_dlp_processes();
+        assert!(engine.ensure_yt_dlp_processes_enabled().is_ok());
+        assert!(engine.lock_for_yt_dlp_process().await.is_ok());
+    }
 
     #[test]
     fn parses_machine_readable_progress_without_fabricating_totals() {

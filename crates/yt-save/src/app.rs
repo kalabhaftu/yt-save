@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::{
     AppTray, ClipboardPopup, DownloadRowData, LibraryRowData, MainWindow, PlaylistEntryRowData,
     PlaylistSubscriptionEntryRowData, PlaylistSubscriptionRowData,
+    app_update::{AppRelease, AppUpdateChannel, CheckOutcome, InstallerKind},
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
     dependencies::DependencyPaths,
     engine::{
@@ -64,6 +65,7 @@ enum UiEvent {
     },
     DependencyStatus(String),
     DependencyUpdateState(bool),
+    AppUpdateView(AppUpdateUiState),
     ClearPreview {
         request_id: u64,
     },
@@ -72,6 +74,41 @@ enum UiEvent {
         source_url: String,
         metadata: Box<MediaMetadata>,
     },
+}
+
+#[derive(Clone)]
+struct AppUpdateUiState {
+    channel: AppUpdateChannel,
+    status: String,
+    release_notes: String,
+    release_url: String,
+    available: bool,
+    checking: bool,
+    downloading: bool,
+    install_ready: bool,
+    installing: bool,
+}
+
+impl AppUpdateUiState {
+    fn idle(channel: AppUpdateChannel, status: impl Into<String>) -> Self {
+        Self {
+            channel,
+            status: status.into(),
+            release_notes: String::new(),
+            release_url: String::new(),
+            available: false,
+            checking: false,
+            downloading: false,
+            install_ready: false,
+            installing: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StagedAppInstaller {
+    path: PathBuf,
+    kind: InstallerKind,
 }
 
 type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<JobSignal>>>>>;
@@ -104,6 +141,12 @@ struct TrayContext {
     queue_wake: Arc<Notify>,
     preferences: Arc<Mutex<TrayPreferences>>,
     shutdown_started: Arc<AtomicBool>,
+    shutdown_committed: Arc<AtomicBool>,
+}
+
+struct ShutdownState {
+    started: Arc<AtomicBool>,
+    committed: Arc<AtomicBool>,
 }
 
 struct ActiveJobRegistration {
@@ -625,6 +668,8 @@ pub fn run() -> Result<()> {
     let auto_retry_attempts = runtime.block_on(store.load_auto_retry_attempts())?;
     let clipboard_monitoring_enabled =
         runtime.block_on(store.load_clipboard_monitoring_enabled())?;
+    let app_update_channel = runtime.block_on(store.load_app_update_channel())?;
+    let app_update_channel_state = Arc::new(Mutex::new(app_update_channel));
     let tray_preferences = runtime.block_on(store.load_tray_preferences())?;
     let tray_preferences_state = Arc::new(Mutex::new(tray_preferences));
     let engine = DownloadEngine::new(dependencies.clone(), download_directory.clone());
@@ -651,6 +696,7 @@ pub fn run() -> Result<()> {
             .into(),
     );
     window.set_clipboard_monitoring_enabled(false);
+    window.set_app_update_channel(app_update_channel.label().into());
     window.set_close_to_tray_enabled(tray_preferences.close_to_tray);
     window.set_minimize_to_tray_enabled(tray_preferences.minimize_to_tray);
     let saved_downloads = runtime.block_on(store.list_downloads())?;
@@ -679,6 +725,7 @@ pub fn run() -> Result<()> {
     #[cfg(windows)]
     configure_clipboard_popup_window(&popup, clipboard_popup_work_area.clone());
     let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_committed = Arc::new(AtomicBool::new(false));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
     let playlist_subscription_review =
         Arc::new(Mutex::new(PlaylistSubscriptionReviewState::default()));
@@ -945,6 +992,22 @@ pub fn run() -> Result<()> {
                         }
                     });
                 }
+                UiEvent::AppUpdateView(state) => {
+                    let weak = weak_window.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_app_update_channel(state.channel.label().into());
+                            window.set_app_update_status(state.status.into());
+                            window.set_app_update_release_notes(state.release_notes.into());
+                            window.set_app_update_release_url(state.release_url.into());
+                            window.set_app_update_available(state.available);
+                            window.set_app_update_checking(state.checking);
+                            window.set_app_update_downloading(state.downloading);
+                            window.set_app_update_install_ready(state.install_ready);
+                            window.set_app_update_installing(state.installing);
+                        }
+                    });
+                }
                 UiEvent::ClearPreview { request_id } => {
                     latest_analysis_id = request_id;
                     if let Ok(mut state) = event_playlist_selection.lock() {
@@ -1159,7 +1222,13 @@ pub fn run() -> Result<()> {
     let mut dependency_paths = dependencies.clone();
     let dependency_engine = engine.clone();
     handle.spawn(async move {
-        let _process_guard = dependency_engine.lock_for_yt_dlp_process().await;
+        let _process_guard = match dependency_engine.lock_for_yt_dlp_process().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!(%error, "skip startup dependency probe while application update is starting");
+                return;
+            }
+        };
         dependency_paths.yt_dlp = dependency_engine.current_yt_dlp_path();
         let readiness = dependency_paths.preflight().await;
         let summary = readiness.summary();
@@ -1223,8 +1292,10 @@ pub fn run() -> Result<()> {
     let enqueue_analysis_generation = analysis_generation.clone();
     let enqueue_queue_wake = queue_wake.clone();
     let update_dispatch_gate = Arc::new(AsyncMutex::new(()));
+    let enqueue_dispatch_gate = update_dispatch_gate.clone();
     let _ = runtime.block_on(recover_pending(&store))?;
     let dispatcher_shutdown_started = shutdown_started.clone();
+    let dispatcher_shutdown_committed = shutdown_committed.clone();
     handle.spawn(run_queue_dispatcher(
         store.clone(),
         engine.clone(),
@@ -1232,7 +1303,10 @@ pub fn run() -> Result<()> {
         queue_wake.clone(),
         active_jobs.clone(),
         update_dispatch_gate.clone(),
-        dispatcher_shutdown_started,
+        ShutdownState {
+            started: dispatcher_shutdown_started,
+            committed: dispatcher_shutdown_committed,
+        },
     ));
 
     let updater_running = Arc::new(AtomicBool::new(false));
@@ -1259,10 +1333,14 @@ pub fn run() -> Result<()> {
         let dispatch_gate = update_gate.clone();
         let dependencies = update_dependencies.clone();
         let running = update_running.clone();
+        let shutdown = update_shutdown_started.clone();
         update_handle.spawn(async move {
             let _ = events.send(UiEvent::DependencyUpdateState(true));
             let result = async {
                 let _dispatch_guard = dispatch_gate.lock().await;
+                if shutdown.load(Ordering::Acquire) {
+                    anyhow::bail!("The application is shutting down before the yt-dlp update can start.");
+                }
                 let active_count = active_jobs
                     .lock()
                     .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
@@ -1321,6 +1399,564 @@ pub fn run() -> Result<()> {
             let _ = events.send(UiEvent::DependencyUpdateState(false));
         });
     });
+
+    let app_update_release = Arc::new(Mutex::new(None::<AppRelease>));
+    let app_update_installer = Arc::new(Mutex::new(None::<StagedAppInstaller>));
+    let app_update_busy = Arc::new(AtomicBool::new(false));
+    let app_update_helper = Arc::new(Mutex::new(None::<crate::app_update::UpdateHelper>));
+
+    let channel_state = app_update_channel_state.clone();
+    let channel_release = app_update_release.clone();
+    let channel_installer = app_update_installer.clone();
+    let channel_store = store.clone();
+    let channel_events = events_tx.clone();
+    let channel_handle = handle.clone();
+    let channel_busy = app_update_busy.clone();
+    window.on_app_update_channel_requested(move |selected| {
+        if channel_busy.load(Ordering::Acquire) {
+            return;
+        }
+        let next = AppUpdateChannel::from_database_value(Some(if selected.as_str() == "Preview" {
+            "preview"
+        } else {
+            "stable"
+        }));
+        let previous = match channel_state.lock() {
+            Ok(mut state) => {
+                let previous = *state;
+                *state = next;
+                previous
+            }
+            Err(_) => {
+                let _ = channel_events.send(UiEvent::Status(
+                    "Application update settings are unavailable.".to_owned(),
+                ));
+                return;
+            }
+        };
+        if previous == next {
+            return;
+        }
+        if let Ok(mut release) = channel_release.lock() {
+            *release = None;
+        }
+        if let Ok(mut installer) = channel_installer.lock() {
+            *installer = None;
+        }
+        let mut view = AppUpdateUiState::idle(
+            next,
+            format!(
+                "{} channel selected. Check for updates to see available releases.",
+                next.label()
+            ),
+        );
+        view.available = false;
+        let _ = channel_events.send(UiEvent::AppUpdateView(view));
+        let store = channel_store.clone();
+        let events = channel_events.clone();
+        channel_handle.spawn(async move {
+            if let Err(error) = store.set_app_update_channel(next, now()).await {
+                error!(%error, "save application update channel");
+                let mut view = AppUpdateUiState::idle(
+                    next,
+                    format!("Channel selected for this session but could not be saved: {error}"),
+                );
+                view.available = false;
+                let _ = events.send(UiEvent::AppUpdateView(view));
+            }
+        });
+    });
+
+    let check_channel_state = app_update_channel_state.clone();
+    let check_release_state = app_update_release.clone();
+    let check_installer_state = app_update_installer.clone();
+    let check_busy = app_update_busy.clone();
+    let check_handle = handle.clone();
+    let check_events = events_tx.clone();
+    window.on_app_update_check_requested(move || {
+        if check_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let channel = match check_channel_state.lock() {
+            Ok(channel) => *channel,
+            Err(_) => {
+                check_busy.store(false, Ordering::Release);
+                let _ = check_events.send(UiEvent::Status(
+                    "Application update settings are unavailable.".to_owned(),
+                ));
+                return;
+            }
+        };
+        if let Ok(mut release) = check_release_state.lock() {
+            *release = None;
+        }
+        if let Ok(mut installer) = check_installer_state.lock() {
+            *installer = None;
+        }
+        let mut view = AppUpdateUiState::idle(channel, "Checking the official Yt Save releases…");
+        view.checking = true;
+        let _ = check_events.send(UiEvent::AppUpdateView(view));
+        let events = check_events.clone();
+        let release_state = check_release_state.clone();
+        let running = check_busy.clone();
+        check_handle.spawn(async move {
+            let result = crate::app_update::check_latest(
+                channel,
+                env!("YT_SAVE_PRODUCT_VERSION"),
+            )
+            .await;
+            let view = match result {
+                Ok(CheckOutcome::UpToDate { current_version, release }) => {
+                    let version = release.version.to_string();
+                    let mut view = AppUpdateUiState::idle(
+                        channel,
+                        format!("Yt Save {current_version} is current on the {} channel.", channel.label()),
+                    );
+                    view.release_notes = app_update_notes_preview(&release.body);
+                    view.release_url = release.html_url.to_string();
+                    view.available = false;
+                    if version != current_version.to_string() {
+                        view.status = format!("Latest {} release is {version}; this app is {current_version}.", channel.label());
+                    }
+                    if let Ok(mut state) = release_state.lock() {
+                        *state = Some(release);
+                    }
+                    view
+                }
+                Ok(CheckOutcome::UpdateAvailable { current_version, release }) => {
+                    let mut view = AppUpdateUiState::idle(
+                        channel,
+                        format!("Yt Save {} is available (installed: {current_version}). Review the notes, then download the matching installer.", release.version),
+                    );
+                    view.release_notes = app_update_notes_preview(&release.body);
+                    view.release_url = release.html_url.to_string();
+                    view.available = true;
+                    if let Ok(mut state) = release_state.lock() {
+                        *state = Some(release);
+                    }
+                    view
+                }
+                Err(error) => {
+                    error!(%error, "check application update");
+                    AppUpdateUiState::idle(channel, format!("Could not check for application updates: {error}"))
+                }
+            };
+            running.store(false, Ordering::Release);
+            let _ = events.send(UiEvent::AppUpdateView(view));
+        });
+    });
+
+    let download_release_state = app_update_release.clone();
+    let download_installer_state = app_update_installer.clone();
+    let download_channel_state = app_update_channel_state.clone();
+    let download_busy = app_update_busy.clone();
+    let download_handle = handle.clone();
+    let download_events = events_tx.clone();
+    window.on_app_update_download_requested(move || {
+        if download_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let channel = download_channel_state
+            .lock()
+            .map(|channel| *channel)
+            .unwrap_or(AppUpdateChannel::Stable);
+        let release = download_release_state.lock().ok().and_then(|state| state.clone());
+        let Some(release) = release else {
+            download_busy.store(false, Ordering::Release);
+            let _ = download_events.send(UiEvent::AppUpdateView(AppUpdateUiState::idle(
+                channel,
+                "Check for updates again before downloading an installer.",
+            )));
+            return;
+        };
+        let mut view = AppUpdateUiState::idle(
+            channel,
+            format!("Preparing and downloading the matching {} installer…", release.version),
+        );
+        view.available = true;
+        view.release_notes = app_update_notes_preview(&release.body);
+        view.release_url = release.html_url.to_string();
+        view.downloading = true;
+        let _ = download_events.send(UiEvent::AppUpdateView(view));
+        let events = download_events.clone();
+        let running = download_busy.clone();
+        let staged_state = download_installer_state.clone();
+        download_handle.spawn(async move {
+            let result = async {
+                let kind = tokio::task::spawn_blocking(crate::app_update::detect_installed_installer)
+                    .await
+                    .context("join installed-package detection")??;
+                let cache_dir = app_update_cache_directory()?;
+                let path = crate::app_update::download_verified_installer(&release, kind, &cache_dir).await?;
+                crate::app_update::verify_cached_installer(&release, kind, &path)?;
+                Ok::<_, anyhow::Error>((kind, path))
+            }
+            .await;
+            let view = match result {
+                Ok((kind, path)) => {
+                    let label = installer_kind_label(kind);
+                    if let Ok(mut staged) = staged_state.lock() {
+                        *staged = Some(StagedAppInstaller { path, kind });
+                    }
+                    let mut view = AppUpdateUiState::idle(
+                        channel,
+                        format!("Verified the {} {} installer. Click Install verified update when ready; downloads will be checked again before handoff.", release.version, label),
+                    );
+                    view.available = true;
+                    view.install_ready = true;
+                    view.release_notes = app_update_notes_preview(&release.body);
+                    view.release_url = release.html_url.to_string();
+                    view
+                }
+                Err(error) => {
+                    error!(%error, "stage verified application installer");
+                    let mut view = AppUpdateUiState::idle(
+                        channel,
+                        format!("The installer was not staged: {error}"),
+                    );
+                    view.available = true;
+                    view.release_notes = app_update_notes_preview(&release.body);
+                    view.release_url = release.html_url.to_string();
+                    view
+                }
+            };
+            running.store(false, Ordering::Release);
+            let _ = events.send(UiEvent::AppUpdateView(view));
+        });
+    });
+
+    let install_release_state = app_update_release.clone();
+    let install_installer_state = app_update_installer.clone();
+    let install_channel_state = app_update_channel_state.clone();
+    let install_busy = app_update_busy.clone();
+    let install_handle = handle.clone();
+    let install_events = events_tx.clone();
+    let install_gate = update_dispatch_gate.clone();
+    let install_helper_state = app_update_helper.clone();
+    let install_active_jobs = active_jobs.clone();
+    let install_shutdown = shutdown_started.clone();
+    let install_shutdown_committed = shutdown_committed.clone();
+    let install_queue_wake = queue_wake.clone();
+    let install_store = store.clone();
+    let install_engine = engine.clone();
+    let install_window = window.as_weak();
+    window.on_app_update_install_requested(move || {
+        if install_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let channel = install_channel_state
+            .lock()
+            .map(|channel| *channel)
+            .unwrap_or(AppUpdateChannel::Stable);
+        if install_shutdown.load(Ordering::Acquire) {
+            let has_helper = install_helper_state
+                .lock()
+                .is_ok_and(|state| state.is_some());
+            if !has_helper {
+                install_busy.store(false, Ordering::Release);
+                let _ = install_events.send(UiEvent::AppUpdateView(AppUpdateUiState::idle(
+                    channel,
+                    "Yt Save is already shutting down and cannot start another update.",
+                )));
+                return;
+            }
+            let helper_state = install_helper_state.clone();
+            let shutdown = install_shutdown.clone();
+            let shutdown_committed = install_shutdown_committed.clone();
+            let queue_wake = install_queue_wake.clone();
+            let engine = install_engine.clone();
+            let running = install_busy.clone();
+            let events = install_events.clone();
+            install_handle.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    cancel_staged_update_helper(&helper_state)
+                })
+                .await
+                .context("join updater helper cancellation retry")
+                .and_then(|result| result);
+                match result {
+                    Ok(()) => {
+                        shutdown_committed.store(false, Ordering::Release);
+                        shutdown.store(false, Ordering::Release);
+                        queue_wake.notify_one();
+                        engine.resume_accepting_yt_dlp_processes();
+                        running.store(false, Ordering::Release);
+                        let mut view = AppUpdateUiState::idle(
+                            channel,
+                            "The updater helper is confirmed stopped. Downloads can resume; retry the installation when ready.",
+                        );
+                        view.available = true;
+                        view.install_ready = true;
+                        let _ = events.send(UiEvent::AppUpdateView(view));
+                    }
+                    Err(error) => {
+                        error!(%error, "retry updater helper cancellation");
+                        running.store(false, Ordering::Release);
+                        let mut view = AppUpdateUiState::idle(
+                            channel,
+                            format!("Safe shutdown mode remains active because the updater helper could not be confirmed stopped: {error}. Keep Yt Save open and retry this action."),
+                        );
+                        view.available = true;
+                        view.install_ready = true;
+                        let _ = events.send(UiEvent::AppUpdateView(view));
+                    }
+                }
+            });
+            return;
+        }
+        let release = install_release_state.lock().ok().and_then(|state| state.clone());
+        let staged = install_installer_state.lock().ok().and_then(|state| state.clone());
+        let (Some(release), Some(staged)) = (release, staged) else {
+            install_busy.store(false, Ordering::Release);
+            let _ = install_events.send(UiEvent::AppUpdateView(AppUpdateUiState::idle(
+                channel,
+                "Download and verify the update before installing it.",
+            )));
+            return;
+        };
+        if install_shutdown.swap(true, Ordering::AcqRel) {
+            install_busy.store(false, Ordering::Release);
+            let _ = install_events.send(UiEvent::AppUpdateView(AppUpdateUiState::idle(
+                channel,
+                "Yt Save is already shutting down and cannot start another update.",
+            )));
+            return;
+        }
+        let mut view = AppUpdateUiState::idle(channel, "Preparing a safe application update handoff…");
+        view.available = true;
+        view.install_ready = true;
+        view.installing = true;
+        view.release_notes = app_update_notes_preview(&release.body);
+        view.release_url = release.html_url.to_string();
+        let _ = install_events.send(UiEvent::AppUpdateView(view));
+        let events = install_events.clone();
+        let running = install_busy.clone();
+        let gate = install_gate.clone();
+        let active_jobs = install_active_jobs.clone();
+        let shutdown = install_shutdown.clone();
+        let shutdown_committed = install_shutdown_committed.clone();
+        let queue_wake = install_queue_wake.clone();
+        let helper_state = install_helper_state.clone();
+        let helper_stop_failed = Arc::new(AtomicBool::new(false));
+        let prepare_helper_stop_failed = helper_stop_failed.clone();
+        let store = install_store.clone();
+        let engine = install_engine.clone();
+        let weak_window = install_window.clone();
+        let event_handle = install_handle.clone();
+        install_handle.spawn(async move {
+            let result = async {
+                let _dispatch_guard = gate.lock().await;
+                let active_count = active_jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
+                    .len();
+                if active_count != 0 {
+                    anyhow::bail!("Finish or safely pause all active downloads before installing an application update.");
+                }
+                let saved_records = store.list_downloads().await?;
+                if saved_records.iter().any(|record| is_active_status(&record.status)) {
+                    anyhow::bail!("The saved queue still contains an active download; wait for it to finish before updating.");
+                }
+                engine.stop_accepting_yt_dlp_processes();
+                let _process_guard = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    engine.lock_for_yt_dlp_update(),
+                )
+                .await
+                .context("yt-dlp operations did not finish within two minutes; the update was canceled")?;
+                let verify_release = release.clone();
+                let verify_path = staged.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::app_update::verify_cached_installer(
+                        &verify_release,
+                        staged.kind,
+                        &verify_path,
+                    )
+                })
+                .await
+                .context("join cached application installer verification")??;
+                let app_path = std::env::current_exe().context("locate the installed application")?;
+                let cache_dir = app_update_cache_directory()?;
+                let installer = staged.path.clone();
+                let helper = tokio::task::spawn_blocking(move || {
+                    crate::app_update::launch_update_helper(
+                        &installer,
+                        staged.kind,
+                        &app_path,
+                        &cache_dir,
+                    )
+                })
+                .await
+                .context("join application updater helper startup")??;
+                let helper_ready = helper.is_ready();
+                *helper_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("updater helper state is unavailable"))? =
+                    Some(helper);
+                if !helper_ready {
+                    prepare_helper_stop_failed.store(true, Ordering::Release);
+                    queue_wake.notify_one();
+                    anyhow::bail!("the updater helper did not become ready and could not be confirmed stopped; retry cancellation while keeping Yt Save open");
+                }
+                queue_wake.notify_one();
+                if let Err(error) = pause_all_downloads(&store, &active_jobs, false).await {
+                    let cancel_state = helper_state.clone();
+                    let helper_stop_error =
+                        tokio::task::spawn_blocking(move || cancel_staged_update_helper(&cancel_state))
+                            .await
+                            .context("join updater helper cancellation")?
+                            .err();
+                    if let Some(helper_stop_error) = helper_stop_error {
+                        prepare_helper_stop_failed.store(true, Ordering::Release);
+                        return Err(error).context(format!(
+                            "preserve the queue before application update; updater helper stop failed: {helper_stop_error:#}"
+                        ));
+                    }
+                    shutdown.store(false, Ordering::Release);
+                    shutdown_committed.store(false, Ordering::Release);
+                    return Err(error).context("preserve the queue before application update");
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    let event_helper_state = helper_state.clone();
+                    let event_shutdown = shutdown.clone();
+                    let event_shutdown_committed = shutdown_committed.clone();
+                    let event_running = running.clone();
+                    let event_events = events.clone();
+                    let event_engine = engine.clone();
+                    let event_queue_wake = queue_wake.clone();
+                    let event_handle = event_handle.clone();
+                    let invoke_result = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak_window.upgrade()
+                            && let Err(error) = window.hide()
+                        {
+                            error!(%error, "hide window for application update");
+                        }
+                        if let Err(error) = slint::quit_event_loop() {
+                            error!(%error, "hand off application update");
+                            let helper_state = event_helper_state.clone();
+                            let shutdown = event_shutdown.clone();
+                            let shutdown_committed = event_shutdown_committed.clone();
+                            let queue_wake = event_queue_wake.clone();
+                            let engine = event_engine.clone();
+                            let running = event_running.clone();
+                            let events = event_events.clone();
+                            let window = weak_window.clone();
+                            event_handle.spawn(async move {
+                                let stop_result = tokio::task::spawn_blocking(move || {
+                                    cancel_staged_update_helper(&helper_state)
+                                })
+                                .await
+                                .context("join updater helper cancellation after failed handoff")
+                                .and_then(|result| result);
+                                if stop_result.is_err() {
+                                } else {
+                                    shutdown.store(false, Ordering::Release);
+                                    shutdown_committed.store(false, Ordering::Release);
+                                    queue_wake.notify_one();
+                                    engine.resume_accepting_yt_dlp_processes();
+                                }
+                                running.store(false, Ordering::Release);
+                                let message = match stop_result {
+                                    Ok(()) => format!("The update could not be started: {error}. The installed application is still available."),
+                                    Err(stop_error) => format!("Safe shutdown mode remains active because the update handoff failed ({error}) and the updater helper could not be confirmed stopped: {stop_error}. Keep Yt Save open and retry this action."),
+                                };
+                                let mut view = AppUpdateUiState::idle(channel, message);
+                                view.available = true;
+                                view.install_ready = true;
+                                let _ = events.send(UiEvent::AppUpdateView(view));
+                                if let Err(show_error) = slint::invoke_from_event_loop(move || {
+                                    if let Some(window) = window.upgrade()
+                                        && let Err(show_error) = window.show()
+                                    {
+                                        error!(%show_error, "restore window after update handoff failure");
+                                    }
+                                }) {
+                                    error!(%show_error, "schedule window restore after update handoff failure");
+                                }
+                            });
+                            return;
+                        }
+                        event_shutdown_committed.store(true, Ordering::Release);
+                        event_queue_wake.notify_one();
+                    });
+                    if let Err(error) = invoke_result {
+                        let cancel_state = helper_state.clone();
+                        let helper_stop_error = tokio::task::spawn_blocking(move || {
+                            cancel_staged_update_helper(&cancel_state)
+                        })
+                        .await
+                        .context("join updater helper cancellation after event-loop dispatch failure")
+                        .and_then(|result| result)
+                        .err();
+                        if let Some(stop_error) = &helper_stop_error
+                        {
+                            error!(%stop_error, "stop updater helper after failed event-loop handoff");
+                        }
+                        if helper_stop_error.is_none() {
+                            shutdown.store(false, Ordering::Release);
+                            shutdown_committed.store(false, Ordering::Release);
+                            queue_wake.notify_one();
+                            engine.resume_accepting_yt_dlp_processes();
+                        }
+                        running.store(false, Ordering::Release);
+                        let status = helper_stop_error.map_or_else(
+                            || format!("Could not hand off to the installer: {error}"),
+                            |stop_error| format!("Safe shutdown mode remains active because the installer handoff failed ({error}) and the updater helper could not be confirmed stopped: {stop_error}. Keep Yt Save open and retry this action."),
+                        );
+                        let _ = events.send(UiEvent::AppUpdateView(AppUpdateUiState::idle(
+                            channel,
+                            status,
+                        )));
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "prepare application update handoff");
+                    let helper_stop_failed = prepare_helper_stop_failed.load(Ordering::Acquire);
+                    if !helper_stop_failed {
+                        shutdown.store(false, Ordering::Release);
+                        shutdown_committed.store(false, Ordering::Release);
+                        queue_wake.notify_one();
+                        engine.resume_accepting_yt_dlp_processes();
+                    }
+                    running.store(false, Ordering::Release);
+                    let mut view = AppUpdateUiState::idle(
+                        channel,
+                        if helper_stop_failed {
+                            format!("Safe shutdown mode remains active because the update was not started ({error}) and the updater helper could not be confirmed stopped. Keep Yt Save open and retry this action.")
+                        } else {
+                            format!("The update was not started: {error}")
+                        },
+                    );
+                    view.available = true;
+                    view.install_ready = true;
+                    view.release_notes = app_update_notes_preview(&release.body);
+                    view.release_url = release.html_url.to_string();
+                    let _ = events.send(UiEvent::AppUpdateView(view));
+                }
+            }
+        });
+    });
+
+    let notes_release_state = app_update_release.clone();
+    let notes_events = events_tx.clone();
+    window.on_app_update_notes_requested(move || {
+        let url = notes_release_state
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|release| release.html_url.to_string()));
+        if let Some(url) = url
+            && let Err(error) = open_release_page(&url)
+        {
+            error!(%error, "open application release notes");
+            let _ = notes_events
+                .send(UiEvent::Status(format!("Could not open the release page: {error}")));
+        }
+    });
+
     let _ = events_tx.send(UiEvent::Refresh);
 
     let history_search_events = events_tx.clone();
@@ -1764,7 +2400,14 @@ pub fn run() -> Result<()> {
     let queue_subscription_events = events_tx.clone();
     let queue_subscription_handle = handle.clone();
     let queue_subscription_wake = queue_wake.clone();
+    let queue_subscription_dispatch_gate = update_dispatch_gate.clone();
+    let queue_subscription_shutdown = shutdown_started.clone();
     window.on_playlist_subscription_queue_selected_requested(move || {
+        if queue_subscription_shutdown.load(Ordering::Acquire) {
+            let _ = queue_subscription_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let snapshot = queue_subscription_review.lock().ok().map(|review| review.clone());
         let Some(snapshot) = snapshot else {
             return;
@@ -1835,6 +2478,8 @@ pub fn run() -> Result<()> {
         let events = queue_subscription_events.clone();
         let queue_wake = queue_subscription_wake.clone();
         let handle = queue_subscription_handle.clone();
+        let dispatch_gate = queue_subscription_dispatch_gate.clone();
+        let shutdown = queue_subscription_shutdown.clone();
         handle.spawn(async move {
             let destination = match tokio::task::spawn_blocking(move || {
                 validate_download_directory(Path::new(&directory))
@@ -1880,6 +2525,13 @@ pub fn run() -> Result<()> {
                     PlaylistSubscriptionQueueItem { media_key: entry.media_key, record }
                 })
                 .collect::<Vec<_>>();
+            let _dispatch_guard = dispatch_gate.lock().await;
+            if shutdown.load(Ordering::Acquire) {
+                let _ = events.send(UiEvent::Status(
+                    "Playlist entries were not queued because Yt Save is shutting down.".to_owned(),
+                ));
+                return;
+            }
             match store.queue_playlist_subscription_entries(subscription.id.clone(), items).await {
                 Ok(count) => {
                     if let Err(error) = store.set_download_presets(presets, now()).await {
@@ -2040,6 +2692,8 @@ pub fn run() -> Result<()> {
         let queue_wake = enqueue_queue_wake.clone();
         let inspector = engine.clone();
         let analysis_generation = enqueue_analysis_generation.clone();
+        let dispatch_gate = enqueue_dispatch_gate.clone();
+        let shutdown = enqueue_shutdown_started.clone();
         queue_handle.spawn(async move {
             match inspector.inspect(&inspection_url).await {
                 Ok(metadata) if metadata.is_playlist => {
@@ -2112,6 +2766,13 @@ pub fn run() -> Result<()> {
                 }
             };
             record.download_directory = destination.to_string_lossy().into_owned();
+            let _dispatch_guard = dispatch_gate.lock().await;
+            if shutdown.load(Ordering::Acquire) {
+                let _ = events.send(UiEvent::Status(
+                    "The queue item was not added because Yt Save is shutting down.".to_owned(),
+                ));
+                return;
+            }
             if let Err(error) = store.save_download(record.clone()).await {
                 let _ = events.send(UiEvent::Status(format!("Could not save queue item: {error}")));
                 return;
@@ -2236,6 +2897,7 @@ pub fn run() -> Result<()> {
     let selected_playlist = playlist_selection.clone();
     let selected_queue_window = window.as_weak();
     let selected_shutdown_started = shutdown_started.clone();
+    let selected_dispatch_gate = update_dispatch_gate.clone();
     window.on_enqueue_selected_playlist_entries_requested(move || {
         if selected_shutdown_started.load(Ordering::Acquire) {
             let _ = selected_queue_events
@@ -2321,6 +2983,8 @@ pub fn run() -> Result<()> {
         let store = selected_queue_store.clone();
         let events = selected_queue_events.clone();
         let queue_wake = selected_queue_wake.clone();
+        let dispatch_gate = selected_dispatch_gate.clone();
+        let shutdown = selected_shutdown_started.clone();
         selected_queue_handle.spawn(async move {
             let destination = match tokio::task::spawn_blocking(move || {
                 validate_download_directory(Path::new(&selected_directory))
@@ -2368,6 +3032,13 @@ pub fn run() -> Result<()> {
                 records.push(record);
             }
             let selected_count = records.len();
+            let _dispatch_guard = dispatch_gate.lock().await;
+            if shutdown.load(Ordering::Acquire) {
+                let _ = events.send(UiEvent::Status(
+                    "Playlist entries were not queued because Yt Save is shutting down.".to_owned(),
+                ));
+                return;
+            }
             if let Err(error) = store.save_downloads(records).await {
                 error!(%error, "persist selected playlist batch");
                 let _ = events.send(UiEvent::Refresh);
@@ -3316,6 +3987,7 @@ pub fn run() -> Result<()> {
             queue_wake: queue_wake.clone(),
             preferences: tray_preferences_state.clone(),
             shutdown_started,
+            shutdown_committed,
         },
     );
 
@@ -3575,6 +4247,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
         queue_wake,
         preferences,
         shutdown_started,
+        shutdown_committed,
     } = context;
     let open_window = window.as_weak();
     tray.on_open_requested(move || {
@@ -3669,6 +4342,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     let quit_queue_wake = queue_wake.clone();
     let quit_window = window.as_weak();
     let quit_guard = shutdown_started.clone();
+    let quit_committed = shutdown_committed.clone();
     tray.on_quit_requested(move || {
         begin_orderly_quit(
             quit_handle.clone(),
@@ -3677,7 +4351,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
             quit_queue_wake.clone(),
             quit_events.clone(),
             quit_window.clone(),
-            quit_guard.clone(),
+            ShutdownState { started: quit_guard.clone(), committed: quit_committed.clone() },
         );
     });
 
@@ -3732,6 +4406,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
     let close_queue_wake = queue_wake;
     let close_window = window.as_weak();
     let close_guard = shutdown_started;
+    let close_committed = shutdown_committed;
     window.window().on_close_requested(move || {
         let close_to_tray =
             close_preferences.lock().map(|preferences| preferences.close_to_tray).unwrap_or(false);
@@ -3745,7 +4420,7 @@ fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
                 close_queue_wake.clone(),
                 close_events.clone(),
                 close_window.clone(),
-                close_guard.clone(),
+                ShutdownState { started: close_guard.clone(), committed: close_committed.clone() },
             );
             CloseRequestResponse::KeepWindowShown
         }
@@ -3799,6 +4474,18 @@ fn save_tray_preference_update(
     });
 }
 
+fn cancel_staged_update_helper(
+    helper_state: &Arc<Mutex<Option<crate::app_update::UpdateHelper>>>,
+) -> Result<()> {
+    let mut helper_state =
+        helper_state.lock().map_err(|_| anyhow::anyhow!("updater helper state is unavailable"))?;
+    if let Some(helper) = helper_state.as_mut() {
+        helper.cancel_and_wait()?;
+    }
+    helper_state.take();
+    Ok(())
+}
+
 fn begin_orderly_quit(
     handle: tokio::runtime::Handle,
     store: Store,
@@ -3806,8 +4493,10 @@ fn begin_orderly_quit(
     queue_wake: Arc<Notify>,
     events: mpsc::UnboundedSender<UiEvent>,
     window: slint::Weak<MainWindow>,
-    shutdown_started: Arc<AtomicBool>,
+    shutdown: ShutdownState,
 ) {
+    let shutdown_started = shutdown.started;
+    let shutdown_committed = shutdown.committed;
     if shutdown_started.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -3846,6 +4535,7 @@ fn begin_orderly_quit(
                 let _ = events.send(UiEvent::Status(
                     "Downloads are paused. The application is shutting down.".to_owned(),
                 ));
+                let quit_queue_wake = queue_wake.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = window.upgrade()
                         && let Err(error) = window.hide()
@@ -3854,6 +4544,8 @@ fn begin_orderly_quit(
                     }
                     if let Err(error) = slint::quit_event_loop() {
                         shutdown_started.store(false, Ordering::Release);
+                        shutdown_committed.store(false, Ordering::Release);
+                        quit_queue_wake.notify_one();
                         error!(%error, "quit Slint event loop during orderly shutdown");
                         if let Some(window) = window.upgrade() {
                             window.set_status_message(
@@ -3861,11 +4553,16 @@ fn begin_orderly_quit(
                             );
                             let _ = window.show();
                         }
+                        return;
                     }
+                    shutdown_committed.store(true, Ordering::Release);
+                    quit_queue_wake.notify_one();
                 });
             }
             Err(error) => {
                 shutdown_started.store(false, Ordering::Release);
+                shutdown_committed.store(false, Ordering::Release);
+                queue_wake.notify_one();
                 error!(%error, "orderly application shutdown");
                 let message = format!(
                     "Could not safely quit: {error}. The window and tray remain available."
@@ -4120,17 +4817,20 @@ async fn run_queue_dispatcher(
     queue_wake: Arc<Notify>,
     active_jobs: ActiveJobs,
     update_dispatch_gate: Arc<AsyncMutex<()>>,
-    shutdown_started: Arc<AtomicBool>,
+    shutdown: ShutdownState,
 ) {
+    let ShutdownState { started: shutdown_started, committed: shutdown_committed } = shutdown;
     let mut workers = JoinSet::new();
     loop {
         if shutdown_started.load(Ordering::Acquire) {
-            while let Some(result) = workers.join_next().await {
-                if let Err(error) = result {
-                    error!(%error, "queue worker task failed while shutting down");
-                }
-            }
-            if shutdown_started.load(Ordering::Acquire) {
+            if drain_workers_during_shutdown(
+                &mut workers,
+                &queue_wake,
+                &shutdown_started,
+                &shutdown_committed,
+            )
+            .await
+            {
                 return;
             }
             continue;
@@ -4306,6 +5006,43 @@ async fn run_queue_dispatcher(
                     }
                 },
             }
+        }
+    }
+}
+
+async fn drain_workers_during_shutdown(
+    workers: &mut JoinSet<()>,
+    queue_wake: &Notify,
+    shutdown_started: &AtomicBool,
+    shutdown_committed: &AtomicBool,
+) -> bool {
+    loop {
+        if shutdown_committed.load(Ordering::Acquire) {
+            return true;
+        }
+        if !shutdown_started.load(Ordering::Acquire) {
+            return false;
+        }
+        let notified = queue_wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if shutdown_committed.load(Ordering::Acquire) {
+            return true;
+        }
+        if !shutdown_started.load(Ordering::Acquire) {
+            return false;
+        }
+        if workers.is_empty() {
+            notified.await;
+            continue;
+        }
+        tokio::select! {
+            result = workers.join_next() => {
+                if let Some(Err(error)) = result {
+                    error!(%error, "queue worker task failed while shutting down");
+                }
+            }
+            _ = notified.as_mut() => {}
         }
     }
 }
@@ -5180,6 +5917,68 @@ fn format_local_schedule(timestamp: i64) -> String {
         .unwrap_or_else(|| "an unknown time".to_owned())
 }
 
+fn app_update_cache_directory() -> Result<PathBuf> {
+    let project_dirs =
+        ProjectDirs::from("com", env!("YT_SAVE_PUBLISHER"), env!("YT_SAVE_PRODUCT_NAME"))
+            .context("determine the per-user update cache directory")?;
+    let directory = project_dirs.cache_dir().join("app-updates");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create application update cache {}", directory.display()))?;
+    Ok(directory)
+}
+
+fn app_update_notes_preview(body: &str) -> String {
+    let mut text = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    text.retain(|character| !character.is_control() || character == '\t');
+    const MAX_NOTES_CHARS: usize = 520;
+    if text.chars().count() > MAX_NOTES_CHARS {
+        text = text.chars().take(MAX_NOTES_CHARS).collect::<String>();
+        text.push('…');
+    }
+    text
+}
+
+fn installer_kind_label(kind: InstallerKind) -> &'static str {
+    match kind {
+        InstallerKind::Msi => "MSI",
+        InstallerKind::SetupExe => "Inno Setup",
+    }
+}
+
+fn open_release_page(value: &str) -> Result<()> {
+    let url = url::Url::parse(value).context("parse the application release page URL")?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.path().starts_with(&format!(
+                "/{}/{}/releases/tag/",
+                env!("YT_SAVE_GITHUB_OWNER"),
+                env!("YT_SAVE_GITHUB_REPOSITORY")
+            )),
+        "the application release page did not match the configured GitHub repository"
+    );
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "start", "", url.as_str()]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url.as_str());
+        command
+    };
+    command.spawn().context("open the official application release page")?;
+    Ok(())
+}
+
 fn validate_download_directory(path: &Path) -> Result<PathBuf> {
     if path.as_os_str().is_empty() || !path.is_absolute() {
         anyhow::bail!("choose an absolute save-folder path");
@@ -5784,6 +6583,103 @@ mod tests {
         assert!(!can_dispatch_more(2, 2));
         assert!(can_dispatch_more(1, 2));
         assert!(!can_dispatch_more(1, 1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_drain_resumes_when_shutdown_is_rolled_back() {
+        let shutdown_started = Arc::new(AtomicBool::new(true));
+        let queue_wake = Arc::new(Notify::new());
+        let mut workers = JoinSet::new();
+        workers.spawn(async { std::future::pending::<()>().await });
+
+        let rollback_shutdown = shutdown_started.clone();
+        let rollback_wake = queue_wake.clone();
+        let rollback = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            rollback_shutdown.store(false, Ordering::Release);
+            rollback_wake.notify_one();
+        });
+
+        let shutdown_committed = AtomicBool::new(false);
+        let should_exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_workers_during_shutdown(
+                &mut workers,
+                &queue_wake,
+                &shutdown_started,
+                &shutdown_committed,
+            ),
+        )
+        .await
+        .expect("the shutdown rollback should wake the dispatcher");
+        rollback.await.unwrap();
+
+        assert!(!should_exit);
+        assert_eq!(workers.len(), 1, "an active worker must not be discarded");
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_drain_waits_for_rollback_after_last_worker_finishes() {
+        let shutdown_started = Arc::new(AtomicBool::new(true));
+        let queue_wake = Arc::new(Notify::new());
+        let mut workers = JoinSet::new();
+        workers.spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
+
+        let rollback_shutdown = shutdown_started.clone();
+        let rollback_wake = queue_wake.clone();
+        let rollback = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            rollback_shutdown.store(false, Ordering::Release);
+            rollback_wake.notify_one();
+        });
+
+        let shutdown_committed = AtomicBool::new(false);
+        let should_exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_workers_during_shutdown(
+                &mut workers,
+                &queue_wake,
+                &shutdown_started,
+                &shutdown_committed,
+            ),
+        )
+        .await
+        .expect("the shutdown rollback should wake an empty dispatcher");
+        rollback.await.unwrap();
+        assert!(!should_exit);
+        assert!(workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_drain_exits_after_shutdown_is_committed() {
+        let shutdown_started = AtomicBool::new(true);
+        let shutdown_committed = Arc::new(AtomicBool::new(false));
+        let queue_wake = Arc::new(Notify::new());
+        let mut workers = JoinSet::new();
+
+        let commit = shutdown_committed.clone();
+        let wake = queue_wake.clone();
+        let commit_shutdown = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            commit.store(true, Ordering::Release);
+            wake.notify_one();
+        });
+
+        let should_exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_workers_during_shutdown(
+                &mut workers,
+                &queue_wake,
+                &shutdown_started,
+                &shutdown_committed,
+            ),
+        )
+        .await
+        .expect("the committed shutdown should wake the dispatcher");
+        commit_shutdown.await.unwrap();
+        assert!(should_exit);
     }
     use crate::model::{AudioFormat, AudioQuality, VideoQuality};
 

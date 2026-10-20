@@ -137,6 +137,15 @@ export component MainWindow inherits Window {
     in-out property <bool> minimize-to-tray-enabled: false;
     in-out property <string> dependency-status: "Checking bundled tools…";
     in-out property <bool> yt-dlp-update-in-progress: false;
+    in-out property <string> app-update-channel: "Stable";
+    in-out property <string> app-update-status: "Application updates have not been checked.";
+    in-out property <string> app-update-release-notes: "";
+    in-out property <string> app-update-release-url: "";
+    in-out property <bool> app-update-available: false;
+    in-out property <bool> app-update-checking: false;
+    in-out property <bool> app-update-downloading: false;
+    in-out property <bool> app-update-install-ready: false;
+    in-out property <bool> app-update-installing: false;
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
     in-out property <bool> analyzed-is-playlist: false;
@@ -169,6 +178,11 @@ export component MainWindow inherits Window {
     callback playlist-subscription-dismiss-selected-requested();
     callback clipboard-monitoring-requested(bool);
     callback yt-dlp-update-requested();
+    callback app-update-channel-requested(string);
+    callback app-update-check-requested();
+    callback app-update-download-requested();
+    callback app-update-install-requested();
+    callback app-update-notes-requested();
     callback clipboard-candidate-dismissed();
     callback close-to-tray-requested(bool);
     callback minimize-to-tray-requested(bool);
@@ -385,6 +399,75 @@ export component MainWindow inherits Window {
                                         button-height: 28px;
                                         button-min-width: 150px;
                                         clicked => { root.yt-dlp-update-requested(); }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                border-radius: 12px;
+                                background: #171b28;
+                                border-width: 1px;
+                                border-color: #282d40;
+                                height: 214px;
+
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 5px;
+                                    Text { text: "APPLICATION UPDATES"; color: #737b94; font-size: 10px; font-weight: 700; }
+                                    HorizontalLayout {
+                                        height: 30px;
+                                        Text { text: "Channel"; color: #aab2c8; font-size: 10px; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        ComboBox {
+                                            model: ["Stable", "Preview"];
+                                            current-value <=> root.app-update-channel;
+                                            enabled: !root.app-update-checking && !root.app-update-downloading && !root.app-update-installing;
+                                            width: 118px;
+                                            height: 30px;
+                                            selected(value) => { root.app-update-channel-requested(value); }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.app-update-status;
+                                        color: #aab2c8;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                        vertical-stretch: 1;
+                                    }
+                                    Text {
+                                        text: root.app-update-release-notes;
+                                        color: #828ba2;
+                                        font-size: 9px;
+                                        wrap: word-wrap;
+                                        overflow: elide;
+                                        visible: root.app-update-available;
+                                        max-height: 46px;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        ActionButton {
+                                            label: root.app-update-installing ? "Preparing install…" : root.app-update-checking ? "Checking…" : root.app-update-downloading ? "Downloading…" : root.app-update-install-ready ? "Install verified update" : root.app-update-available ? "Download update" : "Check for updates";
+                                            is-enabled: !root.app-update-checking && !root.app-update-downloading && !root.app-update-installing;
+                                            button-height: 30px;
+                                            button-min-width: 146px;
+                                            primary: root.app-update-available;
+                                            clicked => {
+                                                if root.app-update-install-ready {
+                                                    root.app-update-install-requested();
+                                                } else if root.app-update-available {
+                                                    root.app-update-download-requested();
+                                                } else {
+                                                    root.app-update-check-requested();
+                                                }
+                                            }
+                                        }
+                                        ActionButton {
+                                            label: "Release page";
+                                            button-height: 30px;
+                                            button-min-width: 86px;
+                                            is-enabled: root.app-update-available && !root.app-update-installing;
+                                            clicked => { root.app-update-notes-requested(); }
+                                        }
                                     }
                                 }
                             }

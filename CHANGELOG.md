@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Publish plain `vMAJOR.MINOR.PATCH` release tags as stable and SemVer prerelease tags as preview releases; retain checksum assets and generated release notes. Application self-update UI remains unimplemented.
+- Publish plain `vMAJOR.MINOR.PATCH` release tags as stable and SemVer prerelease tags as preview releases; retain checksum assets and generated release notes.
+- Add a user-controlled application updater with persisted Stable/Preview channels, SemVer release ordering, GitHub prerelease channel handling, release notes, matching MSI/Inno installer selection, bounded GitHub downloads, SHA-256 verification, and an idle-queue installer handoff. A committed-shutdown handshake protects queue dispatch recovery; yt-dlp updates recheck shutdown after waiting for the shared gate; failed installer handoffs signal and wait for their helper to stop. Windows upgrade, UAC, failure-recovery, and data-preservation acceptance remain pending; GitHub's API digest is not an independent publisher signature.
 - Add a pinned cargo-deny license/source policy for Rust dependencies, run it with the security audit workflow, and document its scoped Slint GPL option and source allowlist.
 - Add a user-triggered stable yt-dlp updater with bounded HTTPS downloads, GitHub SHA-256 digest verification, staged `--version` checks, per-user versioned binaries, rollback markers, startup recovery, and a Windows single-instance guard for shared engine state. Detached OpenPGP signature verification and live Windows update acceptance remain pending.
 - Add playlist subscriptions for yt-dlp-supported sources with Manual, hourly, 6-hour, 12-hour, daily, and weekly check frequencies. The in-app scheduler polls every 30 seconds and checks at most eight due subscriptions per pass while the app is running; new entries remain in the review archive and are not queued automatically.

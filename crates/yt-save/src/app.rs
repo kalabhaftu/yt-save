@@ -8711,14 +8711,25 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires packaged Windows media tools and live YouTube access"]
     async fn packaged_yt_dlp_deno_ffmpeg_complete_a_youtube_queue_job() {
-        let package_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("package")
-            .join("bin")
+        let package_bin = std::env::var_os("YT_SAVE_DEPENDENCY_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target")
+                    .join("package")
+                    .join("bin")
+            })
             .canonicalize()
-            .expect("build package dependencies before running this acceptance test");
+            .expect("build package dependencies or set YT_SAVE_DEPENDENCY_DIR before running this acceptance test");
+        for dependency in ["yt-dlp.exe", "deno.exe", "ffmpeg.exe", "ffprobe.exe"] {
+            assert!(
+                package_bin.join(dependency).is_file(),
+                "packaged dependency is missing: {}",
+                package_bin.join(dependency).display()
+            );
+        }
         let temp_dir = std::env::temp_dir().join(format!("yt-save-live-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let output_directory = temp_dir.join("downloads");

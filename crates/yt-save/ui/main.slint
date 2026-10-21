@@ -97,6 +97,9 @@ export component MainWindow inherits Window {
     background: #0c0e15;
 
     in-out property <string> url-input: "";
+    in property <bool> cookie-support-enabled: false;
+    in property <string> cookie-support-status: "";
+    in-out property <bool> has-saved-cookies: false;
     in-out property <bool> multiple-links-mode: false;
     in-out property <string> batch-url-input: "";
     in-out property <bool> batch-enqueue-in-progress: false;
@@ -175,6 +178,10 @@ export component MainWindow inherits Window {
     in property <[PlaylistSubscriptionEntryRowData]> playlist-subscription-entries: [];
 
     callback analyze-requested(string);
+    callback cookie-sign-in-requested(string);
+    callback cookie-clear-requested(string);
+    callback cookie-vault-state-requested(string);
+    callback cookie-runtime-download-requested();
     callback enqueue-requested(string);
     callback enqueue-batch-requested(string);
     callback playlist-entry-toggle-requested(int);
@@ -257,6 +264,7 @@ export component MainWindow inherits Window {
         if root.url-input != root.format-choice-display-url {
             root.selected-format = "Automatic (quality preset)";
         }
+        root.cookie-vault-state-requested(root.url-input);
     }
 
     changed history-search => {
@@ -919,7 +927,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 388px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 38px : 0px) + (root.multiple-links-mode ? 100px : 0px);
+                        height: 462px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 38px : 0px) + (root.multiple-links-mode ? 100px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -1057,6 +1065,38 @@ export component MainWindow inherits Window {
                                     label: "Add to queue";
                                     primary: true;
                                     clicked => { root.enqueue-requested(root.url-input); }
+                                }
+                            }
+                            if !root.multiple-links-mode : HorizontalLayout {
+                                height: 34px;
+                                spacing: 8px;
+                                ActionButton {
+                                    label: root.cookie-support-enabled ? (root.has-saved-cookies ? "Sign in again for this site" : "Sign in for this site") : "Get WebView2 Runtime";
+                                    is-enabled: !root.cookie-support-enabled || root.url-input != "";
+                                    button-height: 32px;
+                                    button-min-width: 170px;
+                                    clicked => {
+                                        if root.cookie-support-enabled {
+                                            root.cookie-sign-in-requested(root.url-input);
+                                        } else {
+                                            root.cookie-runtime-download-requested();
+                                        }
+                                    }
+                                }
+                                ActionButton {
+                                    label: "Clear saved sign-in";
+                                    is-enabled: root.has-saved-cookies;
+                                    button-height: 32px;
+                                    button-min-width: 142px;
+                                    clicked => { root.cookie-clear-requested(root.url-input); }
+                                }
+                                Text {
+                                    text: !root.cookie-support-enabled ? root.cookie-support-status : (root.has-saved-cookies ? "Saved cookies are encrypted for your Windows account and used for matching HTTPS URLs." : "Sign in inside Yt Save, then choose Save cookies to use this site's sign-in.");
+                                    color: #8f98ae;
+                                    font-size: 10px;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
                                 }
                             }
                             HorizontalLayout {
@@ -1854,6 +1894,131 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component CookieLoginWindow inherits Window {
+    title: "Sign in to your media site — Yt Save";
+    preferred-width: 920px;
+    preferred-height: 720px;
+    min-width: 920px;
+    max-width: 920px;
+    min-height: 720px;
+    max-height: 720px;
+    background: #0c0e15;
+
+    in property <string> site-label: "your media site";
+    in-out property <string> login-status: "Sign in on the page below, then choose Save cookies.";
+    in-out property <bool> saving: false;
+
+    callback save-requested();
+    callback cancel-requested();
+    callback back-requested();
+    callback forward-requested();
+    callback reload-requested();
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 108px;
+            background: #11141f;
+            border-color: #202436;
+            border-width: 0px;
+            VerticalLayout {
+                padding-left: 22px;
+                padding-right: 22px;
+                padding-top: 13px;
+                spacing: 4px;
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 6px;
+                    Text {
+                        text: "Sign in to " + root.site-label;
+                        color: #f2f3f8;
+                        font-size: 20px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    ActionButton {
+                        label: "Back";
+                        button-height: 28px;
+                        button-min-width: 62px;
+                        clicked => { root.back-requested(); }
+                    }
+                    ActionButton {
+                        label: "Forward";
+                        button-height: 28px;
+                        button-min-width: 72px;
+                        clicked => { root.forward-requested(); }
+                    }
+                    ActionButton {
+                        label: "Reload";
+                        button-height: 28px;
+                        button-min-width: 68px;
+                        clicked => { root.reload-requested(); }
+                    }
+                }
+                Text {
+                    text: "This compact sign-in view is inside Yt Save. Some sites may block embedded sign-in.";
+                    color: #a9b0c4;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.login-status;
+                    color: #c7cbe0;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            height: 500px;
+            background: #151925;
+            border-width: 1px;
+            border-color: #2a3043;
+        }
+        Rectangle {
+            height: 112px;
+            background: #11141f;
+            VerticalLayout {
+                padding-left: 22px;
+                padding-right: 22px;
+                padding-top: 8px;
+                spacing: 6px;
+                Text {
+                    text: "Yt Save can read this sign-in page. Cookies are saved only when you choose Save cookies, then are protected with your Windows account and sent to yt-dlp for matching URLs.";
+                    color: #a9b0c4;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                HorizontalLayout {
+                    height: 38px;
+                    spacing: 8px;
+                    Text { text: ""; horizontal-stretch: 1; }
+                    ActionButton {
+                        label: root.saving ? "Saving cookies…" : "Save cookies";
+                        primary: true;
+                        is-enabled: !root.saving;
+                        button-height: 36px;
+                        button-min-width: 132px;
+                        clicked => { root.save-requested(); }
+                    }
+                    ActionButton {
+                        label: "Cancel";
+                        is-enabled: !root.saving;
+                        button-height: 36px;
+                        button-min-width: 92px;
+                        clicked => { root.cancel-requested(); }
                     }
                 }
             }

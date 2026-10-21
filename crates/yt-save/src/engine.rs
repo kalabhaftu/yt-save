@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -12,11 +13,12 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
-    sync::{RwLock as AsyncRwLock, watch},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock, watch},
 };
 use tracing::{debug, warn};
 
 use crate::{
+    cookie_auth::{CookieLease, CookieStore},
     dependencies::DependencyPaths,
     model::{
         AudioFormat, AudioQuality, DownloadMode, MediaMetadata, SubtitleFormat, VideoQuality,
@@ -128,6 +130,19 @@ pub struct DownloadEngine {
     process_gate: Arc<AsyncRwLock<()>>,
     yt_dlp_processes_enabled: Arc<AtomicBool>,
     output_directory: PathBuf,
+    cookie_store: CookieStore,
+    cookie_host_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+}
+
+struct CookieProcessAuth {
+    lease: CookieLease,
+    _host_guard: OwnedMutexGuard<()>,
+}
+
+impl CookieProcessAuth {
+    fn finish(self) -> Result<()> {
+        self.lease.finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -180,6 +195,64 @@ impl DownloadEngine {
             process_gate: Arc::new(AsyncRwLock::new(())),
             yt_dlp_processes_enabled: Arc::new(AtomicBool::new(true)),
             output_directory,
+            cookie_store: CookieStore::disabled(),
+            cookie_host_gates: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_cookie_store(mut self, cookie_store: CookieStore) -> Self {
+        self.cookie_store = cookie_store;
+        self
+    }
+
+    async fn attach_cookie_lease(
+        &self,
+        url: &str,
+        command: &mut Command,
+    ) -> Result<Option<CookieProcessAuth>> {
+        if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() != "https") {
+            return Ok(None);
+        }
+
+        let store = self.cookie_store.clone();
+        let url = url.to_owned();
+        let has_saved = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let url = url.clone();
+            move || store.has_saved_for_url(&url)
+        })
+        .await
+        .context("check saved sign-in for yt-dlp")??;
+        if !has_saved {
+            return Ok(None);
+        }
+
+        let host = crate::cookie_auth::validated_url_host(&url)?;
+        let host_gate = {
+            let mut gates =
+                self.cookie_host_gates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            gates.get(&host).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let gate = Arc::new(AsyncMutex::new(()));
+                gates.insert(host.clone(), Arc::downgrade(&gate));
+                gate
+            })
+        };
+        let host_guard = host_gate.lock_owned().await;
+        let lease = tokio::task::spawn_blocking(move || store.lease_for_url(&url))
+            .await
+            .context("prepare saved sign-in for yt-dlp")??;
+        if let Some(lease) = lease.as_ref() {
+            command.arg("--cookies").arg(lease.path());
+        }
+        Ok(lease.map(|lease| CookieProcessAuth { lease, _host_guard: host_guard }))
+    }
+
+    async fn refresh_cookie_lease(auth: Option<CookieProcessAuth>) {
+        if let Some(auth) = auth
+            && !matches!(tokio::task::spawn_blocking(move || auth.finish()).await, Ok(Ok(())))
+        {
+            warn!("yt-dlp exited but the encrypted sign-in could not be refreshed");
         }
     }
 
@@ -301,28 +374,32 @@ impl DownloadEngine {
         self.require_yt_dlp()?;
         let mut command =
             self.inspect_command(url, playlist_index, playlist_start, playlist_end)?;
+        let cookie_lease = self.attach_cookie_lease(url, &mut command).await?;
         debug!(host = url_host(url), "requesting yt-dlp metadata");
         let mut child = command.spawn().context("start yt-dlp metadata extraction")?;
         let stdout = child.stdout.take().context("open yt-dlp metadata stdout")?;
         let stderr = child.stderr.take().context("open yt-dlp metadata stderr")?;
         let stdout_task = tokio::spawn(read_all(stdout));
         let stderr_task = tokio::spawn(read_all(stderr));
-        let (status, stop_signal) = tokio::select! {
+        let (status_result, stop_signal) = tokio::select! {
             biased;
-            status = child.wait() => (status.context("wait for yt-dlp metadata")?, JobSignal::Continue),
-            stop_signal = wait_for_signal(signal) => {
-                match terminate_process_tree(&mut child).await {
-                    Ok(status) => (status, stop_signal),
-                    Err(error) => {
-                        stdout_task.abort();
-                        stderr_task.abort();
-                        let _ = stdout_task.await;
-                        let _ = stderr_task.await;
-                        return Err(error);
-                    }
-                }
-            },
+            status = child.wait() => (status.context("wait for yt-dlp metadata"), JobSignal::Continue),
+            stop_signal = wait_for_signal(signal) => (terminate_process_tree(&mut child).await, stop_signal),
         };
+        let status = match status_result {
+            Ok(status) => status,
+            Err(error) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                if force_kill_direct_child(&mut child).await.is_ok() {
+                    Self::refresh_cookie_lease(cookie_lease).await;
+                }
+                return Err(error);
+            }
+        };
+        Self::refresh_cookie_lease(cookie_lease).await;
         let output = Output {
             status,
             stdout: stdout_task.await.context("join yt-dlp metadata stdout reader")??,
@@ -379,6 +456,7 @@ impl DownloadEngine {
             options.output_directory.clone().unwrap_or_else(|| self.output_directory.clone());
         self.require_yt_dlp()?;
         let mut command = self.download_command(url, playlist_index, options)?;
+        let mut cookie_lease = self.attach_cookie_lease(url, &mut command).await?;
         debug!(host = url_host(url), "starting yt-dlp download");
         let mut child = command.spawn().context("start yt-dlp download")?;
         let stdout = child.stdout.take().context("open yt-dlp stdout")?;
@@ -399,6 +477,12 @@ impl DownloadEngine {
                 requested = wait_for_signal(signal) => {
                     stop_signal = requested;
                     if let Err(error) = terminate_process_tree(&mut child).await {
+                        let stopped = force_kill_direct_child(&mut child).await.is_ok();
+                        if stopped {
+                            Self::refresh_cookie_lease(cookie_lease.take()).await;
+                        } else {
+                            warn!("could not confirm yt-dlp stopped; temporary sign-in cleanup is pending");
+                        }
                         stderr_task.abort();
                         let _ = stderr_task.await;
                         return Err(error);
@@ -406,32 +490,55 @@ impl DownloadEngine {
                     break;
                 }
                 line = lines.next_line() => {
-                    let Some(line) = line.context("read yt-dlp output")? else {
-                        break;
-                    };
-                    process_download_line(&line, &mut output_path, &mut on_progress);
+                    match line {
+                        Ok(Some(line)) => process_download_line(&line, &mut output_path, &mut on_progress),
+                        Ok(None) => break,
+                        Err(error) => {
+                            let read_error = anyhow::Error::from(error).context("read yt-dlp output");
+                            let stopped = match terminate_process_tree(&mut child).await {
+                                Ok(_) => true,
+                                Err(_) => force_kill_direct_child(&mut child).await.is_ok(),
+                            };
+                            if stopped {
+                                Self::refresh_cookie_lease(cookie_lease.take()).await;
+                            } else {
+                                warn!("could not confirm yt-dlp stopped; temporary sign-in cleanup is pending");
+                            }
+                            stderr_task.abort();
+                            let _ = stderr_task.await;
+                            return Err(read_error);
+                        }
+                    }
                 }
             }
         }
-        let status = if stop_signal != JobSignal::Continue {
-            child.wait().await.context("wait for yt-dlp")?
+        let status_result = if stop_signal != JobSignal::Continue {
+            child.wait().await.context("wait for yt-dlp")
         } else {
             tokio::select! {
                 biased;
                 requested = wait_for_signal(signal) => {
                     stop_signal = requested;
-                    match terminate_process_tree(&mut child).await {
-                        Ok(status) => status,
-                        Err(error) => {
-                            stderr_task.abort();
-                            let _ = stderr_task.await;
-                            return Err(error);
-                        }
-                    }
+                    terminate_process_tree(&mut child).await
                 }
-                status = child.wait() => status.context("wait for yt-dlp")?,
+                status = child.wait() => status.context("wait for yt-dlp"),
             }
         };
+        let status = match status_result {
+            Ok(status) => status,
+            Err(error) => {
+                let stopped = force_kill_direct_child(&mut child).await.is_ok();
+                if stopped {
+                    Self::refresh_cookie_lease(cookie_lease.take()).await;
+                } else {
+                    warn!("could not confirm yt-dlp stopped; temporary sign-in cleanup is pending");
+                }
+                stderr_task.abort();
+                let _ = stderr_task.await;
+                return Err(error);
+            }
+        };
+        Self::refresh_cookie_lease(cookie_lease.take()).await;
         if stop_signal != JobSignal::Continue {
             while let Some(line) = lines.next_line().await.context("read yt-dlp output")? {
                 process_download_line(&line, &mut output_path, &mut on_progress);
@@ -920,6 +1027,78 @@ fn url_host(value: &str) -> &str {
 mod tests {
     use super::*;
     use crate::dependencies::DependencyPaths;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn yt_dlp_receives_a_temporary_cookie_path_without_cookie_values_in_arguments() {
+        use crate::cookie_auth::CookieRecord;
+
+        let root =
+            std::env::temp_dir().join(format!("yt-save-engine-cookie-{}", uuid::Uuid::new_v4()));
+        let cookie_store = CookieStore::new(root.clone());
+        cookie_store
+            .save_for_url(
+                "https://media.example.test/watch",
+                &[CookieRecord {
+                    domain: "media.example.test".to_owned(),
+                    path: "/".to_owned(),
+                    name: "session".to_owned(),
+                    value: "sensitive-session-value".to_owned(),
+                    secure: true,
+                    http_only: true,
+                    expires: 1_800_000_000,
+                }],
+            )
+            .expect("protect cookie jar");
+        let engine = DownloadEngine::new(
+            DependencyPaths {
+                directory: PathBuf::new(),
+                yt_dlp: PathBuf::new(),
+                deno: PathBuf::new(),
+                ffmpeg: PathBuf::new(),
+                ffprobe: PathBuf::new(),
+            },
+            PathBuf::new(),
+        )
+        .with_cookie_store(cookie_store);
+        let mut command = engine.base_command();
+        let lease = engine
+            .attach_cookie_lease("https://media.example.test/watch", &mut command)
+            .await
+            .expect("prepare cookie lease")
+            .expect("saved cookie lease");
+        let expected_path = lease.lease.path().to_string_lossy().into_owned();
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let cookies_index = arguments.iter().position(|argument| argument == "--cookies").unwrap();
+        assert_eq!(arguments.get(cookies_index + 1), Some(&expected_path));
+        assert!(!arguments.iter().any(|argument| argument.contains("sensitive-session-value")));
+
+        let second_engine = engine.clone();
+        let mut second_lease = tokio::spawn(async move {
+            let mut second_command = second_engine.base_command();
+            second_engine
+                .attach_cookie_lease("https://media.example.test/another", &mut second_command)
+                .await
+                .expect("prepare second cookie lease")
+                .expect("second saved cookie lease")
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second_lease)
+                .await
+                .is_err()
+        );
+        lease.finish().expect("refresh protected cookie jar");
+        second_lease
+            .await
+            .expect("second cookie lease task")
+            .finish()
+            .expect("refresh second protected cookie jar");
+        std::fs::remove_dir_all(root).expect("remove test cookie files");
+    }
 
     #[tokio::test]
     async fn update_shutdown_rejects_late_process_starts_and_can_recover() {

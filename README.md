@@ -14,6 +14,7 @@ Real application screenshots will be added after the first Windows UI validation
 
 - Native Rust application with a Slint UI and Tokio background work.
 - Accepts HTTP and HTTPS media URLs from any site yt-dlp can extract.
+- Offers an opt-in, compact HTTPS sign-in view for sites that need an account. Cookies are saved only after the user chooses Save cookies, encrypted for the current Windows account, and passed to yt-dlp through a short-lived file scoped to the entered URL's host. The WebView2 runtime is required for this optional sign-in feature; public media downloads do not need it.
 - Reads media metadata and available formats through yt-dlp JSON output. For one analyzed media URL, an exact-format menu shows up to the first 100 reported formats with their IDs, extensions, stream types, codecs, dimensions, frame rates, and reported or estimated sizes when yt-dlp provides them. The list is filtered to the selected download mode; an exact choice overrides the video quality preset. Yt Save stores only its ID and rechecks it before queueing and again before download. Batch and playlist jobs continue to use their mode and quality presets.
 - Previews up to the first 50 playlist entries. Select all, clear the selection, select an inclusive playlist-index range, or toggle entries individually; entries are selectable only when yt-dlp returns a positive playlist index. Selected entries become separate durable queue jobs with a shared playlist group, so the queue can pause or resume the selected batch together; Add to queue still downloads the whole playlist.
 - Saves playlist subscriptions with Manual, hourly, 6-hour, 12-hour, daily, or weekly checks. While Yt Save is running, a scheduler polls every 30 seconds and checks up to eight due playlists per pass; newly discovered entries remain in the review archive and are never queued automatically. Manual checking remains the default.
@@ -45,13 +46,15 @@ Real application screenshots will be added after the first Windows UI validation
 
 ## Windows requirements
 
-The packaged application bundles its runtime dependencies. Developers need:
+The packaged application bundles yt-dlp, Deno, FFmpeg, and FFprobe. The optional embedded sign-in feature uses the Microsoft Edge WebView2 Runtime installed on Windows; the app does not package the large fixed-version runtime. Developers need:
 
 - Rust stable with the MSVC x64 toolchain
 - Rust 1.92 or newer (required by the selected Slint release)
 - Python 3.11 or newer for the standard-library dependency fetch and icon scripts
 - WiX Toolset 5.0.2 for MSI builds
 - Inno Setup 6 for setup EXE builds
+
+If WebView2 Runtime is missing or too old for private sign-in sessions, Yt Save offers the official Microsoft runtime page. Other download features remain available.
 
 No Python, yt-dlp, Deno, FFmpeg, or PATH configuration is required for end users of a correctly assembled installer.
 
@@ -80,7 +83,7 @@ Package the application with both source definitions:
 
 New plain `vMAJOR.MINOR.PATCH` tags publish stable releases; SemVer prerelease tags such as `v1.2.0-preview.1` publish preview releases. Existing releases retain their previously selected GitHub channel. The Application Updates card handles Yt Save releases separately from the Engine Status updater, which applies only to yt-dlp.
 
-Both installers use the same per-machine program location and per-user application data location. An installer marker prevents MSI and Inno Setup installs from being layered over each other; uninstall the current package before switching installer types. Uninstall removes application files but preserves downloaded media and application data.
+The MSI always installs per-machine. Inno Setup supports current-user and all-users installs, using automatic program, shortcut, and registry locations for the selected scope; its update flow preserves that scope. Cross-installer guards check the current user's HKCU and machine HKLM markers and reject conflicting or ambiguous installs. A machine-wide installer cannot inspect another Windows account's HKCU, so remove installations belonging to other accounts before installing the MSI. Uninstall removes application files but preserves downloaded media and application data.
 
 ## Development
 

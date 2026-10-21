@@ -101,6 +101,7 @@ pub struct AppRelease {
 pub enum InstallerKind {
     Msi,
     SetupExe,
+    SetupExeCurrentUser,
 }
 
 impl InstallerKind {
@@ -108,6 +109,7 @@ impl InstallerKind {
         match self {
             Self::Msi => "msi",
             Self::SetupExe => "setup-exe",
+            Self::SetupExeCurrentUser => "setup-exe-current-user",
         }
     }
 
@@ -115,6 +117,7 @@ impl InstallerKind {
         match value {
             "msi" => Ok(Self::Msi),
             "setup-exe" => Ok(Self::SetupExe),
+            "setup-exe-current-user" => Ok(Self::SetupExeCurrentUser),
             _ => bail!("unsupported installer kind in updater helper arguments"),
         }
     }
@@ -412,15 +415,19 @@ pub fn verify_cached_installer(
     Ok(())
 }
 
-/// Detects the installation format using the package markers written under the branded HKLM key.
-/// Exactly one marker must be present and equal to DWORD 1.
+/// Detects the installer and Inno install scope from the branded current-user and machine keys.
+/// Exactly one supported marker must be present and equal to DWORD 1.
 pub fn detect_installed_installer() -> Result<InstallerKind> {
     #[cfg(windows)]
     {
+        use InstallerRegistryHive::{CurrentUser, LocalMachine};
         let key = format!("Software\\{}", env!("YT_SAVE_BUNDLE_IDENTIFIER"));
-        let msi = registry_marker(&key, "InstalledByMSI")?;
-        let inno = registry_marker(&key, "InstalledByInno")?;
-        installer_kind_from_markers(msi, inno)
+        installer_kind_from_markers(
+            registry_marker(CurrentUser, &key, "InstalledByMSI")?,
+            registry_marker(CurrentUser, &key, "InstalledByInno")?,
+            registry_marker(LocalMachine, &key, "InstalledByMSI")?,
+            registry_marker(LocalMachine, &key, "InstalledByInno")?,
+        )
     }
     #[cfg(not(windows))]
     {
@@ -694,13 +701,13 @@ fn validated_asset(release: &AppRelease, kind: InstallerKind) -> Result<&Install
     validate_typed_release(release)?;
     let asset = match kind {
         InstallerKind::Msi => &release.msi,
-        InstallerKind::SetupExe => &release.setup_exe,
+        InstallerKind::SetupExe | InstallerKind::SetupExeCurrentUser => &release.setup_exe,
     };
     let expected_name = match kind {
         InstallerKind::Msi => {
             format!("{}-{}-x64.msi", env!("YT_SAVE_PACKAGE_NAME"), release.version)
         }
-        InstallerKind::SetupExe => {
+        InstallerKind::SetupExe | InstallerKind::SetupExeCurrentUser => {
             format!("{}-{}-x64-setup.exe", env!("YT_SAVE_PACKAGE_NAME"), release.version)
         }
     };
@@ -909,35 +916,55 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn installer_kind_from_markers(msi: bool, inno: bool) -> Result<InstallerKind> {
-    match (msi, inno) {
-        (true, false) => Ok(InstallerKind::Msi),
-        (false, true) => Ok(InstallerKind::SetupExe),
-        (false, false) => bail!("no installed Yt Save installer marker was found"),
-        (true, true) => bail!("both installer markers are present; refusing an ambiguous update"),
+fn installer_kind_from_markers(
+    msi_current_user: bool,
+    inno_current_user: bool,
+    msi_machine: bool,
+    inno_machine: bool,
+) -> Result<InstallerKind> {
+    let marker_count = [msi_current_user, inno_current_user, msi_machine, inno_machine]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    match marker_count {
+        0 => bail!("no installed Yt Save installer marker was found"),
+        1 if msi_current_user => {
+            bail!(
+                "an MSI marker was found under the current-user hive; MSI installs must be per-machine"
+            )
+        }
+        1 if inno_current_user => Ok(InstallerKind::SetupExeCurrentUser),
+        1 if msi_machine => Ok(InstallerKind::Msi),
+        1 if inno_machine => Ok(InstallerKind::SetupExe),
+        _ => bail!("multiple Yt Save installer markers are present; refusing an ambiguous update"),
     }
 }
 
 #[cfg(windows)]
-fn registry_marker(subkey: &str, value_name: &str) -> Result<bool> {
+#[derive(Clone, Copy)]
+enum InstallerRegistryHive {
+    CurrentUser,
+    LocalMachine,
+}
+
+#[cfg(windows)]
+fn registry_marker(hive: InstallerRegistryHive, subkey: &str, value_name: &str) -> Result<bool> {
     use windows_sys::Win32::{
         Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS},
         System::Registry::{
-            HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, RegCloseKey,
-            RegOpenKeyExW, RegQueryValueExW,
+            HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD,
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
         },
     };
 
     let subkey: Vec<u16> = subkey.encode_utf16().chain(Some(0)).collect();
+    let root_key = match hive {
+        InstallerRegistryHive::CurrentUser => HKEY_CURRENT_USER,
+        InstallerRegistryHive::LocalMachine => HKEY_LOCAL_MACHINE,
+    };
     let mut key = std::ptr::null_mut();
     let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-            &mut key,
-        )
+        RegOpenKeyExW(root_key, subkey.as_ptr(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &mut key)
     };
     if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
         return Ok(false);
@@ -1115,7 +1142,7 @@ fn ensure_helper_installer_path(
     let prefix = format!("{}-", env!("YT_SAVE_PACKAGE_NAME"));
     let suffix = match kind {
         InstallerKind::Msi => "-x64.msi",
-        InstallerKind::SetupExe => "-x64-setup.exe",
+        InstallerKind::SetupExe | InstallerKind::SetupExeCurrentUser => "-x64-setup.exe",
     };
     let version = name
         .strip_prefix(&prefix)
@@ -1170,6 +1197,11 @@ fn run_helper_windows(args: HelperArgs) -> Result<i32> {
                 command
             }
             InstallerKind::SetupExe => Command::new(&args.installer_path),
+            InstallerKind::SetupExeCurrentUser => {
+                let mut command = Command::new(&args.installer_path);
+                command.arg("/CURRENTUSER");
+                command
+            }
         };
         let status =
             command.stdin(Stdio::null()).status().context("run interactive Yt Save installer")?;
@@ -1460,11 +1492,27 @@ mod tests {
     }
 
     #[test]
-    fn installer_marker_mapping_rejects_neither_or_both_formats() {
-        assert_eq!(installer_kind_from_markers(true, false).unwrap(), InstallerKind::Msi);
-        assert_eq!(installer_kind_from_markers(false, true).unwrap(), InstallerKind::SetupExe);
-        assert!(installer_kind_from_markers(false, false).is_err());
-        assert!(installer_kind_from_markers(true, true).is_err());
+    fn installer_marker_mapping_recognizes_current_user_and_machine_hives() {
+        assert_eq!(
+            installer_kind_from_markers(false, true, false, false).unwrap(),
+            InstallerKind::SetupExeCurrentUser
+        );
+        assert_eq!(
+            installer_kind_from_markers(false, false, true, false).unwrap(),
+            InstallerKind::Msi
+        );
+        assert_eq!(
+            installer_kind_from_markers(false, false, false, true).unwrap(),
+            InstallerKind::SetupExe
+        );
+    }
+
+    #[test]
+    fn installer_marker_mapping_rejects_missing_conflicting_or_ambiguous_markers() {
+        assert!(installer_kind_from_markers(false, false, false, false).is_err());
+        assert!(installer_kind_from_markers(false, true, true, false).is_err());
+        assert!(installer_kind_from_markers(false, true, false, true).is_err());
+        assert!(installer_kind_from_markers(true, false, false, false).is_err());
     }
 
     #[test]

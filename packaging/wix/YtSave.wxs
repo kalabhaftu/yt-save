@@ -9,15 +9,24 @@
     InstallerVersion="500">
     <Property Id="INNO_INSTALLATION_FOUND">
       <RegistrySearch
-        Id="InnoSetupInstallMarker"
+        Id="InnoSetupMachineInstallMarker"
         Root="HKLM"
         Key="Software\$(var.BundleIdentifier)"
         Name="InstalledByInno"
         Type="raw"
         Bitness="always64" />
     </Property>
+    <Property Id="INNO_USER_INSTALLATION_FOUND">
+      <RegistrySearch
+        Id="InnoSetupCurrentUserInstallMarker"
+        Root="HKCU"
+        Key="Software\$(var.BundleIdentifier)"
+        Name="InstalledByInno"
+        Type="raw"
+        Bitness="always64" />
+    </Property>
     <Launch
-      Condition="NOT INNO_INSTALLATION_FOUND"
+      Condition="NOT INNO_INSTALLATION_FOUND AND NOT INNO_USER_INSTALLATION_FOUND"
       Message="Uninstall the Inno Setup installation of Yt Save before installing the MSI package." />
     <MajorUpgrade DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />
     <MediaTemplate EmbedCab="yes" />

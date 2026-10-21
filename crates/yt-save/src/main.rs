@@ -1,6 +1,7 @@
 mod app;
 mod app_update;
 mod clipboard_monitor;
+mod cookie_auth;
 mod dependencies;
 mod engine;
 mod history;

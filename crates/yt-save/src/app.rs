@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -40,15 +40,17 @@ use crate::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
         PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_from_label,
         download_speed_limit_label, format_bytes, format_duration, format_is_available,
-        is_safe_format_id, normalize_subtitle_languages, subtitle_languages_available,
+        is_safe_format_id, normalize_subtitle_languages, normalized_host_key,
+        subtitle_languages_available,
     },
     persistence::{
-        DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, MAX_AUTO_RETRY_ATTEMPTS,
-        PLAYLIST_CHECK_INTERVAL_1_HOUR, PLAYLIST_CHECK_INTERVAL_6_HOURS,
-        PLAYLIST_CHECK_INTERVAL_7_DAYS, PLAYLIST_CHECK_INTERVAL_12_HOURS,
-        PLAYLIST_CHECK_INTERVAL_24_HOURS, PLAYLIST_CHECK_INTERVAL_MANUAL, PlaylistSubscription,
-        PlaylistSubscriptionEntry, PlaylistSubscriptionEntryInput, PlaylistSubscriptionQueueItem,
-        QueueMove, Store, TrayPreferences,
+        DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, DEFAULT_MAX_CONCURRENT_PER_HOST,
+        MAX_AUTO_RETRY_ATTEMPTS, MAX_CONCURRENT_PER_HOST, PLAYLIST_CHECK_INTERVAL_1_HOUR,
+        PLAYLIST_CHECK_INTERVAL_6_HOURS, PLAYLIST_CHECK_INTERVAL_7_DAYS,
+        PLAYLIST_CHECK_INTERVAL_12_HOURS, PLAYLIST_CHECK_INTERVAL_24_HOURS,
+        PLAYLIST_CHECK_INTERVAL_MANUAL, PlaylistSubscription, PlaylistSubscriptionEntry,
+        PlaylistSubscriptionEntryInput, PlaylistSubscriptionQueueItem, QueueMove, Store,
+        TrayPreferences,
     },
 };
 
@@ -140,6 +142,7 @@ struct StagedAppInstaller {
 }
 
 type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, Arc<watch::Sender<JobSignal>>>>>;
+type ActiveHostCounts = Arc<Mutex<HashMap<String, usize>>>;
 
 type LibraryCacheSignature =
     Vec<(String, String, String, String, Option<String>, String, Option<u64>, i64)>;
@@ -181,6 +184,36 @@ struct ActiveJobRegistration {
     id: String,
     jobs: ActiveJobs,
     sender: Arc<watch::Sender<JobSignal>>,
+}
+
+struct ActiveHostRegistration {
+    host_key: String,
+    counts: ActiveHostCounts,
+}
+
+impl ActiveHostRegistration {
+    fn register(host_key: String, counts: ActiveHostCounts) -> Self {
+        let mut active = counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active.entry(host_key.clone()).or_default() += 1;
+        drop(active);
+        Self { host_key, counts }
+    }
+}
+
+impl Drop for ActiveHostRegistration {
+    fn drop(&mut self) {
+        let mut active = self.counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = active.get_mut(&self.host_key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.host_key);
+            }
+        }
+    }
+}
+
+fn active_host_counts_snapshot(counts: &ActiveHostCounts) -> HashMap<String, usize> {
+    counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
 impl Drop for ActiveJobRegistration {
@@ -841,6 +874,7 @@ pub fn run() -> Result<()> {
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
     let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
+    let max_concurrent_per_host = runtime.block_on(store.load_max_concurrent_per_host())?;
     let concurrent_fragments = runtime.block_on(store.load_concurrent_fragments())?;
     let auto_retry_attempts = runtime.block_on(store.load_auto_retry_attempts())?;
     let clipboard_monitoring_enabled =
@@ -878,6 +912,7 @@ pub fn run() -> Result<()> {
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
     window.set_max_concurrent_downloads(max_concurrent_downloads.to_string().into());
+    window.set_max_concurrent_per_host(max_concurrent_per_host.to_string().into());
     window.set_concurrent_fragments(concurrent_fragments.to_string().into());
     window.set_download_speed_limit(
         download_speed_limit_label(download_presets.download_speed_limit_bytes_per_second).into(),
@@ -3994,6 +4029,64 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let host_limit_store = store.clone();
+    let host_limit_events = events_tx.clone();
+    let host_limit_wake = queue_wake.clone();
+    let host_limit_handle = handle.clone();
+    let host_limit_generation = Arc::new(AtomicU64::new(0));
+    let host_limit_write_lock = Arc::new(AsyncMutex::new(()));
+    let host_limit_window = window.as_weak();
+    window.on_max_concurrent_per_host_requested(move |value| {
+        let Ok(limit) = value.parse::<usize>() else {
+            return;
+        };
+        if !(1..=MAX_CONCURRENT_PER_HOST).contains(&limit) {
+            return;
+        }
+        let store = host_limit_store.clone();
+        let events = host_limit_events.clone();
+        let queue_wake = host_limit_wake.clone();
+        let generation_state = host_limit_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = host_limit_write_lock.clone();
+        let weak_window = host_limit_window.clone();
+        host_limit_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let previous_limit = store
+                .load_max_concurrent_per_host()
+                .await
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_PER_HOST);
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            match store.set_max_concurrent_per_host(limit, now()).await {
+                Ok(()) => {
+                    queue_wake.notify_one();
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Each website can now run up to {limit} downloads at once."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "save per-website concurrency limit");
+                    if generation_state.load(Ordering::Acquire) == generation {
+                        let previous_value = previous_limit.to_string().into();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_max_concurrent_per_host(previous_value);
+                            }
+                        });
+                    }
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not save the per-website download limit: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let fragments_store = store.clone();
     let fragments_events = events_tx.clone();
     let fragments_handle = handle.clone();
@@ -6077,6 +6170,7 @@ async fn run_queue_dispatcher(
 ) {
     let ShutdownState { started: shutdown_started, committed: shutdown_committed } = shutdown;
     let mut workers = JoinSet::new();
+    let active_host_counts: ActiveHostCounts = Arc::new(Mutex::new(HashMap::new()));
     loop {
         if shutdown_started.load(Ordering::Acquire) {
             if drain_workers_during_shutdown(
@@ -6131,11 +6225,23 @@ async fn run_queue_dispatcher(
             if !can_dispatch_more(workers.len(), limit) {
                 break;
             }
+            let per_host_limit = match store.load_max_concurrent_per_host().await {
+                Ok(limit) => limit,
+                Err(error) => {
+                    error!(%error, "read per-website concurrency limit; using default");
+                    retry_after_error = true;
+                    DEFAULT_MAX_CONCURRENT_PER_HOST
+                }
+            };
+            let active_host_snapshot = active_host_counts_snapshot(&active_host_counts);
             let _dispatch_guard = update_dispatch_gate.lock().await;
             if shutdown_started.load(Ordering::Acquire) {
                 break;
             }
-            let pending = match store.next_queued_download().await {
+            let pending = match store
+                .next_queued_download_with_host_limit(active_host_snapshot.clone(), per_host_limit)
+                .await
+            {
                 Ok(Some(pending)) => pending,
                 Ok(None) => break,
                 Err(error) => {
@@ -6167,7 +6273,15 @@ async fn run_queue_dispatcher(
                 drop(registration);
                 break;
             }
-            let active = match store.claim_queued_download_if_next(&pending.id, now()).await {
+            let active = match store
+                .claim_queued_download_if_host_eligible(
+                    &pending.id,
+                    active_host_snapshot,
+                    per_host_limit,
+                    now(),
+                )
+                .await
+            {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     drop(registration);
@@ -6187,6 +6301,10 @@ async fn run_queue_dispatcher(
             let job_engine = engine.clone();
             let job_events = events.clone();
             let job_wake = queue_wake.clone();
+            let host_registration = ActiveHostRegistration::register(
+                normalized_host_key(&active.url).unwrap_or_default(),
+                active_host_counts.clone(),
+            );
             workers.spawn(async move {
                 run_download_job(
                     active,
@@ -6197,6 +6315,7 @@ async fn run_queue_dispatcher(
                     registration,
                 )
                 .await;
+                drop(host_registration);
                 job_wake.notify_one();
             });
         }
@@ -7765,6 +7884,23 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_host_counts_release_on_worker_exit() {
+        let counts: ActiveHostCounts = Arc::new(Mutex::new(HashMap::new()));
+        let first = ActiveHostRegistration::register("media.example".to_owned(), counts.clone());
+        let second = ActiveHostRegistration::register("media.example".to_owned(), counts.clone());
+        let other = ActiveHostRegistration::register("other.example".to_owned(), counts.clone());
+
+        assert_eq!(active_host_counts_snapshot(&counts).get("media.example"), Some(&2));
+        assert_eq!(active_host_counts_snapshot(&counts).get("other.example"), Some(&1));
+
+        drop(first);
+        assert_eq!(active_host_counts_snapshot(&counts).get("media.example"), Some(&1));
+        drop(second);
+        drop(other);
+        assert!(active_host_counts_snapshot(&counts).is_empty());
+    }
 
     #[cfg(windows)]
     #[test]

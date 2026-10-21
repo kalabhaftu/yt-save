@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use rusqlite::{
@@ -9,12 +12,14 @@ use crate::{
     app_update::AppUpdateChannel,
     model::{
         AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
-        VideoQuality, normalize_download_speed_limit,
+        VideoQuality, normalize_download_speed_limit, normalized_host_key,
     },
 };
 
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 1;
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 8;
+pub const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 1;
+pub const MAX_CONCURRENT_PER_HOST: usize = 8;
 pub const DEFAULT_CONCURRENT_FRAGMENTS: usize = 1;
 pub const MAX_CONCURRENT_FRAGMENTS: usize = 8;
 pub const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
@@ -955,6 +960,42 @@ impl Store {
         Ok(())
     }
 
+    /// Loads the persisted per-host queue concurrency limit; invalid or missing values use one.
+    pub async fn load_max_concurrent_per_host(&self) -> Result<usize> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let parsed = setting_value(connection, "max_concurrent_per_host")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| (1..=MAX_CONCURRENT_PER_HOST).contains(value));
+                Ok(parsed.unwrap_or(DEFAULT_MAX_CONCURRENT_PER_HOST))
+            })
+        })
+        .await
+        .context("join per-host concurrency setting read")?
+    }
+
+    /// Saves the bounded per-host queue concurrency limit for subsequent dispatches.
+    pub async fn set_max_concurrent_per_host(&self, limit: usize, updated_at: i64) -> Result<()> {
+        let limit = limit.clamp(1, MAX_CONCURRENT_PER_HOST).to_string();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('max_concurrent_per_host', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": limit, ":updated": updated_at },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join per-host concurrency setting write")??;
+        Ok(())
+    }
+
     /// Loads yt-dlp's per-download fragment worker count; invalid or missing values use one.
     pub async fn load_concurrent_fragments(&self) -> Result<usize> {
         let store = self.clone();
@@ -1398,6 +1439,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn next_queued_download(&self) -> Result<Option<DownloadRecord>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1420,7 +1462,34 @@ impl Store {
         .context("join queue read")?
     }
 
+    /// Returns the first queued item whose normalized host is below its active worker limit.
+    ///
+    /// Items that cannot produce an HTTP(S) host key share the empty-string bucket.
+    pub async fn next_queued_download_with_host_limit(
+        &self,
+        active_host_counts: HashMap<String, usize>,
+        per_host_limit: usize,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let id = first_eligible_queued_download_id(
+                    connection,
+                    &active_host_counts,
+                    per_host_limit,
+                )?;
+                match id {
+                    Some(id) => load_download_by_id(connection, &id),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .context("join host-aware queue read")?
+    }
+
     /// Claims only if `id` is still first, so a concurrent reorder is honored before launch.
+    #[cfg(test)]
     pub async fn claim_queued_download_if_next(
         &self,
         id: &str,
@@ -1465,6 +1534,55 @@ impl Store {
         })
         .await
         .context("join queue claim")?
+    }
+
+    /// Claims only if `id` is still the first queued item eligible under the supplied host counts.
+    ///
+    /// Due scheduled rows are promoted and queue order, cancellation, and eligibility are checked
+    /// in the same immediate transaction as the claim.
+    pub async fn claim_queued_download_if_host_eligible(
+        &self,
+        id: &str,
+        active_host_counts: HashMap<String, usize>,
+        per_host_limit: usize,
+        updated_at: i64,
+    ) -> Result<Option<DownloadRecord>> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection_mut(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "UPDATE downloads
+                     SET status = 'Queued', scheduled_at = NULL, updated_at = :now
+                     WHERE status = 'Waiting for schedule'
+                       AND scheduled_at IS NOT NULL
+                       AND scheduled_at <= :now",
+                    named_params! { ":now": updated_at },
+                )?;
+                let next_id = first_eligible_queued_download_id(
+                    &transaction,
+                    &active_host_counts,
+                    per_host_limit,
+                )?;
+                if next_id.as_deref() != Some(id.as_str()) {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                let affected = transaction.execute(
+                    "UPDATE downloads SET status = 'Analyzing', error = NULL, updated_at = :updated
+                     WHERE id = :id AND status = 'Queued'",
+                    named_params! { ":id": id, ":updated": updated_at },
+                )?;
+                let record =
+                    if affected == 1 { load_download_by_id(&transaction, &id)? } else { None };
+                transaction.commit()?;
+                Ok(record)
+            })
+        })
+        .await
+        .context("join host-aware queue claim")?
     }
 
     /// Moves a queued or paused item within its priority group.
@@ -2238,6 +2356,27 @@ fn validate_queue_items(items: &[PlaylistSubscriptionQueueItem]) -> Result<()> {
     Ok(())
 }
 
+fn first_eligible_queued_download_id(
+    connection: &Connection,
+    active_host_counts: &HashMap<String, usize>,
+    per_host_limit: usize,
+) -> Result<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT id, url FROM downloads WHERE status = 'Queued'
+         ORDER BY priority DESC, queue_rank ASC, rowid ASC",
+    )?;
+    let rows =
+        statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, url) = row?;
+        let host_key = normalized_host_key(&url).unwrap_or_default();
+        if active_host_counts.get(&host_key).copied().unwrap_or_default() < per_host_limit {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 fn setting_value(connection: &Connection, key: &str) -> Result<Option<String>> {
     connection
         .query_row(
@@ -2471,6 +2610,53 @@ mod tests {
 
         let reopened = Store::open(db_path).unwrap();
         assert_eq!(reopened.load_max_concurrent_downloads().await.unwrap(), 1);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_per_host_defaults_bounds_and_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let db_path = temp_dir.join("state.sqlite3");
+        let store = Store::open(db_path.clone()).unwrap();
+
+        assert_eq!(
+            store.load_max_concurrent_per_host().await.unwrap(),
+            DEFAULT_MAX_CONCURRENT_PER_HOST
+        );
+        store.set_max_concurrent_per_host(6, 11).await.unwrap();
+        assert_eq!(store.load_max_concurrent_per_host().await.unwrap(), 6);
+        store.set_max_concurrent_per_host(usize::MAX, 12).await.unwrap();
+        assert_eq!(store.load_max_concurrent_per_host().await.unwrap(), MAX_CONCURRENT_PER_HOST);
+        store.set_max_concurrent_per_host(0, 13).await.unwrap();
+        assert_eq!(
+            store.load_max_concurrent_per_host().await.unwrap(),
+            DEFAULT_MAX_CONCURRENT_PER_HOST
+        );
+        store.set_max_concurrent_per_host(5, 14).await.unwrap();
+        drop(store);
+
+        let store = Store::open(db_path.clone()).unwrap();
+        assert_eq!(store.load_max_concurrent_per_host().await.unwrap(), 5);
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE app_settings SET value = 'invalid' WHERE key = 'max_concurrent_per_host'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.load_max_concurrent_per_host().await.unwrap(),
+            DEFAULT_MAX_CONCURRENT_PER_HOST
+        );
+        drop(store);
+
+        let reopened = Store::open(db_path).unwrap();
+        assert_eq!(
+            reopened.load_max_concurrent_per_host().await.unwrap(),
+            DEFAULT_MAX_CONCURRENT_PER_HOST
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
@@ -4122,6 +4308,146 @@ mod tests {
             assert_eq!(claimed.id, "first");
             assert_eq!(claimed.status, "Analyzing");
         }
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_aware_queue_selection_skips_saturated_hosts_and_claim_rechecks_eligibility() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+
+        let mut same_host_first = DownloadRecord::queued(
+            "same-host-first".to_owned(),
+            "https://example.test/first".to_owned(),
+            10,
+        );
+        same_host_first.priority = 1;
+        let mut other_host_later = DownloadRecord::queued(
+            "other-host-later".to_owned(),
+            "https://other.test/later".to_owned(),
+            12,
+        );
+        other_host_later.priority = 1;
+        let same_host_second = DownloadRecord::queued(
+            "same-host-second".to_owned(),
+            "http://EXAMPLE.test:8080/second".to_owned(),
+            11,
+        );
+        let other_host_earlier = DownloadRecord::queued(
+            "other-host-earlier".to_owned(),
+            "https://other.test/earlier".to_owned(),
+            13,
+        );
+        store
+            .save_downloads(vec![
+                same_host_first,
+                same_host_second,
+                other_host_later,
+                other_host_earlier,
+            ])
+            .await
+            .unwrap();
+
+        let active_hosts = HashMap::from([("example.test".to_owned(), 1)]);
+        let next = store
+            .next_queued_download_with_host_limit(active_hosts.clone(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.id, "other-host-later");
+
+        assert!(
+            store
+                .claim_queued_download_if_host_eligible(
+                    "same-host-first",
+                    active_hosts.clone(),
+                    1,
+                    20,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let claimed = store
+            .claim_queued_download_if_host_eligible("other-host-later", active_hosts.clone(), 1, 21)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.status, "Analyzing");
+
+        let all_hosts_saturated =
+            HashMap::from([("example.test".to_owned(), 1), ("other.test".to_owned(), 1)]);
+        assert!(
+            store
+                .next_queued_download_with_host_limit(all_hosts_saturated, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_aware_queue_claim_rechecks_reordering_and_uses_empty_host_bucket() {
+        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
+        store
+            .save_downloads(vec![
+                DownloadRecord::queued(
+                    "first".to_owned(),
+                    "https://example.test/first".to_owned(),
+                    10,
+                ),
+                DownloadRecord::queued(
+                    "second".to_owned(),
+                    "https://other.test/second".to_owned(),
+                    11,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let no_active_hosts = HashMap::new();
+        assert_eq!(
+            store
+                .next_queued_download_with_host_limit(no_active_hosts.clone(), 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "first"
+        );
+        assert!(store.move_download("second", QueueMove::Top).await.unwrap());
+        assert!(
+            store
+                .claim_queued_download_if_host_eligible("first", no_active_hosts.clone(), 1, 20)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .claim_queued_download_if_host_eligible("second", no_active_hosts, 1, 21)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "Analyzing"
+        );
+        assert!(store.cancel_queued_download("first", 22).await.unwrap());
+
+        let invalid_host =
+            DownloadRecord::queued("invalid-host".to_owned(), "not a URL".to_owned(), 23);
+        store.save_download(invalid_host).await.unwrap();
+        let empty_host_saturated = HashMap::from([(String::new(), 1)]);
+        assert!(
+            store
+                .next_queued_download_with_host_limit(empty_host_saturated, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
 

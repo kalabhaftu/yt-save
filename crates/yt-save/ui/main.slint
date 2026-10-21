@@ -123,6 +123,7 @@ export component MainWindow inherits Window {
     in property <bool> can-retry-failed: false;
     in-out property <bool> confirm-cancel-all: false;
     in-out property <string> max-concurrent-downloads: "1";
+    in-out property <string> max-concurrent-per-host: "1";
     in-out property <string> concurrent-fragments: "1";
     in-out property <string> download-speed-limit: "Unlimited";
     in-out property <string> auto-retry-attempts: "3";
@@ -231,6 +232,7 @@ export component MainWindow inherits Window {
     callback playlist-group-action-requested(string, string);
     callback download-priority-requested(string, int);
     callback max-concurrent-downloads-requested(string);
+    callback max-concurrent-per-host-requested(string);
     callback concurrent-fragments-requested(string);
     callback download-speed-limit-requested(string);
     callback auto-retry-attempts-requested(string);
@@ -246,6 +248,10 @@ export component MainWindow inherits Window {
 
     changed max-concurrent-downloads => {
         root.max-concurrent-downloads-requested(root.max-concurrent-downloads);
+    }
+
+    changed max-concurrent-per-host => {
+        root.max-concurrent-per-host-requested(root.max-concurrent-per-host);
     }
 
     changed concurrent-fragments => {
@@ -1685,6 +1691,13 @@ export component MainWindow inherits Window {
                                 model: ["1", "2", "3", "4", "5", "6", "7", "8"];
                                 current-value <=> root.max-concurrent-downloads;
                                 width: 74px;
+                                height: 32px;
+                            }
+                            Text { text: "Per-site cap"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }
+                            ComboBox {
+                                model: ["1", "2", "3", "4", "5", "6", "7", "8"];
+                                current-value <=> root.max-concurrent-per-host;
+                                width: 64px;
                                 height: 32px;
                             }
                             Text { text: "Fragments per download"; color: #a1a8bb; font-size: 11px; vertical-alignment: center; }

@@ -694,10 +694,21 @@ impl MediaMetadata {
     }
 }
 
+/// Returns the normalized hostname for an HTTP(S) URL, excluding scheme and port.
+///
+/// `url::Url` canonicalizes domain names (including case and IDNs) and host strings. Keeping only
+/// the host lets downloads from HTTP and HTTPS, or different ports on the same host, share a site
+/// concurrency bucket.
+pub fn normalized_host_key(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.host_str().map(str::to_owned)
+}
+
 fn is_http_url(value: &str) -> bool {
-    url::Url::parse(value).is_ok_and(|parsed| {
-        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
-    })
+    normalized_host_key(value).is_some()
 }
 
 fn subtitle_languages(value: &serde_json::Value, field: &str) -> Vec<String> {
@@ -836,6 +847,23 @@ pub fn format_duration(seconds: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_host_key_uses_http_host_and_ignores_scheme_and_port() {
+        assert_eq!(
+            normalized_host_key("https://Example.COM:8443/watch"),
+            Some("example.com".into())
+        );
+        assert_eq!(normalized_host_key("http://example.com:80/media"), Some("example.com".into()));
+        assert_eq!(normalized_host_key("https://example.com/media"), Some("example.com".into()));
+    }
+
+    #[test]
+    fn normalized_host_key_rejects_invalid_urls_and_non_http_schemes() {
+        for value in ["", "not a URL", "https://", "file:///C:/media.mp4"] {
+            assert_eq!(normalized_host_key(value), None, "unexpected host for {value:?}");
+        }
+    }
 
     #[test]
     fn metadata_parser_handles_single_item_and_playlist_json() {

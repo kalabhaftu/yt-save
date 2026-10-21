@@ -180,16 +180,27 @@ impl CookieStore {
             return Ok(0);
         }
         ensure_supported()?;
+        #[cfg(windows)]
+        let active_downloader_parents = active_yt_dlp_parent_pids()?;
+        #[cfg(not(windows))]
+        let active_downloader_parents = HashSet::new();
+        self.cleanup_stale_leases_with_active_pids(cutoff, &active_downloader_parents)
+    }
+
+    fn cleanup_stale_leases_with_active_pids(
+        &self,
+        cutoff: SystemTime,
+        active_downloader_parents: &HashSet<u32>,
+    ) -> Result<usize> {
+        if !self.enabled {
+            return Ok(0);
+        }
         let staging = self.root.join(".cookie-staging");
         let entries = match fs::read_dir(&staging) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(error).context("Could not inspect cookie staging files"),
         };
-        #[cfg(windows)]
-        let active_downloader_parents = active_yt_dlp_parent_pids()?;
-        #[cfg(not(windows))]
-        let active_downloader_parents = HashSet::new();
         let mut removed = 0;
         for entry in entries {
             let entry = entry.context("Could not inspect cookie staging file")?;
@@ -217,7 +228,7 @@ impl CookieStore {
             if modified >= cutoff {
                 continue;
             }
-            if should_retain_lease(owner, &active_downloader_parents) {
+            if should_retain_lease(owner, active_downloader_parents) {
                 continue;
             }
             fs::remove_file(entry.path()).context("Could not remove stale cookie staging file")?;
@@ -892,13 +903,29 @@ mod tests {
 
         let store = CookieStore::new(root.clone());
         store.active_leases.lock().unwrap().insert(stale.clone());
+        let no_active_downloader_parents = HashSet::new();
         let past_cutoff = SystemTime::now().checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
-        assert_eq!(store.cleanup_stale_leases_before(past_cutoff).unwrap(), 0);
-        let future_cutoff = SystemTime::now() + Duration::from_secs(1);
-        assert_eq!(store.cleanup_stale_leases_before(future_cutoff).unwrap(), 1);
+        assert_eq!(
+            store
+                .cleanup_stale_leases_with_active_pids(past_cutoff, &no_active_downloader_parents)
+                .unwrap(),
+            0
+        );
+        let future_cutoff = SystemTime::now() + Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            store
+                .cleanup_stale_leases_with_active_pids(future_cutoff, &no_active_downloader_parents)
+                .unwrap(),
+            1
+        );
         assert!(stale.exists(), "an active lease remains available for cookie refresh");
         store.active_leases.lock().unwrap().remove(&stale);
-        assert_eq!(store.cleanup_stale_leases_before(future_cutoff).unwrap(), 1);
+        assert_eq!(
+            store
+                .cleanup_stale_leases_with_active_pids(future_cutoff, &no_active_downloader_parents)
+                .unwrap(),
+            1
+        );
         assert!(!stale.exists());
         assert!(!legacy.exists());
         assert!(unrelated.exists());

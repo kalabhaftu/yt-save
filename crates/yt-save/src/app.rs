@@ -797,6 +797,14 @@ async fn perform_playlist_subscription_check(
                 engine.default_output_directory().to_string_lossy().into_owned();
             let configured_directory =
                 store.get_or_initialize_download_directory(fallback_directory).await?;
+            let organize_media_folders = store.load_organize_media_folders().await?;
+            let configured_directory = organized_download_directory(
+                Path::new(&configured_directory),
+                presets.mode,
+                organize_media_folders,
+            )
+            .to_string_lossy()
+            .into_owned();
             let directory_title = metadata.title.clone();
             let directory_subscription_id = subscription.id.clone();
             let directory = tokio::task::spawn_blocking(move || {
@@ -1051,6 +1059,7 @@ pub fn run() -> Result<()> {
     runtime
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
+    let organize_media_folders = runtime.block_on(store.load_organize_media_folders())?;
     let current_download_presets = Arc::new(Mutex::new(download_presets));
     let saved_download_presets = runtime
         .block_on(store.load_saved_download_presets())
@@ -1093,6 +1102,7 @@ pub fn run() -> Result<()> {
     window.set_cookie_support_status(cookie_support_status.into());
     window.set_app_version(env!("YT_SAVE_PRODUCT_VERSION").into());
     window.set_download_directory(download_directory_text.into());
+    window.set_organize_media_folders(organize_media_folders);
     window.set_audio_only(download_presets.mode == DownloadMode::AudioOnly);
     window.set_video_only(download_presets.mode == DownloadMode::VideoOnly);
     window.set_subtitle_only(download_presets.mode == DownloadMode::SubtitlesOnly);
@@ -3188,6 +3198,7 @@ pub fn run() -> Result<()> {
             video_quality,
             speed_limit_label,
             directory,
+            organize_media_folders,
             scheduled,
             local_time,
             schedule_repeat_label,
@@ -3205,6 +3216,7 @@ pub fn run() -> Result<()> {
                     window.get_video_quality().to_string(),
                     window.get_download_speed_limit().to_string(),
                     window.get_download_directory().to_string(),
+                    window.get_organize_media_folders(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
                     window.get_schedule_repeat().to_string(),
@@ -3255,7 +3267,13 @@ pub fn run() -> Result<()> {
         handle.spawn(async move {
             let playlist_title = subscription.title.clone();
             let subscription_id = subscription.id.clone();
+            let organization_mode = presets.mode;
             let destination = match tokio::task::spawn_blocking(move || {
+                let directory = organized_download_directory(
+                    Path::new(&directory),
+                    organization_mode,
+                    organize_media_folders,
+                );
                 create_playlist_subscription_directory(
                     Path::new(&directory),
                     &playlist_title,
@@ -3406,7 +3424,7 @@ pub fn run() -> Result<()> {
             (selected_exact_format, format_choice_mode, format_choice_source_url),
             selected_quality,
             selected_video_quality,
-            (selected_speed_limit, selected_directory),
+            (selected_speed_limit, selected_directory, organize_media_folders),
             (schedule_enabled, schedule_local_time, schedule_repeat_label),
         ) = enqueue_window
             .upgrade()
@@ -3431,6 +3449,7 @@ pub fn run() -> Result<()> {
                     (
                         window.get_download_speed_limit().to_string(),
                         window.get_download_directory().to_string(),
+                        window.get_organize_media_folders(),
                     ),
                     (
                         window.get_schedule_download(),
@@ -3601,7 +3620,13 @@ pub fn run() -> Result<()> {
                     return;
                 }
             };
-            record.download_directory = destination.to_string_lossy().into_owned();
+            record.download_directory = organized_download_directory(
+                &destination,
+                record.download_mode,
+                organize_media_folders,
+            )
+            .to_string_lossy()
+            .into_owned();
             record.schedule_repeat_interval_seconds = schedule_repeat_interval_seconds;
             let _dispatch_guard = dispatch_gate.lock().await;
             if shutdown.load(Ordering::Acquire) {
@@ -3673,6 +3698,7 @@ pub fn run() -> Result<()> {
             selected_video_quality,
             selected_speed_limit,
             selected_directory,
+            organize_media_folders,
             schedule_enabled,
             schedule_local_time,
             schedule_repeat_label,
@@ -3691,6 +3717,7 @@ pub fn run() -> Result<()> {
                 window.get_video_quality().to_string(),
                 window.get_download_speed_limit().to_string(),
                 window.get_download_directory().to_string(),
+                window.get_organize_media_folders(),
                 window.get_schedule_download(),
                 window.get_schedule_local_time().to_string(),
                 window.get_schedule_repeat().to_string(),
@@ -3787,6 +3814,7 @@ pub fn run() -> Result<()> {
                 include_auto_subtitles,
                 scheduled_at,
                 schedule_repeat_interval_seconds,
+                organize_media_folders,
                 download_directory: destination.to_string_lossy().into_owned(),
             };
             let mut issues = parsed.issues;
@@ -4097,6 +4125,7 @@ pub fn run() -> Result<()> {
             selected_video_quality,
             selected_speed_limit,
             selected_directory,
+            organize_media_folders,
             schedule_enabled,
             schedule_local_time,
             schedule_repeat_label,
@@ -4111,8 +4140,9 @@ pub fn run() -> Result<()> {
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
-                window.get_download_speed_limit().to_string(),
+                    window.get_download_speed_limit().to_string(),
                     window.get_download_directory().to_string(),
+                    window.get_organize_media_folders(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
                     window.get_schedule_repeat().to_string(),
@@ -4174,7 +4204,13 @@ pub fn run() -> Result<()> {
                     return;
                 }
             };
-            let destination = destination.to_string_lossy().into_owned();
+            let destination = organized_download_directory(
+                &destination,
+                download_presets.mode,
+                organize_media_folders,
+            )
+            .to_string_lossy()
+            .into_owned();
             let playlist_group_id = Uuid::new_v4().to_string();
             let playlist_group_title = selection.title.clone();
             let mut records = Vec::with_capacity(selected_entries.len());
@@ -4597,6 +4633,31 @@ pub fn run() -> Result<()> {
             });
         },
     );
+
+    let organization_store = store.clone();
+    let organization_events = events_tx.clone();
+    let organization_handle = handle.clone();
+    let organization_generation = Arc::new(AtomicU64::new(0));
+    let organization_write_lock = Arc::new(AsyncMutex::new(()));
+    window.on_media_organization_changed(move |enabled| {
+        let generation_state = organization_generation.clone();
+        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+        let write_lock = organization_write_lock.clone();
+        let store = organization_store.clone();
+        let events = organization_events.clone();
+        organization_handle.spawn(async move {
+            let _write_guard = write_lock.lock().await;
+            if generation_state.load(Ordering::Acquire) != generation {
+                return;
+            }
+            if let Err(error) = store.set_organize_media_folders(enabled, now()).await {
+                error!(%error, "save media-type organization rule");
+                let _ = events.send(UiEvent::Status(format!(
+                    "This folder rule is active for the session but could not be saved: {error}"
+                )));
+            }
+        });
+    });
 
     let save_named_presets_store = store.clone();
     let save_named_presets_state = saved_download_presets_state.clone();
@@ -6570,6 +6631,7 @@ struct BatchDownloadSettings {
     include_auto_subtitles: bool,
     scheduled_at: Option<i64>,
     schedule_repeat_interval_seconds: Option<i64>,
+    organize_media_folders: bool,
     download_directory: String,
 }
 
@@ -6594,7 +6656,13 @@ fn queued_batch_record(
     record.include_auto_subtitles = settings.include_auto_subtitles;
     record.scheduled_at = settings.scheduled_at;
     record.schedule_repeat_interval_seconds = settings.schedule_repeat_interval_seconds;
-    record.download_directory = settings.download_directory.clone();
+    record.download_directory = organized_download_directory(
+        Path::new(&settings.download_directory),
+        settings.presets.mode,
+        settings.organize_media_folders,
+    )
+    .to_string_lossy()
+    .into_owned();
     if settings.scheduled_at.is_some() {
         record.status = "Waiting for schedule".to_owned();
     }
@@ -7127,6 +7195,23 @@ fn validate_download_directory(path: &Path) -> Result<PathBuf> {
         anyhow::bail!("{} is not a folder", path.display());
     }
     std::fs::canonicalize(path).with_context(|| format!("resolve save folder {}", path.display()))
+}
+
+fn organized_download_directory(
+    directory: &Path,
+    mode: DownloadMode,
+    separate_media_types: bool,
+) -> PathBuf {
+    if !separate_media_types {
+        return directory.to_path_buf();
+    }
+    match mode {
+        DownloadMode::AudioOnly => directory.join("Music"),
+        DownloadMode::Video | DownloadMode::VideoOnly => directory.join("Videos"),
+        DownloadMode::SubtitlesOnly | DownloadMode::MetadataOnly | DownloadMode::ThumbnailOnly => {
+            directory.to_path_buf()
+        }
+    }
 }
 
 fn playlist_folder_component(title: &str, subscription_id: &str) -> String {

@@ -1,6 +1,42 @@
 use super::*;
 
 impl Store {
+    /// Loads the media-type folder rule, enabled by default for new installations.
+    pub async fn load_organize_media_folders(&self) -> Result<bool> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let value = setting_value(connection, "organize_media_folders")?;
+                Ok(!matches!(value.as_deref(), Some("false")))
+            })
+        })
+        .await
+        .context("join media organization preference read")?
+    }
+
+    /// Persists whether new audio and video jobs use separate `Music` and `Videos` folders.
+    pub async fn set_organize_media_folders(&self, enabled: bool, updated_at: i64) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('organize_media_folders', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! {
+                        ":value": if enabled { "true" } else { "false" },
+                        ":updated": updated_at,
+                    },
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .context("join media organization preference write")??;
+        Ok(())
+    }
+
     /// Loads the saved destination, creating it from `fallback` for older installations.
     /// Queue rows created before destination snapshots existed are assigned this initial path.
     pub async fn get_or_initialize_download_directory(&self, fallback: String) -> Result<String> {

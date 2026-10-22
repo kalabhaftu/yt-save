@@ -115,6 +115,7 @@ export component MainWindow inherits Window {
     in-out property <bool> schedule-download: false;
     in-out property <string> schedule-local-time: "";
     in-out property <string> schedule-repeat: "Once";
+    in-out property <bool> organize-media-folders: true;
     in-out property <string> audio-format: "original";
     in-out property <string> audio-quality: "best";
     in-out property <string> video-quality: "Best";
@@ -222,6 +223,7 @@ export component MainWindow inherits Window {
     callback minimize-to-tray-requested(bool);
     callback open-download-folder();
     callback open-application-logs();
+    callback media-organization-changed(bool);
     callback choose-download-directory-requested();
     callback clear-completed-requested();
     callback pause-all-requested();
@@ -1034,7 +1036,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 462px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 76px : 0px) + (root.multiple-links-mode ? 100px : 0px);
+                        height: 500px + (root.clipboard-candidate != "" ? 38px : 0px) + (root.subtitle-only ? 72px : 0px) + (root.schedule-download ? 76px : 0px) + (root.multiple-links-mode ? 100px : 0px);
                         background: #151925;
                         border-width: 1px;
                         border-color: #2a3043;
@@ -1325,6 +1327,23 @@ export component MainWindow inherits Window {
                                     is-enabled: root.saved-download-preset-selection != "";
                                     clicked => { root.delete-saved-download-preset-requested(root.saved-download-preset-selection); }
                                 }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Organization"; color: #a9b0c4; font-size: 11px; width: 92px; vertical-alignment: center; }
+                                ActionButton {
+                                    label: root.organize-media-folders ? "Separate audio / video" : "Use selected folder";
+                                    primary: root.organize-media-folders;
+                                    button-height: 28px;
+                                    button-min-width: 156px;
+                                    clicked => {
+                                        root.organize-media-folders = !root.organize-media-folders;
+                                        root.media-organization-changed(root.organize-media-folders);
+                                    }
+                                }
+                                Text { text: root.organize-media-folders ? "Audio → Music · Video → Videos" : "All downloads use the selected folder"; color: #727b92; font-size: 10px; vertical-alignment: center; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             HorizontalLayout {

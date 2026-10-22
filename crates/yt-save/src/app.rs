@@ -48,7 +48,9 @@ use crate::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
         NamedDownloadPreset, PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_label,
         format_bytes, format_duration, format_is_available, is_safe_format_id,
-        normalize_subtitle_languages, normalized_host_key, subtitle_languages_available,
+        normalize_subtitle_languages, normalized_host_key, schedule_repeat_interval_from_label,
+        is_supported_schedule_repeat_interval, schedule_repeat_interval_label,
+        subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, DEFAULT_MAX_CONCURRENT_PER_HOST,
@@ -3188,6 +3190,7 @@ pub fn run() -> Result<()> {
             directory,
             scheduled,
             local_time,
+            schedule_repeat_label,
         ) = queue_subscription_window
             .upgrade()
             .map(|window| {
@@ -3204,6 +3207,7 @@ pub fn run() -> Result<()> {
                     window.get_download_directory().to_string(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
+                    window.get_schedule_repeat().to_string(),
                 )
             })
             .unwrap_or_default();
@@ -3225,6 +3229,8 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
+        let schedule_repeat_interval_seconds = scheduled_at
+            .and_then(|_| schedule_repeat_interval_from_label(&schedule_repeat_label));
         let mut presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
@@ -3292,6 +3298,7 @@ pub fn run() -> Result<()> {
                     record.download_speed_limit_bytes_per_second =
                         presets.download_speed_limit_bytes_per_second;
                     record.scheduled_at = scheduled_at;
+                    record.schedule_repeat_interval_seconds = schedule_repeat_interval_seconds;
                     if scheduled_at.is_some() {
                         record.status = "Waiting for schedule".to_owned();
                     }
@@ -3400,7 +3407,7 @@ pub fn run() -> Result<()> {
             selected_quality,
             selected_video_quality,
             (selected_speed_limit, selected_directory),
-            (schedule_enabled, schedule_local_time),
+            (schedule_enabled, schedule_local_time, schedule_repeat_label),
         ) = enqueue_window
             .upgrade()
             .map(|window| {
@@ -3425,7 +3432,11 @@ pub fn run() -> Result<()> {
                         window.get_download_speed_limit().to_string(),
                         window.get_download_directory().to_string(),
                     ),
-                    (window.get_schedule_download(), window.get_schedule_local_time().to_string()),
+                    (
+                        window.get_schedule_download(),
+                        window.get_schedule_local_time().to_string(),
+                        window.get_schedule_repeat().to_string(),
+                    ),
                 )
             })
             .unwrap_or_default();
@@ -3440,6 +3451,8 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
+        let schedule_repeat_interval_seconds = scheduled_at
+            .and_then(|_| schedule_repeat_interval_from_label(&schedule_repeat_label));
         let normalized_subtitle_languages = if subtitle_only {
             match normalize_subtitle_languages(&selected_subtitle_languages) {
                 Some(languages) => languages,
@@ -3589,6 +3602,7 @@ pub fn run() -> Result<()> {
                 }
             };
             record.download_directory = destination.to_string_lossy().into_owned();
+            record.schedule_repeat_interval_seconds = schedule_repeat_interval_seconds;
             let _dispatch_guard = dispatch_gate.lock().await;
             if shutdown.load(Ordering::Acquire) {
                 let _ = events.send(UiEvent::Status(
@@ -3603,7 +3617,17 @@ pub fn run() -> Result<()> {
             let schedule_status = scheduled_at.map_or_else(
                 || "Added to the download queue.".to_owned(),
                 |timestamp| {
-                    format!("Scheduled for {} local time.", format_local_schedule(timestamp))
+                    let mut message = format!(
+                        "Scheduled for {} local time.",
+                        format_local_schedule(timestamp),
+                    );
+                    if let Some(interval) = schedule_repeat_interval_seconds {
+                        message.push_str(&format!(
+                            " Repeats {} after each successful run.",
+                            schedule_repeat_interval_label(Some(interval)),
+                        ));
+                    }
+                    message
                 },
             );
             let _ = events.send(UiEvent::Refresh);
@@ -3651,6 +3675,7 @@ pub fn run() -> Result<()> {
             selected_directory,
             schedule_enabled,
             schedule_local_time,
+            schedule_repeat_label,
         )) = batch_window.upgrade().map(|window| {
             (
                 window.get_audio_only(),
@@ -3668,6 +3693,7 @@ pub fn run() -> Result<()> {
                 window.get_download_directory().to_string(),
                 window.get_schedule_download(),
                 window.get_schedule_local_time().to_string(),
+                window.get_schedule_repeat().to_string(),
             )
         })
         else {
@@ -3686,6 +3712,8 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
+        let schedule_repeat_interval_seconds = scheduled_at
+            .and_then(|_| schedule_repeat_interval_from_label(&schedule_repeat_label));
         let normalized_subtitle_languages = if subtitle_only {
             match normalize_subtitle_languages(&selected_subtitle_languages) {
                 Some(languages) => languages,
@@ -3758,6 +3786,7 @@ pub fn run() -> Result<()> {
                 subtitle_format,
                 include_auto_subtitles,
                 scheduled_at,
+                schedule_repeat_interval_seconds,
                 download_directory: destination.to_string_lossy().into_owned(),
             };
             let mut issues = parsed.issues;
@@ -3843,7 +3872,13 @@ pub fn run() -> Result<()> {
                     .send(UiEvent::Status(format!("Could not save the media link batch: {error}")));
                 return;
             }
-            let status = batch_result_status(queued_count, total_count, &issues, scheduled_at);
+            let mut status = batch_result_status(queued_count, total_count, &issues, scheduled_at);
+            if let Some(interval) = schedule_repeat_interval_seconds {
+                status.push_str(&format!(
+                    " Repeats {} after successful runs.",
+                    schedule_repeat_interval_label(Some(interval))
+                ));
+            }
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status(status));
             queue_wake.notify_one();
@@ -4064,6 +4099,7 @@ pub fn run() -> Result<()> {
             selected_directory,
             schedule_enabled,
             schedule_local_time,
+            schedule_repeat_label,
         ) = selected_queue_window
             .upgrade()
             .map(|window| {
@@ -4079,6 +4115,7 @@ pub fn run() -> Result<()> {
                     window.get_download_directory().to_string(),
                     window.get_schedule_download(),
                     window.get_schedule_local_time().to_string(),
+                    window.get_schedule_repeat().to_string(),
                 )
             })
             .unwrap_or_default();
@@ -4093,6 +4130,8 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
+        let schedule_repeat_interval_seconds = scheduled_at
+            .and_then(|_| schedule_repeat_interval_from_label(&schedule_repeat_label));
         let mut download_presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
@@ -4157,6 +4196,7 @@ pub fn run() -> Result<()> {
                 record.download_speed_limit_bytes_per_second =
                     download_presets.download_speed_limit_bytes_per_second;
                 record.scheduled_at = scheduled_at;
+                record.schedule_repeat_interval_seconds = schedule_repeat_interval_seconds;
                 if scheduled_at.is_some() {
                     record.status = "Waiting for schedule".to_owned();
                 }
@@ -4180,12 +4220,18 @@ pub fn run() -> Result<()> {
                 return;
             }
             let _ = events.send(UiEvent::Refresh);
-            let status = scheduled_at.map_or_else(
+            let mut status = scheduled_at.map_or_else(
                 || format!("Queued {selected_count} selected playlist entries. Each item will download separately."),
                 |timestamp| {
                     format!("Scheduled {selected_count} playlist entries for {} local time.", format_local_schedule(timestamp))
                 },
             );
+            if let Some(interval) = schedule_repeat_interval_seconds {
+                status.push_str(&format!(
+                    " Repeats {} after successful runs.",
+                    schedule_repeat_interval_label(Some(interval))
+                ));
+            }
             let _ = events.send(UiEvent::Status(status));
             queue_wake.notify_one();
         });
@@ -6116,29 +6162,38 @@ async fn run_download_job(
             DEFAULT_CONCURRENT_FRAGMENTS
         }
     };
-    let download_result = engine
-        .download_with_playlist_index_cancellable(
-            &active.url,
-            active.playlist_index,
-            DownloadOptions::new(active.download_mode, active.audio_format, active.audio_quality)
-                .with_video_quality(active.video_quality)
-                .with_selected_format_id(active.selected_format_id.clone())
-                .with_concurrent_fragments(concurrent_fragments)
-                .with_download_speed_limit(active.download_speed_limit_bytes_per_second)
-                .with_subtitle_options(
-                    active.subtitle_languages.clone(),
-                    active.subtitle_format,
-                    active.include_auto_subtitles,
+    let download_result = match prepare_recurring_run_output_directory(&active).await {
+        Ok(output_directory) => {
+            engine
+                .download_with_playlist_index_cancellable(
+                    &active.url,
+                    active.playlist_index,
+                    DownloadOptions::new(
+                        active.download_mode,
+                        active.audio_format,
+                        active.audio_quality,
+                    )
+                    .with_video_quality(active.video_quality)
+                    .with_selected_format_id(active.selected_format_id.clone())
+                    .with_concurrent_fragments(concurrent_fragments)
+                    .with_download_speed_limit(active.download_speed_limit_bytes_per_second)
+                    .with_subtitle_options(
+                        active.subtitle_languages.clone(),
+                        active.subtitle_format,
+                        active.include_auto_subtitles,
+                    )
+                    .with_output_directory(output_directory),
+                    &mut signal_receiver,
+                    move |progress| {
+                        let _ = progress_tx.send(progress);
+                    },
                 )
-                .with_output_directory(PathBuf::from(&active.download_directory)),
-            &mut signal_receiver,
-            move |progress| {
-                let _ = progress_tx.send(progress);
-            },
-        )
-        .await;
+                .await
+        }
+        Err(error) => Err(error),
+    };
     let mut final_record = progress_task.await.unwrap_or_else(|_| active.clone());
-    let (downloaded_successfully, canceled, paused, status_message) = match download_result {
+    let (downloaded_successfully, canceled, paused, mut status_message) = match download_result {
         Ok(EngineOutcome::Completed(result)) => {
             final_record.status = "Completed".to_owned();
             final_record.progress = 100.0;
@@ -6188,12 +6243,56 @@ async fn run_download_job(
         }
     };
     final_record.updated_at = now();
+    let next_scheduled_run = if downloaded_successfully {
+        match next_recurring_download(&final_record) {
+            Ok(next_run) => next_run,
+            Err(error) => {
+                error!(%error, job_id = %final_record.id, "schedule next recurring download");
+                status_message.push_str(" The repeat could not be scheduled; check the application log.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(next_run) = next_scheduled_run.as_ref() {
+        if let Some(timestamp) = next_run.scheduled_at {
+            status_message.push_str(&format!(
+                " Next run is scheduled for {} local time.",
+                format_local_schedule(timestamp)
+            ));
+        }
+    }
     let persisted = if canceled {
         store.finish_canceled_download(final_record.clone()).await
     } else if paused {
         store.finish_paused_download(final_record.clone()).await
     } else if downloaded_successfully {
-        store.finish_download(final_record.clone()).await
+        match store
+            .finish_download_with_next_scheduled_run(
+                final_record.clone(),
+                next_scheduled_run.clone(),
+            )
+            .await
+        {
+            Err(schedule_error) if next_scheduled_run.is_some() => {
+                error!(
+                    %schedule_error,
+                    job_id = %final_record.id,
+                    "persist completed recurring download and next run"
+                );
+                match store.finish_download(final_record.clone()).await {
+                    Ok(true) => {
+                        status_message.push_str(
+                            " The download completed, but its next repeat could not be saved; check the application log.",
+                        );
+                        Ok(true)
+                    }
+                    fallback => fallback,
+                }
+            }
+            result => result,
+        }
     } else {
         finish_failed_job(final_record.clone(), &store).await
     };
@@ -6446,6 +6545,7 @@ struct BatchDownloadSettings {
     subtitle_format: SubtitleFormat,
     include_auto_subtitles: bool,
     scheduled_at: Option<i64>,
+    schedule_repeat_interval_seconds: Option<i64>,
     download_directory: String,
 }
 
@@ -6469,6 +6569,7 @@ fn queued_batch_record(
     record.subtitle_format = settings.subtitle_format;
     record.include_auto_subtitles = settings.include_auto_subtitles;
     record.scheduled_at = settings.scheduled_at;
+    record.schedule_repeat_interval_seconds = settings.schedule_repeat_interval_seconds;
     record.download_directory = settings.download_directory.clone();
     if settings.scheduled_at.is_some() {
         record.status = "Waiting for schedule".to_owned();
@@ -6680,10 +6781,20 @@ fn row_view_with_queue_position(
 ) -> DownloadRowData {
     let details = if record.status == "Paused" && record.scheduled_at.is_some() {
         let scheduled = record.scheduled_at.map(format_local_schedule).unwrap_or_default();
-        format!("Paused · planned for {scheduled} local time; resume manually")
+        format!(
+            "Paused · planned for {scheduled} local time; resume manually{}",
+            record.schedule_repeat_interval_seconds.map_or_else(String::new, |interval| {
+                format!(" · repeats {}", schedule_repeat_interval_label(Some(interval)))
+            })
+        )
     } else if record.status == "Waiting for schedule" && record.scheduled_at.is_some() {
         let scheduled = record.scheduled_at.map(format_local_schedule).unwrap_or_default();
-        format!("Starts {scheduled} local time · The app must be running")
+        format!(
+            "Starts {scheduled} local time · The app must be running{}",
+            record.schedule_repeat_interval_seconds.map_or_else(String::new, |interval| {
+                format!(" · repeats {} after success", schedule_repeat_interval_label(Some(interval)))
+            })
+        )
     } else if record.status == "Waiting for schedule" {
         "Scheduled time unavailable".to_owned()
     } else if record.status == "Waiting for retry" {
@@ -6827,6 +6938,62 @@ fn saved_download_preset_model(presets: &[NamedDownloadPreset]) -> ModelRc<Share
             .map(|preset| SharedString::from(preset.name.as_str()))
             .collect::<Vec<_>>(),
     ))
+}
+
+async fn prepare_recurring_run_output_directory(record: &DownloadRecord) -> Result<PathBuf> {
+    let base_directory = PathBuf::from(&record.download_directory);
+    if record.schedule_repeat_interval_seconds.is_none() {
+        return Ok(base_directory);
+    }
+    let run_directory = base_directory.join("Scheduled Runs").join(&record.id);
+    let directory_for_worker = run_directory.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&directory_for_worker)
+            .with_context(|| format!("create recurring download folder {}", directory_for_worker.display()))?;
+        Ok(run_directory)
+    })
+    .await
+    .context("join recurring download folder creation")?
+}
+
+fn next_recurring_download(completed: &DownloadRecord) -> Result<Option<DownloadRecord>> {
+    let Some(interval_seconds) = completed.schedule_repeat_interval_seconds else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        is_supported_schedule_repeat_interval(interval_seconds),
+        "unsupported scheduled download repeat interval"
+    );
+    let next_at = completed
+        .updated_at
+        .checked_add(interval_seconds)
+        .context("next recurring download timestamp overflow")?;
+    let mut next = DownloadRecord::queued(
+        Uuid::new_v4().to_string(),
+        completed.url.clone(),
+        completed.updated_at,
+    );
+    next.priority = completed.priority;
+    next.playlist_index = completed.playlist_index;
+    next.playlist_group_id = completed.playlist_group_id.clone();
+    next.playlist_group_title = completed.playlist_group_title.clone();
+    next.download_mode = completed.download_mode;
+    next.subtitle_languages = completed.subtitle_languages.clone();
+    next.subtitle_format = completed.subtitle_format;
+    next.include_auto_subtitles = completed.include_auto_subtitles;
+    next.audio_format = completed.audio_format;
+    next.audio_quality = completed.audio_quality;
+    next.video_quality = completed.video_quality;
+    next.selected_format_id = completed.selected_format_id.clone();
+    next.download_speed_limit_bytes_per_second =
+        completed.download_speed_limit_bytes_per_second;
+    next.download_directory = completed.download_directory.clone();
+    next.title = completed.title.clone();
+    next.source = completed.source.clone();
+    next.status = "Waiting for schedule".to_owned();
+    next.scheduled_at = Some(next_at);
+    next.schedule_repeat_interval_seconds = Some(interval_seconds);
+    Ok(Some(next))
 }
 
 fn now() -> i64 {

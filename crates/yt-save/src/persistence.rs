@@ -13,7 +13,8 @@ use crate::{
     model::{
         AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord,
         NamedDownloadPreset, SubtitleFormat, VideoQuality, MAX_SAVED_DOWNLOAD_PRESETS,
-        normalize_download_speed_limit, normalize_saved_download_preset_name, normalized_host_key,
+        is_supported_schedule_repeat_interval, normalize_download_speed_limit,
+        normalize_saved_download_preset_name, normalized_host_key,
     },
 };
 
@@ -194,6 +195,7 @@ impl Store {
                     subtitle_format TEXT NOT NULL DEFAULT 'vtt',
                     include_auto_subtitles INTEGER NOT NULL DEFAULT 0,
                     scheduled_at INTEGER,
+                    schedule_repeat_interval_seconds INTEGER,
                     selected_format_id TEXT,
                     download_speed_limit_bytes_per_second INTEGER NOT NULL DEFAULT 0
                  );
@@ -310,6 +312,7 @@ impl Store {
                 ("subtitle_format", "TEXT NOT NULL DEFAULT 'vtt'"),
                 ("include_auto_subtitles", "INTEGER NOT NULL DEFAULT 0"),
                 ("scheduled_at", "INTEGER"),
+                ("schedule_repeat_interval_seconds", "INTEGER"),
                 ("selected_format_id", "TEXT"),
                 ("download_speed_limit_bytes_per_second", "INTEGER NOT NULL DEFAULT 0"),
             ] {
@@ -378,6 +381,12 @@ impl Store {
 }
 
 fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Result<()> {
+    anyhow::ensure!(
+        record
+            .schedule_repeat_interval_seconds
+            .map_or(true, is_supported_schedule_repeat_interval),
+        "unsupported scheduled download repeat interval"
+    );
     let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
     let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
     let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
@@ -390,7 +399,8 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             download_mode, audio_format, audio_quality, video_quality,
             download_directory, queue_rank, priority, retry_attempts, next_retry_at,
             subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-            selected_format_id, download_speed_limit_bytes_per_second
+            selected_format_id, download_speed_limit_bytes_per_second,
+            schedule_repeat_interval_seconds
         ) VALUES (
             :id, :url, :title, :source, :status, :progress, :downloaded,
             :total, :speed, :eta, :output, :error, :created, :updated,
@@ -401,7 +411,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
                       WHERE priority = :priority), 0) + 1024,
             :priority, :retry_attempts, :next_retry_at,
             :subtitle_languages, :subtitle_format, :include_auto_subtitles, :scheduled_at,
-            :selected_format_id, :speed_limit
+            :selected_format_id, :speed_limit, :schedule_repeat_interval_seconds
         ) ON CONFLICT(id) DO UPDATE SET
             url=excluded.url, title=excluded.title, source=excluded.source,
             status=excluded.status, progress=excluded.progress,
@@ -424,6 +434,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             subtitle_format=excluded.subtitle_format,
             include_auto_subtitles=excluded.include_auto_subtitles,
             scheduled_at=excluded.scheduled_at,
+            schedule_repeat_interval_seconds=excluded.schedule_repeat_interval_seconds,
             selected_format_id=excluded.selected_format_id,
             download_speed_limit_bytes_per_second=excluded.download_speed_limit_bytes_per_second",
         named_params! {
@@ -456,6 +467,7 @@ fn save_download_record(connection: &Connection, record: &DownloadRecord) -> Res
             ":subtitle_format": record.subtitle_format.as_database_value(),
             ":include_auto_subtitles": record.include_auto_subtitles,
             ":scheduled_at": record.scheduled_at,
+            ":schedule_repeat_interval_seconds": record.schedule_repeat_interval_seconds,
             ":selected_format_id": record.selected_format_id,
             ":speed_limit": i64::try_from(normalize_download_speed_limit(
                 record.download_speed_limit_bytes_per_second,
@@ -555,7 +567,8 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
                 subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-                selected_format_id, download_speed_limit_bytes_per_second
+                selected_format_id, download_speed_limit_bytes_per_second,
+                schedule_repeat_interval_seconds
          FROM downloads WHERE id = :id",
     )?;
     let record = statement
@@ -593,6 +606,7 @@ fn load_download_by_id(connection: &Connection, id: &str) -> Result<Option<Downl
                 scheduled_at: row.get(29)?,
                 selected_format_id: row.get(30)?,
                 download_speed_limit_bytes_per_second: download_speed_limit_from_row(row, 31)?,
+                schedule_repeat_interval_seconds: row.get(32)?,
             })
         })
         .optional()?;
@@ -617,7 +631,8 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
                 download_mode, audio_format, audio_quality, video_quality, queue_rank,
                 priority, download_directory, retry_attempts, next_retry_at,
                 subtitle_languages, subtitle_format, include_auto_subtitles, scheduled_at,
-                selected_format_id, download_speed_limit_bytes_per_second
+                selected_format_id, download_speed_limit_bytes_per_second,
+                schedule_repeat_interval_seconds
          FROM downloads
         ORDER BY CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN 0 ELSE 1 END,
                   CASE WHEN status IN ('Queued', 'Waiting for retry', 'Paused', 'Waiting for schedule') THEN priority ELSE 0 END DESC,
@@ -659,6 +674,7 @@ fn load_downloads(connection: &Connection) -> Result<Vec<DownloadRecord>> {
             scheduled_at: row.get(29)?,
             selected_format_id: row.get(30)?,
             download_speed_limit_bytes_per_second: download_speed_limit_from_row(row, 31)?,
+            schedule_repeat_interval_seconds: row.get(32)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)

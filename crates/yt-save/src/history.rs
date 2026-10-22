@@ -31,6 +31,7 @@ const HISTORY_COLUMNS: [&str; 30] = [
     "automatic_retry_attempts",
     "next_retry_at_unix",
     "scheduled_at_unix",
+    "schedule_repeat_interval_seconds",
 ];
 
 pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
@@ -68,6 +69,7 @@ pub(crate) fn download_history_csv(records: &[DownloadRecord]) -> String {
             record.retry_attempts.to_string(),
             optional_display(record.next_retry_at),
             optional_display(record.scheduled_at),
+            optional_display(record.schedule_repeat_interval_seconds),
         ];
         append_csv_row(&mut output, fields.iter().map(String::as_str));
     }
@@ -107,7 +109,7 @@ mod tests {
         assert!(csv.starts_with("\"id\",\"url\",\"queue_order\""));
         assert!(csv.contains("\"exact_format_id\",\"download_speed_limit_bytes_per_second\""));
         assert!(csv.ends_with(
-            "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\",\"scheduled_at_unix\"\r\n"
+            "\"created_at_unix\",\"updated_at_unix\",\"automatic_retry_attempts\",\"next_retry_at_unix\",\"scheduled_at_unix\",\"schedule_repeat_interval_seconds\"\r\n"
         ));
         assert_eq!(csv.matches("\r\n").count(), 1);
     }

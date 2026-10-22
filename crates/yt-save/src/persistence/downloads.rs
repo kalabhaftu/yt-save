@@ -571,6 +571,15 @@ impl Store {
 
     /// Persists a completed or failed outcome only while no pause or cancellation has won.
     pub async fn finish_download(&self, record: DownloadRecord) -> Result<bool> {
+        self.finish_download_with_next_scheduled_run(record, None).await
+    }
+
+    /// Completes the current run and inserts its next scheduled run in the same transaction.
+    pub async fn finish_download_with_next_scheduled_run(
+        &self,
+        record: DownloadRecord,
+        next_scheduled_run: Option<DownloadRecord>,
+    ) -> Result<bool> {
         let downloaded_bytes = sqlite_integer(record.downloaded_bytes, "downloaded_bytes")?;
         let total_bytes = sqlite_integer(record.total_bytes, "total_bytes")?;
         let eta_seconds = sqlite_integer(record.eta_seconds, "eta_seconds")?;
@@ -613,6 +622,9 @@ impl Store {
                          WHERE download_id = :id AND state = 'queued'",
                         named_params! { ":id": completed_id, ":completed_at": completed_at },
                     )?;
+                    if let Some(next_run) = next_scheduled_run.as_ref() {
+                        save_download_record(&transaction, next_run)?;
+                    }
                 }
                 transaction.commit()?;
                 Ok(affected > 0)

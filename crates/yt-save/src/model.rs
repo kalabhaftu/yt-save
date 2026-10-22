@@ -59,6 +59,37 @@ pub enum DownloadMode {
     ThumbnailOnly,
 }
 
+pub const SCHEDULE_REPEAT_INTERVAL_HOURLY: i64 = 60 * 60;
+pub const SCHEDULE_REPEAT_INTERVAL_DAILY: i64 = 24 * 60 * 60;
+pub const SCHEDULE_REPEAT_INTERVAL_WEEKLY: i64 = 7 * 24 * 60 * 60;
+
+pub fn schedule_repeat_interval_from_label(value: &str) -> Option<i64> {
+    match value.trim() {
+        "Every hour" => Some(SCHEDULE_REPEAT_INTERVAL_HOURLY),
+        "Every day" => Some(SCHEDULE_REPEAT_INTERVAL_DAILY),
+        "Every week" => Some(SCHEDULE_REPEAT_INTERVAL_WEEKLY),
+        _ => None,
+    }
+}
+
+pub fn schedule_repeat_interval_label(value: Option<i64>) -> &'static str {
+    match value {
+        Some(SCHEDULE_REPEAT_INTERVAL_HOURLY) => "hourly",
+        Some(SCHEDULE_REPEAT_INTERVAL_DAILY) => "daily",
+        Some(SCHEDULE_REPEAT_INTERVAL_WEEKLY) => "weekly",
+        _ => "once",
+    }
+}
+
+pub fn is_supported_schedule_repeat_interval(value: i64) -> bool {
+    matches!(
+        value,
+        SCHEDULE_REPEAT_INTERVAL_HOURLY
+            | SCHEDULE_REPEAT_INTERVAL_DAILY
+            | SCHEDULE_REPEAT_INTERVAL_WEEKLY
+    )
+}
+
 impl DownloadMode {
     pub fn as_database_value(self) -> &'static str {
         match self {
@@ -834,6 +865,8 @@ pub struct DownloadRecord {
     /// Unix timestamp when a one-time scheduled download becomes eligible.
     /// Present only while the scheduled item is waiting or paused before its run time.
     pub scheduled_at: Option<i64>,
+    /// Repeat cadence in seconds; the next run is queued only after a successful scheduled run.
+    pub schedule_repeat_interval_seconds: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -871,6 +904,7 @@ impl DownloadRecord {
             retry_attempts: 0,
             next_retry_at: None,
             scheduled_at: None,
+            schedule_repeat_interval_seconds: None,
             created_at,
             updated_at: created_at,
         }

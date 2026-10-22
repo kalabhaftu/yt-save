@@ -90,6 +90,104 @@ impl Store {
         .context("join preset read")?
     }
 
+    /// Loads user-named New Download presets from one SQLite setting.
+    pub async fn load_saved_download_presets(&self) -> Result<Vec<NamedDownloadPreset>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let value = setting_value(connection, "saved_download_presets")?;
+                let Some(value) = value else {
+                    return Ok(Vec::new());
+                };
+                let saved: Vec<NamedDownloadPreset> =
+                    serde_json::from_str(&value).context("parse saved download presets")?;
+                Ok(normalize_saved_presets(saved))
+            })
+        })
+        .await
+        .context("join saved preset read")?
+    }
+
+    /// Adds or replaces a named snapshot without touching the user's default form choices.
+    pub async fn save_named_download_preset(
+        &self,
+        name: String,
+        presets: DownloadPresets,
+        subtitle_languages: String,
+        subtitle_format: SubtitleFormat,
+        include_auto_subtitles: bool,
+        download_directory: String,
+        updated_at: i64,
+    ) -> Result<Vec<NamedDownloadPreset>> {
+        let name = normalize_saved_download_preset_name(&name)
+            .ok_or_else(|| anyhow::anyhow!("Preset names must contain 1–40 visible characters."))?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mut saved = read_saved_presets(connection)?;
+                if let Some(existing) =
+                    saved.iter_mut().find(|preset| preset.name.eq_ignore_ascii_case(&name))
+                {
+                    existing.name = name;
+                    existing.presets = presets;
+                    existing.subtitle_languages = subtitle_languages;
+                    existing.subtitle_format = subtitle_format;
+                    existing.include_auto_subtitles = include_auto_subtitles;
+                    existing.download_directory = download_directory;
+                } else {
+                    if saved.len() >= MAX_SAVED_DOWNLOAD_PRESETS {
+                        anyhow::bail!("You can save up to {MAX_SAVED_DOWNLOAD_PRESETS} presets.");
+                    }
+                    saved.push(NamedDownloadPreset {
+                        name,
+                        presets,
+                        subtitle_languages,
+                        subtitle_format,
+                        include_auto_subtitles,
+                        download_directory,
+                    });
+                }
+                let value = serde_json::to_string(&saved).context("serialize saved presets")?;
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('saved_download_presets', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": value, ":updated": updated_at },
+                )?;
+                Ok(saved)
+            })
+        })
+        .await
+        .context("join saved preset write")?
+    }
+
+    /// Removes one user-named preset, leaving the active New Download defaults untouched.
+    pub async fn delete_named_download_preset(
+        &self,
+        name: String,
+        updated_at: i64,
+    ) -> Result<Vec<NamedDownloadPreset>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_connection(|connection| {
+                let mut saved = read_saved_presets(connection)?;
+                saved.retain(|preset| !preset.name.eq_ignore_ascii_case(&name));
+                let value = serde_json::to_string(&saved).context("serialize saved presets")?;
+                connection.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES ('saved_download_presets', :value, :updated)
+                     ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at",
+                    named_params! { ":value": value, ":updated": updated_at },
+                )?;
+                Ok(saved)
+            })
+        })
+        .await
+        .context("join saved preset delete")?
+    }
+
     /// Loads the persisted queue concurrency limit; invalid or missing values use one worker.
     pub async fn load_max_concurrent_downloads(&self) -> Result<usize> {
         let store = self.clone();
@@ -512,7 +610,7 @@ impl Store {
         Ok(())
     }
 
-    /// Updates New download format defaults atomically; the speed cap is persisted independently.
+    /// Updates all New download format defaults, including the per-job speed cap, atomically.
     pub async fn set_download_presets(
         &self,
         presets: DownloadPresets,
@@ -521,7 +619,7 @@ impl Store {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             store.with_connection(|connection| {
-                let [(_, mode), (_, audio_format), (_, audio_quality), (_, video_quality), _] =
+                let [(_, mode), (_, audio_format), (_, audio_quality), (_, video_quality), (_, speed_limit)] =
                     presets.database_values();
                 connection.execute(
                     "INSERT INTO app_settings (key, value, updated_at)
@@ -529,7 +627,8 @@ impl Store {
                         ('new_download_mode', :mode, :updated),
                         ('new_download_audio_format', :audio_format, :updated),
                         ('new_download_audio_quality', :audio_quality, :updated),
-                        ('new_download_video_quality', :video_quality, :updated)
+                        ('new_download_video_quality', :video_quality, :updated),
+                        ('new_download_speed_limit_bytes_per_second', :speed_limit, :updated)
                      ON CONFLICT(key) DO UPDATE SET
                         value = excluded.value, updated_at = excluded.updated_at",
                     named_params! {
@@ -537,6 +636,7 @@ impl Store {
                         ":audio_format": audio_format,
                         ":audio_quality": audio_quality,
                         ":video_quality": video_quality,
+                        ":speed_limit": speed_limit,
                         ":updated": updated_at,
                     },
                 )?;
@@ -572,4 +672,40 @@ impl Store {
         .context("join download speed-limit setting write")??;
         Ok(())
     }
+}
+
+fn read_saved_presets(connection: &rusqlite::Connection) -> Result<Vec<NamedDownloadPreset>> {
+    let value = setting_value(connection, "saved_download_presets")?;
+    match value {
+        Some(value) => {
+            let saved: Vec<NamedDownloadPreset> =
+                serde_json::from_str(&value).context("parse saved download presets")?;
+            Ok(normalize_saved_presets(saved))
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn normalize_saved_presets(
+    saved: Vec<NamedDownloadPreset>,
+) -> Vec<NamedDownloadPreset> {
+    let mut normalized = Vec::new();
+    let mut names = HashSet::new();
+    for mut preset in saved {
+        let Some(name) = normalize_saved_download_preset_name(&preset.name) else {
+            continue;
+        };
+        if !names.insert(name.to_lowercase()) {
+            continue;
+        }
+        preset.name = name;
+        preset.presets.download_speed_limit_bytes_per_second = normalize_download_speed_limit(
+            preset.presets.download_speed_limit_bytes_per_second,
+        );
+        normalized.push(preset);
+        if normalized.len() == MAX_SAVED_DOWNLOAD_PRESETS {
+            break;
+        }
+    }
+    normalized
 }

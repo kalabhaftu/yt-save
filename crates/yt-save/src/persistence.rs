@@ -11,8 +11,9 @@ use rusqlite::{
 use crate::{
     app_update::AppUpdateChannel,
     model::{
-        AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord, SubtitleFormat,
-        VideoQuality, normalize_download_speed_limit, normalized_host_key,
+        AudioFormat, AudioQuality, DownloadMode, DownloadPresets, DownloadRecord,
+        NamedDownloadPreset, SubtitleFormat, VideoQuality, MAX_SAVED_DOWNLOAD_PRESETS,
+        normalize_download_speed_limit, normalize_saved_download_preset_name, normalized_host_key,
     },
 };
 

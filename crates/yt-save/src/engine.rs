@@ -30,6 +30,8 @@ use crate::{
 const PROGRESS_PREFIX: &str = "__YT_SAVE_PROGRESS__";
 const OUTPUT_PREFIX: &str = "__YT_SAVE_OUTPUT__";
 const SUBTITLE_OUTPUT_PREFIX: &str = "__YT_SAVE_SUBTITLE_OUTPUT__";
+const METADATA_OUTPUT_PREFIX: &str = "__YT_SAVE_METADATA_OUTPUT__";
+const THUMBNAIL_OUTPUT_PREFIX: &str = "__YT_SAVE_THUMBNAIL_OUTPUT__";
 const OUTPUT_TEMPLATE: &str = "%(playlist_title|.)s/%(title)s [%(id)s].%(ext)s";
 pub(crate) const PLAYLIST_PAGE_SIZE: usize = 50;
 
@@ -456,7 +458,9 @@ impl DownloadEngine {
             return Ok(outcome_for_signal(signal_requested(signal)));
         }
         let subtitle_only = options.mode == DownloadMode::SubtitlesOnly;
-        let subtitle_output_directory =
+        let metadata_only = options.mode == DownloadMode::MetadataOnly;
+        let thumbnail_only = options.mode == DownloadMode::ThumbnailOnly;
+        let sidecar_output_directory =
             options.output_directory.clone().unwrap_or_else(|| self.output_directory.clone());
         self.require_yt_dlp()?;
         let mut command = self.download_command(url, playlist_index, options)?;
@@ -563,11 +567,43 @@ impl DownloadEngine {
                 )
             })?;
             let path = PathBuf::from(path);
-            let path = if path.is_absolute() { path } else { subtitle_output_directory.join(path) };
+            let path = if path.is_absolute() { path } else { sidecar_output_directory.join(path) };
             if !path.is_file() {
                 bail!(
                     "yt-dlp reported a subtitle path that does not exist: {}",
                     path.file_name().and_then(|name| name.to_str()).unwrap_or("subtitle")
+                );
+            }
+            output_path = Some(path.to_string_lossy().into_owned());
+        }
+        if metadata_only {
+            let path = output_path.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "yt-dlp finished without reporting an info JSON file. This extractor may not provide metadata output."
+                )
+            })?;
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() { path } else { sidecar_output_directory.join(path) };
+            if !path.is_file() {
+                bail!(
+                    "yt-dlp reported a metadata path that does not exist: {}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("metadata.info.json")
+                );
+            }
+            output_path = Some(path.to_string_lossy().into_owned());
+        }
+        if thumbnail_only {
+            let path = output_path.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "yt-dlp finished without reporting a thumbnail file. This extractor may not provide a downloadable thumbnail."
+                )
+            })?;
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() { path } else { sidecar_output_directory.join(path) };
+            if !path.is_file() {
+                bail!(
+                    "yt-dlp reported a thumbnail path that does not exist: {}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("thumbnail image")
                 );
             }
             output_path = Some(path.to_string_lossy().into_owned());
@@ -616,8 +652,11 @@ impl DownloadEngine {
                     "The selected format ID is invalid. Analyze the link again and choose another format."
                 );
             }
-            if options.mode == DownloadMode::SubtitlesOnly {
-                bail!("Exact media formats cannot be selected for subtitle-only downloads.");
+            if matches!(
+                options.mode,
+                DownloadMode::SubtitlesOnly | DownloadMode::MetadataOnly | DownloadMode::ThumbnailOnly
+            ) {
+                bail!("Exact media formats cannot be selected for sidecar-only downloads.");
             }
         }
         let mut command = self.base_command();
@@ -727,6 +766,24 @@ impl DownloadEngine {
                     .arg("--print")
                     .arg(format!("after_move:{SUBTITLE_OUTPUT_PREFIX}%(requested_subtitles)j"));
             }
+            DownloadMode::MetadataOnly => {
+                command
+                    .arg("--skip-download")
+                    .arg("--write-info-json")
+                    .arg("--print")
+                    .arg(format!("after_move:{METADATA_OUTPUT_PREFIX}%(infojson_filename)s"))
+                    .arg("--no-simulate");
+            }
+            DownloadMode::ThumbnailOnly => {
+                command
+                    .arg("--skip-download")
+                    .arg("--write-thumbnail")
+                    .arg("--print")
+                    .arg(format!(
+                        "after_move:{THUMBNAIL_OUTPUT_PREFIX}%(thumbnails.-1.filepath)s"
+                    ))
+                    .arg("--no-simulate");
+            }
         }
         add_playlist_item_argument(&mut command, playlist_index)?;
         command.arg(url);
@@ -798,6 +855,14 @@ where
     } else if let Some(subtitles) = line.strip_prefix(SUBTITLE_OUTPUT_PREFIX) {
         if let Some(path) = parse_requested_subtitle_path(subtitles) {
             *output_path = Some(path);
+        }
+    } else if let Some(path) = line.strip_prefix(METADATA_OUTPUT_PREFIX) {
+        if !path.trim().is_empty() {
+            *output_path = Some(path.to_owned());
+        }
+    } else if let Some(path) = line.strip_prefix(THUMBNAIL_OUTPUT_PREFIX) {
+        if !path.trim().is_empty() && path.trim() != "NA" {
+            *output_path = Some(path.to_owned());
         }
     } else if !line.trim().is_empty() {
         debug!("yt-dlp emitted status output");

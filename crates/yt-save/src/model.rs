@@ -47,13 +47,16 @@ pub fn download_speed_limit_argument(bytes_per_second: u64) -> Option<String> {
     (bytes_per_second != 0).then(|| bytes_per_second.to_string())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DownloadMode {
     #[default]
     Video,
     VideoOnly,
     AudioOnly,
     SubtitlesOnly,
+    MetadataOnly,
+    ThumbnailOnly,
 }
 
 impl DownloadMode {
@@ -63,6 +66,8 @@ impl DownloadMode {
             Self::VideoOnly => "video_only",
             Self::AudioOnly => "audio",
             Self::SubtitlesOnly => "subtitles",
+            Self::MetadataOnly => "metadata",
+            Self::ThumbnailOnly => "thumbnail",
         }
     }
 
@@ -72,12 +77,15 @@ impl DownloadMode {
             "video_only" => Some(Self::VideoOnly),
             "audio" => Some(Self::AudioOnly),
             "subtitles" => Some(Self::SubtitlesOnly),
+            "metadata" => Some(Self::MetadataOnly),
+            "thumbnail" => Some(Self::ThumbnailOnly),
             _ => None,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubtitleFormat {
     Srt,
     #[default]
@@ -135,7 +143,8 @@ pub fn subtitle_languages_available(requested: &str, available: &[String]) -> bo
         })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AudioFormat {
     #[default]
     Original,
@@ -212,7 +221,8 @@ impl AudioFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AudioQuality {
     #[default]
     Best,
@@ -260,7 +270,8 @@ impl AudioQuality {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoQuality {
     #[default]
     Best,
@@ -357,13 +368,36 @@ impl VideoQuality {
 }
 
 /// Defaults shown in the New download form. Per-job choices remain persisted on each queue row.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadPresets {
     pub mode: DownloadMode,
     pub audio_format: AudioFormat,
     pub audio_quality: AudioQuality,
     pub video_quality: VideoQuality,
     pub download_speed_limit_bytes_per_second: u64,
+}
+
+/// A user-named snapshot of the New Download controls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedDownloadPreset {
+    pub name: String,
+    pub presets: DownloadPresets,
+    pub subtitle_languages: String,
+    pub subtitle_format: SubtitleFormat,
+    pub include_auto_subtitles: bool,
+    pub download_directory: String,
+}
+
+pub const MAX_SAVED_DOWNLOAD_PRESETS: usize = 32;
+
+/// Keeps preset labels compact and safe to show in the native UI.
+pub fn normalize_saved_download_preset_name(value: &str) -> Option<String> {
+    let name = value.trim();
+    let length = name.chars().count();
+    if length == 0 || length > 40 || name.chars().any(char::is_control) {
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 impl DownloadPresets {
@@ -478,6 +512,8 @@ impl MediaFormatOption {
             DownloadMode::VideoOnly => has_video && !has_audio,
             DownloadMode::AudioOnly => has_audio && !has_video,
             DownloadMode::SubtitlesOnly => false,
+            DownloadMode::MetadataOnly => false,
+            DownloadMode::ThumbnailOnly => false,
         }
     }
 

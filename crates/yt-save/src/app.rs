@@ -41,7 +41,7 @@ use crate::{
     history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
-        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_label,
+        NamedDownloadPreset, PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_label,
         format_bytes, format_duration, format_is_available, is_safe_format_id,
         normalize_subtitle_languages, normalized_host_key, subtitle_languages_available,
     },
@@ -1057,6 +1057,14 @@ pub fn run() -> Result<()> {
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
     let current_download_presets = Arc::new(Mutex::new(download_presets));
+    let saved_download_presets = runtime
+        .block_on(store.load_saved_download_presets())
+        .unwrap_or_else(|error| {
+            error!(%error, "load saved download presets; continuing with no saved presets");
+            Vec::new()
+        });
+    let saved_download_presets_state = Arc::new(Mutex::new(saved_download_presets.clone()));
+    let applying_named_download_preset = Arc::new(AtomicBool::new(false));
     let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
     let max_concurrent_per_host = runtime.block_on(store.load_max_concurrent_per_host())?;
     let concurrent_fragments = runtime.block_on(store.load_concurrent_fragments())?;
@@ -1093,6 +1101,8 @@ pub fn run() -> Result<()> {
     window.set_audio_only(download_presets.mode == DownloadMode::AudioOnly);
     window.set_video_only(download_presets.mode == DownloadMode::VideoOnly);
     window.set_subtitle_only(download_presets.mode == DownloadMode::SubtitlesOnly);
+    window.set_metadata_only(download_presets.mode == DownloadMode::MetadataOnly);
+    window.set_thumbnail_only(download_presets.mode == DownloadMode::ThumbnailOnly);
     window.set_audio_format(download_presets.audio_format.as_database_value().into());
     window.set_audio_quality(download_presets.audio_quality.as_database_value().into());
     window.set_video_quality(download_presets.video_quality.label().into());
@@ -1102,6 +1112,7 @@ pub fn run() -> Result<()> {
     window.set_download_speed_limit(
         download_speed_limit_label(download_presets.download_speed_limit_bytes_per_second).into(),
     );
+    window.set_saved_download_preset_names(saved_download_preset_model(&saved_download_presets));
     window.set_auto_retry_attempts(
         if auto_retry_attempts == 0 { "Off".to_owned() } else { auto_retry_attempts.to_string() }
             .into(),
@@ -1866,6 +1877,10 @@ pub fn run() -> Result<()> {
             .map(|window| {
                 if window.get_subtitle_only() {
                     DownloadMode::SubtitlesOnly
+                } else if window.get_metadata_only() {
+                    DownloadMode::MetadataOnly
+                } else if window.get_thumbnail_only() {
+                    DownloadMode::ThumbnailOnly
                 } else if window.get_video_only() {
                     DownloadMode::VideoOnly
                 } else if window.get_audio_only() {
@@ -3127,6 +3142,8 @@ pub fn run() -> Result<()> {
             audio_only,
             video_only,
             subtitle_only,
+            metadata_only,
+            thumbnail_only,
             audio_format,
             audio_quality,
             video_quality,
@@ -3141,6 +3158,8 @@ pub fn run() -> Result<()> {
                     window.get_audio_only(),
                     window.get_video_only(),
                     window.get_subtitle_only(),
+                    window.get_metadata_only(),
+                    window.get_thumbnail_only(),
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
@@ -3169,7 +3188,7 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
-        let presets = DownloadPresets::from_ui_values(
+        let mut presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
             &audio_format,
@@ -3177,6 +3196,11 @@ pub fn run() -> Result<()> {
             &video_quality,
         )
         .with_download_speed_limit_label(&speed_limit_label);
+        if metadata_only {
+            presets.mode = DownloadMode::MetadataOnly;
+        } else if thumbnail_only {
+            presets.mode = DownloadMode::ThumbnailOnly;
+        }
         let store = queue_subscription_store.clone();
         let review = queue_subscription_review.clone();
         let weak_window = queue_subscription_window.clone();
@@ -3329,6 +3353,8 @@ pub fn run() -> Result<()> {
             audio_only,
             video_only,
             subtitle_only,
+            metadata_only,
+            thumbnail_only,
             selected_subtitle_languages,
             selected_subtitle_format,
             include_auto_subtitles,
@@ -3345,6 +3371,8 @@ pub fn run() -> Result<()> {
                     window.get_audio_only(),
                     window.get_video_only(),
                     window.get_subtitle_only(),
+                    window.get_metadata_only(),
+                    window.get_thumbnail_only(),
                     window.get_subtitle_languages().to_string(),
                     window.get_subtitle_format().to_string(),
                     window.get_include_auto_subtitles(),
@@ -3400,6 +3428,10 @@ pub fn run() -> Result<()> {
         .with_download_speed_limit_label(&selected_speed_limit);
         if subtitle_only {
             download_presets.mode = DownloadMode::SubtitlesOnly;
+        } else if metadata_only {
+            download_presets.mode = DownloadMode::MetadataOnly;
+        } else if thumbnail_only {
+            download_presets.mode = DownloadMode::ThumbnailOnly;
         }
         record.download_mode = download_presets.mode;
         let selected_format_id = match selected_format_id_from_ui(
@@ -3570,6 +3602,8 @@ pub fn run() -> Result<()> {
             audio_only,
             video_only,
             subtitle_only,
+            metadata_only,
+            thumbnail_only,
             selected_subtitle_languages,
             selected_subtitle_format,
             include_auto_subtitles,
@@ -3585,6 +3619,8 @@ pub fn run() -> Result<()> {
                 window.get_audio_only(),
                 window.get_video_only(),
                 window.get_subtitle_only(),
+                window.get_metadata_only(),
+                window.get_thumbnail_only(),
                 window.get_subtitle_languages().to_string(),
                 window.get_subtitle_format().to_string(),
                 window.get_include_auto_subtitles(),
@@ -3627,7 +3663,7 @@ pub fn run() -> Result<()> {
         } else {
             "en".to_owned()
         };
-        let download_presets = DownloadPresets::from_ui_values(
+        let mut download_presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
             &selected_format,
@@ -3635,6 +3671,13 @@ pub fn run() -> Result<()> {
             &selected_video_quality,
         )
         .with_download_speed_limit_label(&selected_speed_limit);
+        if subtitle_only {
+            download_presets.mode = DownloadMode::SubtitlesOnly;
+        } else if metadata_only {
+            download_presets.mode = DownloadMode::MetadataOnly;
+        } else if thumbnail_only {
+            download_presets.mode = DownloadMode::ThumbnailOnly;
+        }
         let subtitle_format =
             SubtitleFormat::from_database_value(&selected_subtitle_format).unwrap_or_default();
         let Some(batch_guard) =
@@ -3673,11 +3716,7 @@ pub fn run() -> Result<()> {
                 }
             };
             let settings = BatchDownloadSettings {
-                presets: if subtitle_only {
-                    DownloadPresets { mode: DownloadMode::SubtitlesOnly, ..download_presets }
-                } else {
-                    download_presets
-                },
+                presets: download_presets,
                 subtitle_languages: normalized_subtitle_languages,
                 subtitle_format,
                 include_auto_subtitles,
@@ -3979,6 +4018,8 @@ pub fn run() -> Result<()> {
         let (
             audio_only,
             video_only,
+            metadata_only,
+            thumbnail_only,
             selected_format,
             selected_quality,
             selected_video_quality,
@@ -3992,6 +4033,8 @@ pub fn run() -> Result<()> {
                 (
                     window.get_audio_only(),
                     window.get_video_only(),
+                    window.get_metadata_only(),
+                    window.get_thumbnail_only(),
                     window.get_audio_format().to_string(),
                     window.get_audio_quality().to_string(),
                     window.get_video_quality().to_string(),
@@ -4013,7 +4056,7 @@ pub fn run() -> Result<()> {
         } else {
             None
         };
-        let download_presets = DownloadPresets::from_ui_values(
+        let mut download_presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
             &selected_format,
@@ -4021,6 +4064,11 @@ pub fn run() -> Result<()> {
             &selected_video_quality,
         )
         .with_download_speed_limit_label(&selected_speed_limit);
+        if metadata_only {
+            download_presets.mode = DownloadMode::MetadataOnly;
+        } else if thumbnail_only {
+            download_presets.mode = DownloadMode::ThumbnailOnly;
+        }
         let _ = selected_queue_events.send(UiEvent::Status(format!(
             "Adding {} selected playlist entries to the queue…",
             selected_entries.len()
@@ -4408,10 +4456,14 @@ pub fn run() -> Result<()> {
     let presets_events = events_tx.clone();
     let presets_handle = handle.clone();
     let presets_state = current_download_presets.clone();
+    let preset_apply_guard = applying_named_download_preset.clone();
     let presets_generation = Arc::new(AtomicU64::new(0));
     let presets_write_lock = Arc::new(AsyncMutex::new(()));
     window.on_download_presets_changed(
-        move |audio_only, video_only, subtitle_only, audio_format, audio_quality, video_quality, speed_limit| {
+        move |audio_only, video_only, subtitle_only, metadata_only, thumbnail_only, audio_format, audio_quality, video_quality, speed_limit| {
+            if preset_apply_guard.load(Ordering::Acquire) {
+                return;
+            }
             let mut presets = DownloadPresets::from_ui_values(
                 audio_only,
                 video_only,
@@ -4422,6 +4474,10 @@ pub fn run() -> Result<()> {
             .with_download_speed_limit_label(speed_limit.as_str());
             if subtitle_only {
                 presets.mode = DownloadMode::SubtitlesOnly;
+            } else if metadata_only {
+                presets.mode = DownloadMode::MetadataOnly;
+            } else if thumbnail_only {
+                presets.mode = DownloadMode::ThumbnailOnly;
             }
             match presets_state.lock() {
                 Ok(mut current) => *current = presets,
@@ -4458,6 +4514,213 @@ pub fn run() -> Result<()> {
             });
         },
     );
+
+    let save_named_presets_store = store.clone();
+    let save_named_presets_state = saved_download_presets_state.clone();
+    let save_named_presets_current = current_download_presets.clone();
+    let save_named_presets_handle = handle.clone();
+    let save_named_presets_events = events_tx.clone();
+    let save_named_presets_window = window.as_weak();
+    window.on_save_saved_download_preset_requested(
+        move |name, subtitle_languages, subtitle_format, include_auto_subtitles, download_directory| {
+            let presets = match save_named_presets_current.lock() {
+                Ok(presets) => *presets,
+                Err(_) => {
+                    error!("current New Download choices are unavailable");
+                    return;
+                }
+            };
+            let store = save_named_presets_store.clone();
+            let state = save_named_presets_state.clone();
+            let events = save_named_presets_events.clone();
+            let weak_window = save_named_presets_window.clone();
+            save_named_presets_handle.spawn(async move {
+                match store
+                    .save_named_download_preset(
+                        name.to_string(),
+                        presets,
+                        subtitle_languages.to_string(),
+                        SubtitleFormat::from_database_value(subtitle_format.as_str())
+                            .unwrap_or_default(),
+                        include_auto_subtitles,
+                        download_directory.to_string(),
+                        now(),
+                    )
+                    .await
+                {
+                    Ok(saved) => {
+                        let selected_name = saved
+                            .iter()
+                            .find(|preset| preset.name.eq_ignore_ascii_case(name.as_str()))
+                            .map(|preset| preset.name.clone())
+                            .unwrap_or_else(|| name.to_string().trim().to_owned());
+                        if let Ok(mut current) = state.lock() {
+                            *current = saved.clone();
+                        }
+                        let model = saved_download_preset_model(&saved);
+                        let selected_name_for_ui = selected_name.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.set_saved_download_preset_names(model);
+                                window.set_saved_download_preset_selection(selected_name_for_ui.into());
+                                window.set_saved_download_preset_name_input(SharedString::default());
+                            }
+                        });
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Saved download preset ‘{selected_name}’."
+                        )));
+                    }
+                    Err(error) => {
+                        error!(%error, "save named download preset");
+                        let _ = events.send(UiEvent::Status(format!(
+                            "Could not save this download preset: {error}"
+                        )));
+                    }
+                }
+            });
+        },
+    );
+
+    let apply_named_presets_state = saved_download_presets_state.clone();
+    let apply_named_presets_current = current_download_presets.clone();
+    let apply_named_presets_guard = applying_named_download_preset.clone();
+    let apply_named_presets_store = store.clone();
+    let apply_named_presets_handle = handle.clone();
+    let apply_named_presets_events = events_tx.clone();
+    let apply_named_presets_window = window.as_weak();
+    window.on_apply_saved_download_preset_requested(move |name| {
+        let preset = match apply_named_presets_state.lock() {
+            Ok(saved) => saved
+                .iter()
+                .find(|preset| preset.name == name.as_str())
+                .cloned(),
+            Err(_) => {
+                error!("saved download presets are unavailable");
+                None
+            }
+        };
+        let Some(preset) = preset else {
+            let _ = apply_named_presets_events.send(UiEvent::Status(
+                "Choose an available saved download preset first.".to_owned(),
+            ));
+            return;
+        };
+        if let Ok(mut current) = apply_named_presets_current.lock() {
+            *current = preset.presets;
+        }
+        let store = apply_named_presets_store.clone();
+        let events = apply_named_presets_events.clone();
+        let weak_window = apply_named_presets_window.clone();
+        let applying = apply_named_presets_guard.clone();
+        apply_named_presets_handle.spawn(async move {
+            let destination = validate_download_directory(Path::new(&preset.download_directory))
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            let destination_error = if destination.is_none() {
+                Some("The saved destination is unavailable; the current folder was kept.".to_owned())
+            } else {
+                None
+            };
+            let mut persistence_error = None;
+            if let Err(error) = store.set_download_presets(preset.presets, now()).await {
+                error!(%error, "persist applied named download preset");
+                persistence_error = Some(error.to_string());
+            }
+            if let Some(directory) = destination.as_ref()
+                && let Err(error) = store.set_default_download_directory(directory.clone(), now()).await
+            {
+                error!(%error, "persist named preset destination");
+                persistence_error = Some(error.to_string());
+            }
+            let model_values = preset.clone();
+            let selected_name = preset.name.clone();
+            let weak_window_for_update = weak_window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak_window_for_update.upgrade() {
+                    applying.store(true, Ordering::Release);
+                    window.set_audio_only(model_values.presets.mode == DownloadMode::AudioOnly);
+                    window.set_video_only(model_values.presets.mode == DownloadMode::VideoOnly);
+                    window.set_subtitle_only(
+                        model_values.presets.mode == DownloadMode::SubtitlesOnly,
+                    );
+                    window.set_metadata_only(
+                        model_values.presets.mode == DownloadMode::MetadataOnly,
+                    );
+                    window.set_thumbnail_only(
+                        model_values.presets.mode == DownloadMode::ThumbnailOnly,
+                    );
+                    window.set_audio_format(model_values.presets.audio_format.as_database_value().into());
+                    window.set_audio_quality(model_values.presets.audio_quality.as_database_value().into());
+                    window.set_video_quality(model_values.presets.video_quality.label().into());
+                    window.set_download_speed_limit(
+                        download_speed_limit_label(
+                            model_values.presets.download_speed_limit_bytes_per_second,
+                        )
+                        .into(),
+                    );
+                    window.set_subtitle_languages(model_values.subtitle_languages.into());
+                    window.set_subtitle_format(
+                        model_values.subtitle_format.as_database_value().into(),
+                    );
+                    window.set_include_auto_subtitles(model_values.include_auto_subtitles);
+                    if let Some(directory) = destination {
+                        window.set_download_directory(directory.into());
+                    }
+                    window.set_saved_download_preset_selection(selected_name.into());
+                    applying.store(false, Ordering::Release);
+                }
+            });
+            let message = if let Some(error) = persistence_error {
+                format!(
+                    "Applied ‘{}’ for this session, but could not save all defaults: {error}",
+                    preset.name
+                )
+            } else if let Some(error) = destination_error {
+                format!("Applied ‘{}’. {error}", preset.name)
+            } else {
+                format!("Applied download preset ‘{}’.", preset.name)
+            };
+            let _ = events.send(UiEvent::Status(message));
+        });
+    });
+
+    let delete_named_presets_store = store.clone();
+    let delete_named_presets_state = saved_download_presets_state.clone();
+    let delete_named_presets_handle = handle.clone();
+    let delete_named_presets_events = events_tx.clone();
+    let delete_named_presets_window = window.as_weak();
+    window.on_delete_saved_download_preset_requested(move |name| {
+        let store = delete_named_presets_store.clone();
+        let state = delete_named_presets_state.clone();
+        let events = delete_named_presets_events.clone();
+        let weak_window = delete_named_presets_window.clone();
+        let selected_name = name.to_string();
+        delete_named_presets_handle.spawn(async move {
+            match store.delete_named_download_preset(selected_name.clone(), now()).await {
+                Ok(saved) => {
+                    if let Ok(mut current) = state.lock() {
+                        *current = saved.clone();
+                    }
+                    let model = saved_download_preset_model(&saved);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_saved_download_preset_names(model);
+                            window.set_saved_download_preset_selection(SharedString::default());
+                        }
+                    });
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Removed saved download preset ‘{selected_name}’."
+                    )));
+                }
+                Err(error) => {
+                    error!(%error, "remove named download preset");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not remove this download preset: {error}"
+                    )));
+                }
+            }
+        });
+    });
 
     let retry_settings_store = store.clone();
     let retry_settings_events = events_tx.clone();
@@ -5051,7 +5314,7 @@ pub fn run() -> Result<()> {
         let events = locate_events.clone();
         let handle = locate_handle.clone();
         let _ =
-            events.send(UiEvent::Status("Choose the moved media file to relink it.".to_owned()));
+            events.send(UiEvent::Status("Choose the moved download file to relink it.".to_owned()));
         handle.spawn(async move {
             let selected = match tokio::task::spawn_blocking(pick_library_media_file).await {
                 Ok(Ok(Some(path))) => path,
@@ -5074,7 +5337,7 @@ pub fn run() -> Result<()> {
             };
             if !has_supported_media_extension(&selected) {
                 let _ = events
-                    .send(UiEvent::Status("Choose a supported audio or video file.".to_owned()));
+                    .send(UiEvent::Status("Choose a supported audio, video, subtitle, metadata, or image file.".to_owned()));
                 return;
             }
             let canonical = match tokio::task::spawn_blocking(move || {
@@ -5846,6 +6109,10 @@ async fn run_download_job(
             final_record.error = None;
             let message = if final_record.download_mode == DownloadMode::SubtitlesOnly {
                 "Subtitle sidecar saved."
+            } else if final_record.download_mode == DownloadMode::MetadataOnly {
+                "Metadata sidecar saved."
+            } else if final_record.download_mode == DownloadMode::ThumbnailOnly {
+                "Thumbnail image saved."
             } else {
                 "Download complete."
             };
@@ -6346,6 +6613,8 @@ fn scan_library_entries(records: &[DownloadRecord]) -> Vec<LibraryCacheEntry> {
                 DownloadMode::Video | DownloadMode::VideoOnly => "Video",
                 DownloadMode::AudioOnly => "Audio",
                 DownloadMode::SubtitlesOnly => "Subtitles",
+                DownloadMode::MetadataOnly => "Metadata",
+                DownloadMode::ThumbnailOnly => "Thumbnail",
             };
             let file_format = Path::new(path)
                 .extension()
@@ -6422,6 +6691,8 @@ fn library_row_views_from_cache(
             "Video" => entry.row.kind.as_str() == "Video",
             "Audio" => entry.row.kind.as_str() == "Audio",
             "Subtitles" => entry.row.kind.as_str() == "Subtitles",
+            "Metadata" => entry.row.kind.as_str() == "Metadata",
+            "Thumbnail" => entry.row.kind.as_str() == "Thumbnail",
             "Missing files" => !entry.row.path_available,
             _ => true,
         })
@@ -6616,6 +6887,8 @@ fn row_view_with_queue_position(
             record.subtitle_format.as_database_value().to_uppercase(),
             if record.include_auto_subtitles { " · auto captions" } else { " · manual captions" }
         ),
+        (DownloadMode::MetadataOnly, _) => "Metadata · JSON".to_owned(),
+        (DownloadMode::ThumbnailOnly, _) => "Thumbnail · Image".to_owned(),
     };
     let speed_limit = if record.download_speed_limit_bytes_per_second == 0 {
         String::new()
@@ -6688,6 +6961,15 @@ fn selected_format_id_from_ui(
         );
     }
     Ok(Some(format_id.to_owned()))
+}
+
+fn saved_download_preset_model(presets: &[NamedDownloadPreset]) -> ModelRc<SharedString> {
+    ModelRc::new(VecModel::from(
+        presets
+            .iter()
+            .map(|preset| SharedString::from(preset.name.as_str()))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn now() -> i64 {
@@ -6952,12 +7234,12 @@ fn pick_library_media_file() -> Result<Option<PathBuf>> {
     };
 
     let filter: Vec<u16> = concat!(
-        "Media files\0",
-        "*.3g2;*.3gp;*.aac;*.ac3;*.aif;*.aiff;*.alac;*.amr;*.ape;*.asf;*.au;*.avi;*.caf;*.flac;*.flv;*.m2ts;*.m4a;*.m4b;*.m4v;*.mka;*.mkv;*.mov;*.mp2;*.mp3;*.mp4;*.mpeg;*.mpg;*.oga;*.ogg;*.ogv;*.opus;*.ra;*.rm;*.srt;*.ts;*.vtt;*.wav;*.webm;*.wma;*.wmv\0\0"
+        "Download files\0",
+        "*.3g2;*.3gp;*.aac;*.ac3;*.aif;*.aiff;*.alac;*.amr;*.ape;*.asf;*.au;*.avi;*.avif;*.bmp;*.caf;*.flac;*.flv;*.gif;*.jpeg;*.jpg;*.m2ts;*.m4a;*.m4b;*.m4v;*.mka;*.mkv;*.mov;*.mp2;*.mp3;*.mp4;*.mpeg;*.mpg;*.oga;*.ogg;*.ogv;*.opus;*.png;*.ra;*.rm;*.srt;*.ts;*.vtt;*.wav;*.webm;*.webp;*.wma;*.wmv\0\0"
     )
     .encode_utf16()
     .collect();
-    let title: Vec<u16> = "Locate moved media file".encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "Locate moved download file".encode_utf16().chain(Some(0)).collect();
     let mut file = vec![0u16; 32_768];
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
@@ -7041,9 +7323,15 @@ fn has_supported_media_extension(path: &Path) -> bool {
             | "asf"
             | "au"
             | "avi"
+            | "avif"
+            | "bmp"
             | "caf"
             | "flac"
             | "flv"
+            | "gif"
+            | "jpeg"
+            | "jpg"
+            | "json"
             | "m2ts"
             | "m4a"
             | "m4b"
@@ -7060,11 +7348,13 @@ fn has_supported_media_extension(path: &Path) -> bool {
             | "ogg"
             | "ogv"
             | "opus"
+            | "png"
             | "ra"
             | "rm"
             | "ts"
             | "wav"
             | "webm"
+            | "webp"
             | "wma"
             | "wmv"
             | "srt"

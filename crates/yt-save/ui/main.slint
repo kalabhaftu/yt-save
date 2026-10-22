@@ -107,6 +107,8 @@ export component MainWindow inherits Window {
     in-out property <bool> audio-only: false;
     in-out property <bool> video-only: false;
     in-out property <bool> subtitle-only: false;
+    in-out property <bool> metadata-only: false;
+    in-out property <bool> thumbnail-only: false;
     in-out property <string> subtitle-languages: "en";
     in-out property <string> subtitle-format: "vtt";
     in-out property <bool> include-auto-subtitles: false;
@@ -127,6 +129,9 @@ export component MainWindow inherits Window {
     in-out property <string> max-concurrent-per-host: "1";
     in-out property <string> concurrent-fragments: "1";
     in-out property <string> download-speed-limit: "Unlimited";
+    in-out property <string> saved-download-preset-selection: "";
+    in-out property <string> saved-download-preset-name-input: "";
+    in property <[string]> saved-download-preset-names: [];
     in-out property <string> auto-retry-attempts: "3";
     in-out property <string> history-search: "";
     in-out property <bool> show-library: false;
@@ -237,7 +242,10 @@ export component MainWindow inherits Window {
     callback max-concurrent-downloads-requested(string);
     callback max-concurrent-per-host-requested(string);
     callback concurrent-fragments-requested(string);
-    callback download-presets-changed(bool, bool, bool, string, string, string, string);
+    callback download-presets-changed(bool, bool, bool, bool, bool, string, string, string, string);
+    callback apply-saved-download-preset-requested(string);
+    callback save-saved-download-preset-requested(string, string, string, bool, string);
+    callback delete-saved-download-preset-requested(string);
     callback auto-retry-attempts-requested(string);
     callback open-output-requested(string);
     callback reveal-output-requested(string);
@@ -262,31 +270,39 @@ export component MainWindow inherits Window {
     }
 
     changed audio-only => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed video-only => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed subtitle-only => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed metadata-only => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed thumbnail-only => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed audio-format => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed audio-quality => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed video-quality => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed download-speed-limit => {
-        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.metadata-only, root.thumbnail-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed auto-retry-attempts => {
@@ -665,7 +681,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         ComboBox {
-                            model: ["All files", "Video", "Audio", "Subtitles", "Missing files"];
+                            model: ["All files", "Video", "Audio", "Subtitles", "Metadata", "Thumbnail", "Missing files"];
                             current-value <=> root.library-filter;
                             width: 136px;
                             height: 34px;
@@ -715,7 +731,7 @@ export component MainWindow inherits Window {
                                         height: 48px;
                                         border-radius: 10px;
                                         background: #22263a;
-                                        Text { text: entry.kind == "Audio" ? "♫" : "▶"; color: #aaa0ff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                                        Text { text: entry.kind == "Audio" ? "♫" : entry.kind == "Thumbnail" ? "▧" : entry.kind == "Metadata" ? "{}" : entry.kind == "Subtitles" ? "CC" : "▶"; color: #aaa0ff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
                                     }
                                     VerticalLayout {
                                         alignment: center;
@@ -1194,31 +1210,112 @@ export component MainWindow inherits Window {
                                 }
                                 ActionButton {
                                     label: "Video + audio";
-                                    primary: !root.audio-only && !root.video-only && !root.subtitle-only;
+                                    primary: !root.audio-only && !root.video-only && !root.subtitle-only && !root.metadata-only && !root.thumbnail-only;
                                     button-height: 30px;
                                     button-min-width: 112px;
-                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = false; root.selected-format = "Automatic (quality preset)"; }
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = false; root.metadata-only = false; root.thumbnail-only = false; root.selected-format = "Automatic (quality preset)"; }
                                 }
                                 ActionButton {
                                     label: "Video only";
                                     primary: root.video-only;
                                     button-height: 30px;
                                     button-min-width: 96px;
-                                    clicked => { root.audio-only = false; root.video-only = true; root.subtitle-only = false; root.selected-format = "Automatic (quality preset)"; }
+                                    clicked => { root.audio-only = false; root.video-only = true; root.subtitle-only = false; root.metadata-only = false; root.thumbnail-only = false; root.selected-format = "Automatic (quality preset)"; }
                                 }
                                 ActionButton {
                                     label: "Audio only";
                                     primary: root.audio-only;
                                     button-height: 30px;
                                     button-min-width: 102px;
-                                    clicked => { root.audio-only = true; root.video-only = false; root.subtitle-only = false; root.selected-format = "Automatic (quality preset)"; }
+                                    clicked => { root.audio-only = true; root.video-only = false; root.subtitle-only = false; root.metadata-only = false; root.thumbnail-only = false; root.selected-format = "Automatic (quality preset)"; }
                                 }
                                 ActionButton {
                                     label: "Subtitles";
                                     primary: root.subtitle-only;
                                     button-height: 30px;
                                     button-min-width: 98px;
-                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = true; root.selected-format = "Automatic (quality preset)"; }
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = true; root.metadata-only = false; root.thumbnail-only = false; root.selected-format = "Automatic (quality preset)"; }
+                                }
+                                ActionButton {
+                                    label: "Metadata only";
+                                    primary: root.metadata-only;
+                                    button-height: 30px;
+                                    button-min-width: 108px;
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = false; root.metadata-only = true; root.thumbnail-only = false; root.selected-format = "Automatic (quality preset)"; }
+                                }
+                                ActionButton {
+                                    label: "Thumbnail";
+                                    primary: root.thumbnail-only;
+                                    button-height: 30px;
+                                    button-min-width: 88px;
+                                    clicked => { root.audio-only = false; root.video-only = false; root.subtitle-only = false; root.metadata-only = false; root.thumbnail-only = true; root.selected-format = "Automatic (quality preset)"; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            HorizontalLayout {
+                                height: 34px;
+                                spacing: 6px;
+                                Text {
+                                    text: "Saved preset";
+                                    color: #a9b0c4;
+                                    font-size: 11px;
+                                    width: 92px;
+                                    vertical-alignment: center;
+                                }
+                                ComboBox {
+                                    model: root.saved-download-preset-names;
+                                    current-value <=> root.saved-download-preset-selection;
+                                    width: 170px;
+                                    height: 32px;
+                                }
+                                ActionButton {
+                                    label: "Apply";
+                                    button-height: 30px;
+                                    button-min-width: 66px;
+                                    is-enabled: root.saved-download-preset-selection != "";
+                                    clicked => { root.apply-saved-download-preset-requested(root.saved-download-preset-selection); }
+                                }
+                                Rectangle {
+                                    border-radius: 7px;
+                                    background: #0e111a;
+                                    border-width: 1px;
+                                    border-color: #343a4e;
+                                    width: 172px;
+                                    height: 32px;
+                                    TextInput {
+                                        text <=> root.saved-download-preset-name-input;
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: parent.height;
+                                        accessible-placeholder-text: "Name this preset";
+                                        color: #ecedf4;
+                                        font-size: 11px;
+                                        selection-background-color: #5751a3;
+                                        vertical-alignment: center;
+                                    }
+                                    if root.saved-download-preset-name-input == "" : Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: parent.height;
+                                        text: "Name this preset";
+                                        color: #727b92;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                ActionButton {
+                                    label: "Save";
+                                    primary: true;
+                                    button-height: 30px;
+                                    button-min-width: 62px;
+                                    clicked => { root.save-saved-download-preset-requested(root.saved-download-preset-name-input, root.subtitle-languages, root.subtitle-format, root.include-auto-subtitles, root.download-directory); }
+                                }
+                                ActionButton {
+                                    label: "Remove";
+                                    button-height: 30px;
+                                    button-min-width: 72px;
+                                    is-enabled: root.saved-download-preset-selection != "";
+                                    clicked => { root.delete-saved-download-preset-requested(root.saved-download-preset-selection); }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
@@ -1235,7 +1332,7 @@ export component MainWindow inherits Window {
                                 ComboBox {
                                     model: ["Best", "2160p / 4K", "1440p", "1080p", "720p", "480p", "360p", "Lowest"];
                                     current-value <=> root.video-quality;
-                                    enabled: !root.audio-only && !root.subtitle-only;
+                                    enabled: !root.audio-only && !root.subtitle-only && !root.metadata-only && !root.thumbnail-only;
                                     height: 34px;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
@@ -1478,7 +1575,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 height: 12px;
-                                text: root.schedule-download ? (root.subtitle-only ? "Yt Save must be running at the scheduled time. Captions are external sidecars." : "Yt Save must be running at the scheduled local time.") : root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? (root.video-only ? "Video only selects a video stream; the requested height cap is strict and may be unavailable." : "Video + audio presets cap requested resolution; availability depends on site formats.") : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
+                                text: root.schedule-download ? (root.thumbnail-only ? "Yt Save must be running at the scheduled local time. The thumbnail is saved as an image." : root.metadata-only ? "Yt Save must be running at the scheduled local time. Metadata is saved as a JSON sidecar." : root.subtitle-only ? "Yt Save must be running at the scheduled time. Captions are external sidecars." : "Yt Save must be running at the scheduled local time.") : root.thumbnail-only ? "Saves the best available thumbnail image without downloading media." : root.metadata-only ? "Saves yt-dlp metadata as a JSON sidecar without downloading media." : root.subtitle-only ? "Captions are saved as external sidecar files; missing captions are reported as a failed queue item." : !root.audio-only ? (root.video-only ? "Video only selects a video stream; the requested height cap is strict and may be unavailable." : "Video + audio presets cap requested resolution; availability depends on site formats.") : root.audio-format == "alac" || root.audio-format == "flac" || root.audio-format == "wav" ? "ALAC, FLAC, and WAV cannot restore quality already lost in a lossy source." : root.audio-format != "original" ? "Conversion requires bundled FFmpeg. Quality applies to lossy formats." : "Original keeps the source audio without conversion.";
                                 color: #747d96;
                                 font-size: 10px;
                                 overflow: elide;
@@ -1519,13 +1616,13 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
-                                if root.format-choices.length > 1 && root.format-choice-display-url == root.url-input && ((root.audio-only && root.format-choice-mode == "audio") || (root.video-only && root.format-choice-mode == "video_only") || (root.subtitle-only && root.format-choice-mode == "subtitles") || (!root.audio-only && !root.video-only && !root.subtitle-only && root.format-choice-mode == "video")) : ComboBox {
+                                if root.format-choices.length > 1 && root.format-choice-display-url == root.url-input && ((root.audio-only && root.format-choice-mode == "audio") || (root.video-only && root.format-choice-mode == "video_only") || (root.subtitle-only && root.format-choice-mode == "subtitles") || (!root.audio-only && !root.video-only && !root.subtitle-only && !root.metadata-only && !root.thumbnail-only && root.format-choice-mode == "video")) : ComboBox {
                                     model: root.format-choices;
                                     current-value <=> root.selected-format;
                                     horizontal-stretch: 1;
                                     height: 34px;
                                 }
-                                if root.format-choices.length > 1 && (root.format-choice-display-url != root.url-input || !((root.audio-only && root.format-choice-mode == "audio") || (root.video-only && root.format-choice-mode == "video_only") || (root.subtitle-only && root.format-choice-mode == "subtitles") || (!root.audio-only && !root.video-only && !root.subtitle-only && root.format-choice-mode == "video"))) : Text {
+                                if root.format-choices.length > 1 && (root.format-choice-display-url != root.url-input || !((root.audio-only && root.format-choice-mode == "audio") || (root.video-only && root.format-choice-mode == "video_only") || (root.subtitle-only && root.format-choice-mode == "subtitles") || (!root.audio-only && !root.video-only && !root.subtitle-only && !root.metadata-only && !root.thumbnail-only && root.format-choice-mode == "video"))) : Text {
                                     text: "Analyze this URL again for formats in the selected mode.";
                                     color: #777f99;
                                     font-size: 11px;

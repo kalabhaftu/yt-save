@@ -1,4 +1,5 @@
 use super::*;
+use slint::CloseRequestResponse;
 
 pub(super) struct TrayContext {
     pub(super) store: Store,

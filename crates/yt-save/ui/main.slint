@@ -221,6 +221,7 @@ export component MainWindow inherits Window {
     callback close-to-tray-requested(bool);
     callback minimize-to-tray-requested(bool);
     callback open-download-folder();
+    callback open-application-logs();
     callback choose-download-directory-requested();
     callback clear-completed-requested();
     callback pause-all-requested();
@@ -1025,6 +1026,10 @@ export component MainWindow inherits Window {
                         ActionButton {
                             label: "Open folder";
                             clicked => { root.open-download-folder(); }
+                        }
+                        ActionButton {
+                            label: "Open logs";
+                            clicked => { root.open-application-logs(); }
                         }
                     }
 

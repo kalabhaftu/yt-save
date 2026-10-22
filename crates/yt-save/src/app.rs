@@ -4991,6 +4991,30 @@ pub fn run() -> Result<()> {
         });
     });
 
+    let log_folder = paths.data_local.join("logs");
+    let log_events = events_tx.clone();
+    let log_handle = handle.clone();
+    window.on_open_application_logs(move || {
+        let events = log_events.clone();
+        let folder = log_folder.clone();
+        log_handle.spawn_blocking(move || {
+            let result = std::fs::create_dir_all(&folder)
+                .with_context(|| format!("create application log folder {}", folder.display()))
+                .and_then(|()| open_folder(&folder));
+            match result {
+                Ok(()) => {
+                    let _ = events.send(UiEvent::Status("Opened the application logs folder.".to_owned()));
+                }
+                Err(error) => {
+                    error!(%error, log_folder = %folder.display(), "open application logs folder");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not open application logs: {error}"
+                    )));
+                }
+            }
+        });
+    });
+
     let choose_store = store.clone();
     let choose_events = events_tx.clone();
     let choose_window = window.as_weak();

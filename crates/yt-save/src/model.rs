@@ -472,8 +472,16 @@ pub struct MediaMetadata {
     pub title: String,
     pub webpage_url: String,
     pub source: String,
+    #[serde(default)]
+    pub creator: Option<String>,
+    #[serde(default)]
+    pub upload_date: Option<String>,
     pub duration_seconds: Option<f64>,
     pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub chapters: Vec<MediaChapter>,
     pub format_count: usize,
     #[serde(default)]
     pub formats: Vec<MediaFormatOption>,
@@ -487,6 +495,12 @@ pub struct MediaMetadata {
     pub manual_subtitle_languages: Vec<String>,
     #[serde(default)]
     pub automatic_subtitle_languages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MediaChapter {
+    pub start_time: f64,
+    pub title: String,
 }
 
 /// Safe, displayable metadata for one yt-dlp format. Stream URLs and request details are omitted.
@@ -700,6 +714,18 @@ impl MediaMetadata {
             text(value, "title").or_else(|| text(first_entry, "title"))
         };
 
+        let description_source = if selected_playlist_index.is_some() {
+            text(first_entry, "description").or_else(|| text(value, "description"))
+        } else if is_playlist {
+            text(value, "description").or_else(|| text(first_entry, "description"))
+        } else {
+            text(first_entry, "description").or_else(|| text(value, "description"))
+        };
+        let creator_source = first_text(first_entry, &["channel", "uploader", "creator"])
+            .or_else(|| first_text(value, &["channel", "uploader", "creator"]));
+        let upload_date_source = first_text(first_entry, &["upload_date", "release_date"])
+            .or_else(|| first_text(value, &["upload_date", "release_date"]));
+
         Self {
             id: text(first_entry, "id").unwrap_or_default(),
             title: title.unwrap_or_else(|| "Untitled media".to_owned()),
@@ -709,8 +735,12 @@ impl MediaMetadata {
             source: text(value, "extractor_key")
                 .or_else(|| text(value, "extractor"))
                 .unwrap_or_else(|| "Supported site".to_owned()),
+            creator: creator_source.and_then(|value| clean_display_text(&value, 100)),
+            upload_date: upload_date_source.and_then(|value| clean_upload_date(&value)),
             duration_seconds: first_entry.get("duration").and_then(serde_json::Value::as_f64),
             thumbnail: text(first_entry, "thumbnail"),
+            description: description_source.and_then(|value| clean_display_text(&value, 420)),
+            chapters: parse_media_chapters(first_entry),
             format_count: first_entry
                 .get("formats")
                 .and_then(serde_json::Value::as_array)
@@ -849,6 +879,60 @@ impl DownloadRecord {
 
 fn text(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+}
+
+fn first_text(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| text(value, key).filter(|value| !value.trim().is_empty()))
+}
+
+fn clean_display_text(value: &str, maximum_characters: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut characters = normalized.chars();
+    let mut display = characters.by_ref().take(maximum_characters).collect::<String>();
+    if characters.next().is_some() {
+        display.push('…');
+    }
+    Some(display)
+}
+
+fn clean_upload_date(value: &str) -> Option<String> {
+    let digits = value.chars().filter(char::is_ascii_digit).collect::<String>();
+    if digits.len() == 8
+        && let Ok(date) = chrono::NaiveDate::parse_from_str(&digits, "%Y%m%d")
+    {
+        Some(date.format("%Y-%m-%d").to_string())
+    } else {
+        clean_display_text(value, 24)
+    }
+}
+
+fn parse_media_chapters(value: &serde_json::Value) -> Vec<MediaChapter> {
+    value
+        .get("chapters")
+        .and_then(serde_json::Value::as_array)
+        .map(|chapters| {
+            chapters
+                .iter()
+                .enumerate()
+                .take(100)
+                .filter_map(|(index, chapter)| {
+                    let start_time = chapter
+                        .get("start_time")
+                        .and_then(serde_json::Value::as_f64)
+                        .filter(|time| time.is_finite() && *time >= 0.0)?;
+                    let title = chapter
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|title| clean_display_text(title, 80))
+                        .unwrap_or_else(|| format!("Chapter {}", index + 1));
+                    Some(MediaChapter { start_time, title })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn format_bytes(bytes: Option<u64>) -> String {

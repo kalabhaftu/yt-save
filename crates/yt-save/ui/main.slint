@@ -164,6 +164,8 @@ export component MainWindow inherits Window {
     in-out property <bool> app-update-installing: false;
     in-out property <string> analyzed-title: "";
     in-out property <string> analyzed-details: "";
+    in-out property <string> analyzed-description: "";
+    in-out property <string> analyzed-chapters: "";
     in-out property <bool> analyzed-is-playlist: false;
     in-out property <[string]> format-choices: ["Automatic (quality preset)"];
     in-out property <string> selected-format: "Automatic (quality preset)";
@@ -1585,7 +1587,9 @@ export component MainWindow inherits Window {
                     }
 
                     if root.analyzed-title != "" : Rectangle {
-                        height: root.analyzed-is-playlist ? (root.show-playlist-range-controls ? 284px : 250px) : (!root.multiple-links-mode && (root.format-choices.length > 1 || root.format-choice-list-truncated) ? 132px : 92px);
+                        height: root.analyzed-is-playlist
+                            ? (root.show-playlist-range-controls ? 284px : 250px) + (root.analyzed-description != "" ? 48px : 0px) + (root.analyzed-chapters != "" ? 60px : 0px)
+                            : 92px + (root.analyzed-description != "" ? 48px : 0px) + (root.analyzed-chapters != "" ? 60px : 0px) + (!root.multiple-links-mode && (root.format-choices.length > 1 || root.format-choice-list-truncated) ? 40px : 0px);
                         background: #121722;
                         border-width: 1px;
                         border-color: #2a3041;
@@ -1598,6 +1602,24 @@ export component MainWindow inherits Window {
                             spacing: 6px;
                             Text { text: root.analyzed-title; color: #e9ebf4; font-size: 14px; font-weight: 600; }
                             Text { text: root.analyzed-details; color: #8c95ad; font-size: 12px; }
+                            if root.analyzed-description != "" : Text {
+                                text: root.analyzed-description;
+                                height: 42px;
+                                color: #a1a9bd;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                                vertical-alignment: top;
+                            }
+                            if root.analyzed-chapters != "" : Text {
+                                text: root.analyzed-chapters;
+                                height: 54px;
+                                color: #a1a9bd;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                                vertical-alignment: top;
+                            }
                             if !root.analyzed-is-playlist && !root.multiple-links-mode && (root.format-choices.length > 1 || root.format-choice-list-truncated) : HorizontalLayout {
                                 height: 34px;
                                 spacing: 8px;

@@ -43,6 +43,7 @@ struct PlaylistSubscriptionRowData {
     url: string,
     summary: string,
     check-frequency: string,
+    auto-queue-new-entries: bool,
     selected: bool,
 }
 
@@ -136,6 +137,7 @@ export component MainWindow inherits Window {
     in-out property <string> subscription-selection-summary: "";
     in-out property <bool> subscription-checking: false;
     in-out property <string> subscription-check-frequency: "Manual";
+    in-out property <bool> subscription-auto-queue-new-entries: false;
     in-out property <int> playlist-subscription-selected-count: 0;
     in-out property <string> library-search: "";
     in-out property <string> library-filter: "All files";
@@ -195,6 +197,7 @@ export component MainWindow inherits Window {
     callback playlist-subscription-selected-requested(string);
     callback playlist-subscription-check-requested(string);
     callback playlist-subscription-frequency-requested(string, string);
+    callback playlist-subscription-auto-queue-requested(string, bool);
     callback playlist-subscription-delete-requested(string);
     callback playlist-subscription-entry-toggle-requested(string);
     callback playlist-subscription-queue-selected-requested();
@@ -234,7 +237,7 @@ export component MainWindow inherits Window {
     callback max-concurrent-downloads-requested(string);
     callback max-concurrent-per-host-requested(string);
     callback concurrent-fragments-requested(string);
-    callback download-speed-limit-requested(string);
+    callback download-presets-changed(bool, bool, bool, string, string, string, string);
     callback auto-retry-attempts-requested(string);
     callback open-output-requested(string);
     callback reveal-output-requested(string);
@@ -258,8 +261,32 @@ export component MainWindow inherits Window {
         root.concurrent-fragments-requested(root.concurrent-fragments);
     }
 
+    changed audio-only => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed video-only => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed subtitle-only => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed audio-format => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed audio-quality => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
+    changed video-quality => {
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
+    }
+
     changed download-speed-limit => {
-        root.download-speed-limit-requested(root.download-speed-limit);
+        root.download-presets-changed(root.audio-only, root.video-only, root.subtitle-only, root.audio-format, root.audio-quality, root.video-quality, root.download-speed-limit);
     }
 
     changed auto-retry-attempts => {
@@ -746,7 +773,7 @@ export component MainWindow inherits Window {
                             spacing: 4px;
                             Text { text: "Playlist subscriptions"; color: #f2f3f8; font-size: 27px; font-weight: 700; }
                             Text {
-                                text: "Check saved playlists manually or on a schedule while Yt Save is running. New entries wait here for your review; local files are never removed.";
+                                text: "Check saved playlists while Yt Save is running. Review new entries or opt in to auto-queue; local files are never removed.";
                                 color: #8c94aa;
                                 font-size: 12px;
                                 overflow: elide;
@@ -774,6 +801,50 @@ export component MainWindow inherits Window {
                             is-enabled: root.playlist-subscription-selected-count > 0;
                             clicked => { root.playlist-subscription-queue-selected-requested(); }
                         }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 9px;
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            border-width: 1px;
+                            border-color: root.subscription-auto-queue-new-entries ? #80b8ff : #394055;
+                            border-radius: 5px;
+                            background: root.subscription-auto-queue-new-entries ? #253b5c : #151925;
+                            if root.subscription-auto-queue-new-entries : Text {
+                                text: "✓";
+                                color: #e7f1ff;
+                                font-size: 14px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                enabled: root.selected-subscription-id != "" && !root.subscription-checking;
+                                clicked => {
+                                    root.playlist-subscription-auto-queue-requested(
+                                        root.selected-subscription-id,
+                                        !root.subscription-auto-queue-new-entries
+                                    );
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text {
+                                text: "Auto-queue new entries";
+                                color: root.selected-subscription-id == "" ? #687087 : #dfe3ee;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: "Uses the current New Download choices and save folder.";
+                                color: #8c94aa;
+                                font-size: 11px;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
 
                     HorizontalLayout {
@@ -810,7 +881,13 @@ export component MainWindow inherits Window {
                                         Text { text: subscription.source + " · " + subscription.check-frequency + " · " + subscription.summary; color: #8c95ad; font-size: 10px; overflow: elide; }
                                         Text { text: subscription.url; color: #717a92; font-size: 9px; overflow: elide; }
                                     }
-                                    TouchArea { clicked => { root.playlist-subscription-selected-requested(subscription.id); } }
+                                    TouchArea {
+                                        clicked => {
+                                            root.selected-subscription-id = subscription.id;
+                                            root.subscription-auto-queue-new-entries = subscription.auto-queue-new-entries;
+                                            root.playlist-subscription-selected-requested(subscription.id);
+                                        }
+                                    }
                                 }
                             }
                         }

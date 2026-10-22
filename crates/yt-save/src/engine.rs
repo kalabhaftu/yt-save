@@ -200,6 +200,10 @@ impl DownloadEngine {
         }
     }
 
+    pub(crate) fn default_output_directory(&self) -> &Path {
+        &self.output_directory
+    }
+
     pub fn with_cookie_store(mut self, cookie_store: CookieStore) -> Self {
         self.cookie_store = cookie_store;
         self
@@ -620,6 +624,7 @@ impl DownloadEngine {
         command
             .arg("--no-warnings")
             .arg("--continue")
+            .arg("--no-overwrites")
             .arg("--newline")
             .arg("--concurrent-fragments")
             .arg(options.concurrent_fragments.to_string())

@@ -9,12 +9,9 @@ use std::{
     time::Duration,
 };
 
-#[cfg(windows)]
-use std::{cell::RefCell, rc::Rc};
-
 use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
     task::JoinSet,
@@ -24,12 +21,18 @@ use uuid::Uuid;
 
 const AUTOMATIC_FORMAT_CHOICE: &str = "Automatic (quality preset)";
 
+mod clipboard_popup;
+#[cfg(windows)]
+mod cookie_login;
+mod tray;
+use tray::{ShutdownState, cancel_staged_update_helper};
+
 use crate::{
     AppTray, ClipboardPopup, DownloadRowData, LibraryRowData, MainWindow, PlaylistEntryRowData,
     PlaylistSubscriptionEntryRowData, PlaylistSubscriptionRowData,
     app_update::{AppRelease, AppUpdateChannel, CheckOutcome, InstallerKind},
     clipboard_monitor::{ClipboardCandidate, ClipboardMonitor, WorkArea},
-    cookie_auth::{CookieRecord, CookieStore},
+    cookie_auth::CookieStore,
     dependencies::DependencyPaths,
     engine::{
         DownloadEngine, DownloadOptions, EngineOutcome, JobSignal, PLAYLIST_PAGE_SIZE,
@@ -38,10 +41,9 @@ use crate::{
     history::download_history_csv,
     model::{
         DownloadMode, DownloadPresets, DownloadRecord, MediaFormatOption, MediaMetadata,
-        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_from_label,
-        download_speed_limit_label, format_bytes, format_duration, format_is_available,
-        is_safe_format_id, normalize_subtitle_languages, normalized_host_key,
-        subtitle_languages_available,
+        PlaylistEntry, PlaylistMediaEntry, SubtitleFormat, download_speed_limit_label,
+        format_bytes, format_duration, format_is_available, is_safe_format_id,
+        normalize_subtitle_languages, normalized_host_key, subtitle_languages_available,
     },
     persistence::{
         DEFAULT_AUTO_RETRY_ATTEMPTS, DEFAULT_CONCURRENT_FRAGMENTS, DEFAULT_MAX_CONCURRENT_PER_HOST,
@@ -164,22 +166,6 @@ struct QueueActionState {
     can_retry_failed: bool,
 }
 
-struct TrayContext {
-    store: Store,
-    handle: tokio::runtime::Handle,
-    events: mpsc::UnboundedSender<UiEvent>,
-    active_jobs: ActiveJobs,
-    queue_wake: Arc<Notify>,
-    preferences: Arc<Mutex<TrayPreferences>>,
-    shutdown_started: Arc<AtomicBool>,
-    shutdown_committed: Arc<AtomicBool>,
-}
-
-struct ShutdownState {
-    started: Arc<AtomicBool>,
-    committed: Arc<AtomicBool>,
-}
-
 struct ActiveJobRegistration {
     id: String,
     jobs: ActiveJobs,
@@ -254,6 +240,24 @@ struct PlaylistSubscriptionReviewState {
     subscription: Option<PlaylistSubscription>,
     entries: Vec<PlaylistSubscriptionEntry>,
     selected_media_keys: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlaylistSubscriptionCheckResult {
+    new_entries: usize,
+    auto_queued_entries: usize,
+    auto_queue_skipped_for_subtitle_mode: bool,
+}
+
+struct PlaylistSubscriptionSchedulerState {
+    queue_wake: Arc<Notify>,
+    dispatch_gate: Arc<AsyncMutex<()>>,
+    current_download_presets: Arc<Mutex<DownloadPresets>>,
+    review_state: Arc<Mutex<PlaylistSubscriptionReviewState>>,
+    check_active: Arc<AtomicBool>,
+    weak_window: slint::Weak<MainWindow>,
+    events: mpsc::UnboundedSender<UiEvent>,
+    shutdown_started: Arc<AtomicBool>,
 }
 
 struct PlaylistSubscriptionCheckGuard {
@@ -427,10 +431,77 @@ fn playlist_subscription_entry_inputs(
                 media_url: media_url.to_owned(),
                 title: entry.title.clone(),
                 playlist_index: entry.playlist_index,
-                available: entry.available,
+                available: entry.available
+                    && !media_url.is_empty()
+                    && validate_url(media_url).is_ok(),
             })
         })
         .collect()
+}
+
+fn playlist_subscription_auto_queue_items(
+    source: &str,
+    playlist_title: &str,
+    entries: &[PlaylistSubscriptionEntryInput],
+    presets: DownloadPresets,
+    download_directory: &str,
+    created_at: i64,
+) -> Vec<PlaylistSubscriptionQueueItem> {
+    let group_id = Uuid::new_v4().to_string();
+    entries
+        .iter()
+        .filter(|entry| entry.available && !entry.media_url.trim().is_empty())
+        .map(|entry| {
+            let mut record = DownloadRecord::queued(
+                Uuid::new_v4().to_string(),
+                entry.media_url.clone(),
+                created_at,
+            );
+            record.title = entry.title.clone();
+            record.source = source.to_owned();
+            record.playlist_group_id = Some(group_id.clone());
+            record.playlist_group_title = Some(playlist_title.to_owned());
+            record.download_mode = presets.mode;
+            record.audio_format = presets.audio_format;
+            record.audio_quality = presets.audio_quality;
+            record.video_quality = presets.video_quality;
+            record.download_speed_limit_bytes_per_second =
+                presets.download_speed_limit_bytes_per_second;
+            record.download_directory = download_directory.to_owned();
+            PlaylistSubscriptionQueueItem { media_key: entry.media_key.clone(), record }
+        })
+        .collect()
+}
+
+fn playlist_subscription_check_status(result: PlaylistSubscriptionCheckResult) -> String {
+    if result.new_entries == 0 {
+        return if result.auto_queue_skipped_for_subtitle_mode {
+            "Playlist checked. No new entries were found. Auto-queue was skipped because subtitle-only mode does not support playlist batches.".to_owned()
+        } else {
+            "Playlist checked. No new entries were found.".to_owned()
+        };
+    }
+    if result.auto_queue_skipped_for_subtitle_mode {
+        return format!(
+            "Found {} new playlist {}. They remain in review because subtitle-only mode does not support playlist batches. Choose Video + audio, Video only, or Audio only to auto-queue future entries.",
+            result.new_entries,
+            plural_word(result.new_entries, "entry", "entries")
+        );
+    }
+    if result.auto_queued_entries == 0 {
+        return format!(
+            "Found {} new playlist {}. Review them before queueing.",
+            result.new_entries,
+            plural_word(result.new_entries, "entry", "entries")
+        );
+    }
+    format!(
+        "Found {} new playlist {}; auto-queued {} available {} using your current New Download choices and save folder. Unavailable entries remain for review.",
+        result.new_entries,
+        plural_word(result.new_entries, "entry", "entries"),
+        result.auto_queued_entries,
+        plural_word(result.auto_queued_entries, "entry", "entries")
+    )
 }
 
 fn playlist_subscription_rows(
@@ -458,6 +529,7 @@ fn playlist_subscription_rows(
                 check_frequency: SharedString::from(subscription_check_frequency_label(
                     subscription.check_interval_seconds,
                 )),
+                auto_queue_new_entries: subscription.auto_queue_new_entries,
                 selected: subscription.id == selected_id,
             }
         })
@@ -678,6 +750,11 @@ async fn refresh_playlist_subscription_view(
                     })
                     .into(),
             );
+            window.set_subscription_auto_queue_new_entries(
+                selected_subscription
+                    .as_ref()
+                    .is_some_and(|subscription| subscription.auto_queue_new_entries),
+            );
             window.set_selected_subscription_title(title.into());
             window.set_selected_subscription_details(details.into());
             window.set_subscription_selection_summary(summary.into());
@@ -695,7 +772,10 @@ async fn perform_playlist_subscription_check(
     store: &Store,
     engine: &DownloadEngine,
     subscription_id: &str,
-) -> Result<usize> {
+    current_download_presets: &Mutex<DownloadPresets>,
+    dispatch_gate: &AsyncMutex<()>,
+    shutdown_started: &AtomicBool,
+) -> Result<PlaylistSubscriptionCheckResult> {
     let subscription = store
         .list_playlist_subscriptions()
         .await?
@@ -708,26 +788,93 @@ async fn perform_playlist_subscription_check(
     }
     let entries =
         playlist_subscription_entry_inputs(&metadata.source, &metadata.subscription_entries);
-    store
-        .record_playlist_subscription_check(
-            subscription_id.to_owned(),
-            metadata.title,
-            metadata.source,
-            now(),
-            entries,
-        )
-        .await
+    let check_time = now();
+    let mut auto_queue_skipped_for_subtitle_mode = false;
+    let queue_items = if subscription.auto_queue_new_entries {
+        let presets = *current_download_presets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("current New Download choices are unavailable"))?;
+        if presets.mode == DownloadMode::SubtitlesOnly {
+            auto_queue_skipped_for_subtitle_mode = true;
+            Vec::new()
+        } else {
+            let fallback_directory =
+                engine.default_output_directory().to_string_lossy().into_owned();
+            let configured_directory =
+                store.get_or_initialize_download_directory(fallback_directory).await?;
+            let directory_title = metadata.title.clone();
+            let directory_subscription_id = subscription.id.clone();
+            let directory = tokio::task::spawn_blocking(move || {
+                create_playlist_subscription_directory(
+                    Path::new(&configured_directory),
+                    &directory_title,
+                    &directory_subscription_id,
+                )
+            })
+            .await
+            .context("join playlist subscription destination creation")??;
+            playlist_subscription_auto_queue_items(
+                &metadata.source,
+                &metadata.title,
+                &entries,
+                presets,
+                &directory.to_string_lossy(),
+                check_time,
+            )
+        }
+    } else {
+        Vec::new()
+    };
+    let _dispatch_guard = dispatch_gate.lock().await;
+    anyhow::ensure!(
+        !shutdown_started.load(Ordering::Acquire),
+        "Playlist check stopped because Yt Save is preparing to close or update."
+    );
+    let (new_entries, auto_queued_entries) = if auto_queue_skipped_for_subtitle_mode {
+        let new_entries = store
+            .record_playlist_subscription_check(
+                subscription_id.to_owned(),
+                metadata.title,
+                metadata.source,
+                check_time,
+                entries,
+            )
+            .await?;
+        (new_entries, 0)
+    } else {
+        store
+            .record_playlist_subscription_check_with_queue_items(
+                subscription_id.to_owned(),
+                metadata.title,
+                metadata.source,
+                check_time,
+                entries,
+                queue_items,
+            )
+            .await?
+    };
+    Ok(PlaylistSubscriptionCheckResult {
+        new_entries,
+        auto_queued_entries,
+        auto_queue_skipped_for_subtitle_mode,
+    })
 }
 
 async fn run_playlist_subscription_scheduler(
     store: Store,
     engine: DownloadEngine,
-    review_state: Arc<Mutex<PlaylistSubscriptionReviewState>>,
-    check_active: Arc<AtomicBool>,
-    weak_window: slint::Weak<MainWindow>,
-    events: mpsc::UnboundedSender<UiEvent>,
-    shutdown_started: Arc<AtomicBool>,
+    state: PlaylistSubscriptionSchedulerState,
 ) {
+    let PlaylistSubscriptionSchedulerState {
+        queue_wake,
+        dispatch_gate,
+        current_download_presets,
+        review_state,
+        check_active,
+        weak_window,
+        events,
+        shutdown_started,
+    } = state;
     let mut timer = tokio::time::interval(Duration::from_secs(30));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -754,16 +901,34 @@ async fn run_playlist_subscription_scheduler(
         let mut checked = 0usize;
         let mut failed = 0usize;
         let mut new_entries = 0usize;
+        let mut auto_queued_entries = 0usize;
+        let mut auto_queue_skipped_count = 0usize;
         for subscription in due_subscriptions {
             if shutdown_started.load(Ordering::Acquire) {
                 break;
             }
-            match perform_playlist_subscription_check(&store, &engine, &subscription.id).await {
-                Ok(count) => {
+            match perform_playlist_subscription_check(
+                &store,
+                &engine,
+                &subscription.id,
+                &current_download_presets,
+                &dispatch_gate,
+                &shutdown_started,
+            )
+            .await
+            {
+                Ok(result) => {
                     checked += 1;
-                    new_entries = new_entries.saturating_add(count);
+                    new_entries = new_entries.saturating_add(result.new_entries);
+                    auto_queued_entries =
+                        auto_queued_entries.saturating_add(result.auto_queued_entries);
+                    auto_queue_skipped_count +=
+                        usize::from(result.auto_queue_skipped_for_subtitle_mode);
                 }
                 Err(error) => {
+                    if shutdown_started.load(Ordering::Acquire) {
+                        break;
+                    }
                     failed += 1;
                     if let Err(save_error) = store
                         .record_playlist_subscription_error(
@@ -781,11 +946,29 @@ async fn run_playlist_subscription_scheduler(
         }
         drop(check_guard);
 
+        if auto_queued_entries > 0 {
+            queue_wake.notify_one();
+        }
+
         if checked > 0 || failed > 0 {
-            let message = format!(
-                "Scheduled playlist checks: {checked} completed, {failed} failed, {new_entries} new {}. New entries wait for your review.",
+            let mut message = format!(
+                "Scheduled playlist checks: {checked} completed, {failed} failed, {new_entries} new {}.",
                 plural_word(new_entries, "entry", "entries")
             );
+            if auto_queued_entries > 0 {
+                message.push_str(&format!(
+                    " Auto-queued {auto_queued_entries} available {} using saved New Download choices and folders. Unavailable entries remain for review.",
+                    plural_word(auto_queued_entries, "entry", "entries")
+                ));
+            }
+            if auto_queue_skipped_count > 0 {
+                message.push_str(&format!(
+                    " Auto-queue was skipped for {auto_queue_skipped_count} playlist {} because subtitle-only mode does not support playlist batches; new entries remain in review.",
+                    plural_word(auto_queue_skipped_count, "subscription", "subscriptions")
+                ));
+            } else if auto_queued_entries == 0 {
+                message.push_str(" New entries wait for your review.");
+            }
             let _ = events.send(UiEvent::Status(message));
             let selected_id = review_state.lock().ok().map(|review| review.subscription_id.clone());
             if let Err(error) = refresh_playlist_subscription_view(
@@ -873,6 +1056,7 @@ pub fn run() -> Result<()> {
     runtime
         .block_on(store.backfill_legacy_download_directories(download_directory_text.clone()))?;
     let download_presets = runtime.block_on(store.load_download_presets())?;
+    let current_download_presets = Arc::new(Mutex::new(download_presets));
     let max_concurrent_downloads = runtime.block_on(store.load_max_concurrent_downloads())?;
     let max_concurrent_per_host = runtime.block_on(store.load_max_concurrent_per_host())?;
     let concurrent_fragments = runtime.block_on(store.load_concurrent_fragments())?;
@@ -888,7 +1072,8 @@ pub fn run() -> Result<()> {
     let handle = runtime.handle().clone();
     let window = MainWindow::new().context("create main window")?;
     #[cfg(windows)]
-    let (cookie_support_enabled, cookie_support_status) = cookie_webview_runtime_status();
+    let (cookie_support_enabled, cookie_support_status) =
+        cookie_login::cookie_webview_runtime_status();
     #[cfg(not(windows))]
     let (cookie_support_enabled, cookie_support_status) =
         (false, "Site sign-in is available in the Windows version.".to_owned());
@@ -952,7 +1137,7 @@ pub fn run() -> Result<()> {
     let clipboard_popup_generation = Arc::new(AtomicU64::new(0));
     let clipboard_popup_work_area = Arc::new(Mutex::new(None::<WorkArea>));
     #[cfg(windows)]
-    configure_clipboard_popup_window(&popup, clipboard_popup_work_area.clone());
+    clipboard_popup::configure_clipboard_popup_window(&popup, clipboard_popup_work_area.clone());
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let shutdown_committed = Arc::new(AtomicBool::new(false));
     let playlist_selection = Arc::new(Mutex::new(None::<PlaylistSelectionState>));
@@ -1222,7 +1407,7 @@ pub fn run() -> Result<()> {
                                     .into(),
                             );
                             #[cfg(windows)]
-                            let main_window_is_focused = main_window_has_focus(&window);
+                            let main_window_is_focused = clipboard_popup::main_window_has_focus(&window);
                             #[cfg(not(windows))]
                             let main_window_is_focused = false;
                             let popup_id = popup_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1234,10 +1419,10 @@ pub fn run() -> Result<()> {
                                 *saved_area = Some(area);
                                 if let Some(popup) = popup.upgrade() {
                                     popup.set_candidate_url(candidate.url.clone().into());
-                                    popup.set_source_host(clipboard_source_host(&candidate.url).into());
+                                    popup.set_source_host(clipboard_popup::clipboard_source_host(&candidate.url).into());
                                     popup.window().set_size(slint::LogicalSize::new(440.0, 214.0));
                                     let scale = popup.window().scale_factor();
-                                    let (x, y) = initial_popup_position(area, scale, 440, 214);
+                                    let (x, y) = clipboard_popup::initial_popup_position(area, scale, 440, 214);
                                     popup.window().set_position(slint::PhysicalPosition::new(x, y));
                                     if let Err(error) = popup.show() {
                                         error!(%error, "show clipboard review popup");
@@ -1481,7 +1666,10 @@ pub fn run() -> Result<()> {
                                 )
                             }
                         }
-                        Err(error) => format!("Could not load playlist entries: {error}"),
+                        Err(error) => {
+                            error!(start_index, end_index, %error, "load playlist entries");
+                            format!("Could not load playlist entries: {error}")
+                        }
                     };
                     let rows = playlist_entry_rows(selection);
                     let selected_count = selection.selected_count();
@@ -1504,7 +1692,7 @@ pub fn run() -> Result<()> {
     });
 
     if clipboard_monitoring_enabled {
-        match start_clipboard_monitor(
+        match clipboard_popup::start_clipboard_monitor(
             &clipboard_monitor_slot,
             &clipboard_monitor_generation,
             events_tx.clone(),
@@ -1539,7 +1727,7 @@ pub fn run() -> Result<()> {
         let weak = clipboard_request_window.clone();
         let events = clipboard_request_events.clone();
         if enabled {
-            match start_clipboard_monitor(
+            match clipboard_popup::start_clipboard_monitor(
                 &clipboard_request_slot,
                 &clipboard_request_generation,
                 events.clone(),
@@ -1579,7 +1767,7 @@ pub fn run() -> Result<()> {
             {
                 error!(%error, "hide clipboard popup after monitoring was disabled");
             }
-            match stop_clipboard_monitor(&clipboard_request_slot, &clipboard_request_generation) {
+            match clipboard_popup::stop_clipboard_monitor(&clipboard_request_slot, &clipboard_request_generation) {
                 Ok(()) => {
                     if let Some(window) = weak.upgrade() {
                         window.set_clipboard_monitoring_enabled(false);
@@ -1617,7 +1805,7 @@ pub fn run() -> Result<()> {
     });
 
     #[cfg(windows)]
-    configure_cookie_auth(CookieAuthContext {
+    cookie_login::configure_cookie_auth(CookieAuthContext {
         main_window: &window,
         login_window: &cookie_login_window,
         cookie_store: cookie_store.clone(),
@@ -1703,6 +1891,7 @@ pub fn run() -> Result<()> {
                     });
                 }
                 Err(error) => {
+                    error!(%error, "analyze media link");
                     let _ = events.send(UiEvent::Status(error.to_string()));
                 }
             }
@@ -2452,8 +2641,11 @@ pub fn run() -> Result<()> {
     let save_subscription_review = playlist_subscription_review.clone();
     let save_subscription_window = window.as_weak();
     let save_subscription_events = events_tx.clone();
+    let save_subscription_wake = queue_wake.clone();
     let save_subscription_handle = handle.clone();
     let save_subscription_shutdown = shutdown_started.clone();
+    let save_subscription_dispatch_gate = update_dispatch_gate.clone();
+    let save_subscription_presets = current_download_presets.clone();
     let save_subscription_check_active = playlist_subscription_check_active.clone();
     window.on_subscribe_playlist_requested(move || {
         if save_subscription_shutdown.load(Ordering::Acquire) {
@@ -2481,6 +2673,10 @@ pub fn run() -> Result<()> {
         let review = save_subscription_review.clone();
         let weak_window = save_subscription_window.clone();
         let events = save_subscription_events.clone();
+        let queue_wake = save_subscription_wake.clone();
+        let shutdown_started = save_subscription_shutdown.clone();
+        let dispatch_gate = save_subscription_dispatch_gate.clone();
+        let current_download_presets = save_subscription_presets.clone();
         save_subscription_handle.spawn(async move {
             let _check_guard = check_guard;
             match store.list_playlist_subscriptions().await {
@@ -2542,16 +2738,26 @@ pub fn run() -> Result<()> {
             let _ = events.send(UiEvent::Status(
                 "Saved the playlist. Checking its entries for your review…".to_owned(),
             ));
-            match perform_playlist_subscription_check(&store, &engine, &subscription_id).await {
-                Ok(new_count) => {
-                    let message = if new_count == 0 {
-                        "Playlist checked. No new entries were found.".to_owned()
-                    } else {
-                        format!("Found {new_count} new playlist {}. Review them before queueing.", plural_word(new_count, "entry", "entries"))
-                    };
-                    let _ = events.send(UiEvent::Status(message));
+            match perform_playlist_subscription_check(
+                &store,
+                &engine,
+                &subscription_id,
+                &current_download_presets,
+                &dispatch_gate,
+                &shutdown_started,
+            )
+            .await
+            {
+                Ok(result) => {
+                    let _ = events.send(UiEvent::Status(playlist_subscription_check_status(result)));
+                    if result.auto_queued_entries > 0 {
+                        queue_wake.notify_one();
+                    }
                 }
                 Err(error) => {
+                    if shutdown_started.load(Ordering::Acquire) {
+                        return;
+                    }
                     let _ = store
                         .record_playlist_subscription_error(subscription_id.clone(), error.to_string(), now())
                         .await;
@@ -2602,15 +2808,28 @@ pub fn run() -> Result<()> {
     let check_subscription_review = playlist_subscription_review.clone();
     let check_subscription_window = window.as_weak();
     let check_subscription_events = events_tx.clone();
+    let check_subscription_wake = queue_wake.clone();
     let check_subscription_handle = handle.clone();
     let check_subscription_active = playlist_subscription_check_active.clone();
+    let check_subscription_dispatch_gate = update_dispatch_gate.clone();
+    let check_subscription_shutdown = shutdown_started.clone();
+    let check_subscription_presets = current_download_presets.clone();
     window.on_playlist_subscription_check_requested(move |id| {
+        if check_subscription_shutdown.load(Ordering::Acquire) {
+            let _ = check_subscription_events
+                .send(UiEvent::Status("The application is shutting down.".to_owned()));
+            return;
+        }
         let id = id.to_string();
         let store = check_subscription_store.clone();
         let engine = check_subscription_engine.clone();
         let review = check_subscription_review.clone();
         let weak_window = check_subscription_window.clone();
         let events = check_subscription_events.clone();
+        let queue_wake = check_subscription_wake.clone();
+        let dispatch_gate = check_subscription_dispatch_gate.clone();
+        let shutdown_started = check_subscription_shutdown.clone();
+        let current_download_presets = check_subscription_presets.clone();
         let Some(check_guard) = PlaylistSubscriptionCheckGuard::start(
             &check_subscription_active,
             check_subscription_window.clone(),
@@ -2625,19 +2844,27 @@ pub fn run() -> Result<()> {
             let _check_guard = check_guard;
             let _ =
                 events.send(UiEvent::Status("Checking the playlist for new entries…".to_owned()));
-            match perform_playlist_subscription_check(&store, &engine, &id).await {
-                Ok(new_count) => {
-                    let message = if new_count == 0 {
-                        "Playlist checked. No new entries were found.".to_owned()
-                    } else {
-                        format!(
-                            "Found {new_count} new playlist {}. Review them before queueing.",
-                            plural_word(new_count, "entry", "entries")
-                        )
-                    };
-                    let _ = events.send(UiEvent::Status(message));
+            match perform_playlist_subscription_check(
+                &store,
+                &engine,
+                &id,
+                &current_download_presets,
+                &dispatch_gate,
+                &shutdown_started,
+            )
+            .await
+            {
+                Ok(result) => {
+                    let _ =
+                        events.send(UiEvent::Status(playlist_subscription_check_status(result)));
+                    if result.auto_queued_entries > 0 {
+                        queue_wake.notify_one();
+                    }
                 }
                 Err(error) => {
+                    if shutdown_started.load(Ordering::Acquire) {
+                        return;
+                    }
                     let _ = store
                         .record_playlist_subscription_error(id.clone(), error.to_string(), now())
                         .await;
@@ -2701,6 +2928,48 @@ pub fn run() -> Result<()> {
                 refresh_playlist_subscription_view(&store, &review, weak_window, Some(id)).await
             {
                 error!(%error, "refresh playlist after changing its check frequency");
+            }
+        });
+    });
+
+    let auto_queue_subscription_store = store.clone();
+    let auto_queue_subscription_review = playlist_subscription_review.clone();
+    let auto_queue_subscription_window = window.as_weak();
+    let auto_queue_subscription_events = events_tx.clone();
+    let auto_queue_subscription_handle = handle.clone();
+    window.on_playlist_subscription_auto_queue_requested(move |id, enabled| {
+        let id = id.to_string();
+        if id.is_empty() {
+            return;
+        }
+        let store = auto_queue_subscription_store.clone();
+        let review = auto_queue_subscription_review.clone();
+        let weak_window = auto_queue_subscription_window.clone();
+        let events = auto_queue_subscription_events.clone();
+        auto_queue_subscription_handle.spawn(async move {
+            match store
+                .set_playlist_subscription_auto_queue_new_entries(id.clone(), enabled)
+                .await
+            {
+                Ok(()) => {
+                    let message = if enabled {
+                        "New available entries for this playlist will be auto-queued using the current New Download choices and save folder."
+                    } else {
+                        "New entries for this playlist will wait for your review."
+                    };
+                    let _ = events.send(UiEvent::Status(message.to_owned()));
+                }
+                Err(error) => {
+                    error!(%error, subscription_id = %id, "update playlist auto-queue preference");
+                    let _ = events.send(UiEvent::Status(format!(
+                        "Could not update the playlist auto-queue setting: {error}"
+                    )));
+                }
+            }
+            if let Err(error) =
+                refresh_playlist_subscription_view(&store, &review, weak_window, Some(id)).await
+            {
+                error!(%error, "refresh playlist after changing auto-queue setting");
             }
         });
     });
@@ -2917,8 +3186,14 @@ pub fn run() -> Result<()> {
         let dispatch_gate = queue_subscription_dispatch_gate.clone();
         let shutdown = queue_subscription_shutdown.clone();
         handle.spawn(async move {
+            let playlist_title = subscription.title.clone();
+            let subscription_id = subscription.id.clone();
             let destination = match tokio::task::spawn_blocking(move || {
-                validate_download_directory(Path::new(&directory))
+                create_playlist_subscription_directory(
+                    Path::new(&directory),
+                    &playlist_title,
+                    &subscription_id,
+                )
             })
             .await
             {
@@ -2972,9 +3247,6 @@ pub fn run() -> Result<()> {
             }
             match store.queue_playlist_subscription_entries(subscription.id.clone(), items).await {
                 Ok(count) => {
-                    if let Err(error) = store.set_download_presets(presets, now()).await {
-                        error!(%error, "save new download presets after subscription queue");
-                    }
                     let _ = events.send(UiEvent::Refresh);
                     let message = if let Some(timestamp) = scheduled_at {
                         format!(
@@ -3017,15 +3289,21 @@ pub fn run() -> Result<()> {
     let scheduled_subscription_active = playlist_subscription_check_active.clone();
     let scheduled_subscription_window = window.as_weak();
     let scheduled_subscription_events = events_tx.clone();
+    let scheduled_subscription_wake = queue_wake.clone();
     let scheduled_subscription_shutdown = shutdown_started.clone();
     handle.spawn(run_playlist_subscription_scheduler(
         scheduled_subscription_store,
         scheduled_subscription_engine,
-        scheduled_subscription_review,
-        scheduled_subscription_active,
-        scheduled_subscription_window,
-        scheduled_subscription_events,
-        scheduled_subscription_shutdown,
+        PlaylistSubscriptionSchedulerState {
+            queue_wake: scheduled_subscription_wake,
+            dispatch_gate: update_dispatch_gate.clone(),
+            current_download_presets: current_download_presets.clone(),
+            review_state: scheduled_subscription_review,
+            check_active: scheduled_subscription_active,
+            weak_window: scheduled_subscription_window,
+            events: scheduled_subscription_events,
+            shutdown_started: scheduled_subscription_shutdown,
+        },
     ));
 
     window.on_enqueue_requested(move |submitted_url| {
@@ -3112,7 +3390,7 @@ pub fn run() -> Result<()> {
         };
         let inspection_url = url.clone();
         let mut record = DownloadRecord::queued(Uuid::new_v4().to_string(), url, now());
-        let download_presets = DownloadPresets::from_ui_values(
+        let mut download_presets = DownloadPresets::from_ui_values(
             audio_only,
             video_only,
             &selected_format,
@@ -3120,11 +3398,10 @@ pub fn run() -> Result<()> {
             &selected_video_quality,
         )
         .with_download_speed_limit_label(&selected_speed_limit);
-        record.download_mode = if subtitle_only {
-            DownloadMode::SubtitlesOnly
-        } else {
-            download_presets.mode
-        };
+        if subtitle_only {
+            download_presets.mode = DownloadMode::SubtitlesOnly;
+        }
+        record.download_mode = download_presets.mode;
         let selected_format_id = match selected_format_id_from_ui(
             &selected_exact_format,
             &format_choice_source_url,
@@ -3260,14 +3537,8 @@ pub fn run() -> Result<()> {
                     format!("Scheduled for {} local time.", format_local_schedule(timestamp))
                 },
             );
-            let preset_status = match store.set_download_presets(download_presets, now()).await {
-                Ok(()) => schedule_status,
-                Err(error) => {
-                    format!("{schedule_status} Could not save the New download presets: {error}")
-                }
-            };
             let _ = events.send(UiEvent::Refresh);
-            let _ = events.send(UiEvent::Status(preset_status));
+            let _ = events.send(UiEvent::Status(schedule_status));
             queue_wake.notify_one();
         });
     });
@@ -3462,7 +3733,8 @@ pub fn run() -> Result<()> {
                             &settings,
                         ));
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        error!(line = item.line_number, %error, "inspect batch media link");
                         issues.push(format!(
                             "line {}: yt-dlp could not read this media link",
                             item.line_number
@@ -3495,11 +3767,7 @@ pub fn run() -> Result<()> {
                     .send(UiEvent::Status(format!("Could not save the media link batch: {error}")));
                 return;
             }
-            let preset_save_error = store.set_download_presets(download_presets, now()).await.err();
-            let mut status = batch_result_status(queued_count, total_count, &issues, scheduled_at);
-            if let Some(error) = preset_save_error {
-                status.push_str(&format!(" New download presets could not be saved: {error}"));
-            }
+            let status = batch_result_status(queued_count, total_count, &issues, scheduled_at);
             let _ = events.send(UiEvent::Refresh);
             let _ = events.send(UiEvent::Status(status));
             queue_wake.notify_one();
@@ -3826,17 +4094,13 @@ pub fn run() -> Result<()> {
                 )));
                 return;
             }
-            let preset_save_error = store.set_download_presets(download_presets, now()).await.err();
             let _ = events.send(UiEvent::Refresh);
-            let mut status = scheduled_at.map_or_else(
+            let status = scheduled_at.map_or_else(
                 || format!("Queued {selected_count} selected playlist entries. Each item will download separately."),
                 |timestamp| {
                     format!("Scheduled {selected_count} playlist entries for {} local time.", format_local_schedule(timestamp))
                 },
             );
-            if let Some(error) = preset_save_error {
-                status.push_str(&format!(" New download presets could not be saved: {error}"));
-            }
             let _ = events.send(UiEvent::Status(status));
             queue_wake.notify_one();
         });
@@ -4140,59 +4404,60 @@ pub fn run() -> Result<()> {
         });
     });
 
-    let speed_limit_store = store.clone();
-    let speed_limit_events = events_tx.clone();
-    let speed_limit_handle = handle.clone();
-    let speed_limit_generation = Arc::new(AtomicU64::new(0));
-    let speed_limit_write_lock = Arc::new(AsyncMutex::new(()));
-    let speed_limit_window = window.as_weak();
-    window.on_download_speed_limit_requested(move |label| {
-        let bytes_per_second = download_speed_limit_from_label(&label);
-        let generation_state = speed_limit_generation.clone();
-        let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
-        let write_lock = speed_limit_write_lock.clone();
-        let store = speed_limit_store.clone();
-        let events = speed_limit_events.clone();
-        let weak_window = speed_limit_window.clone();
-        speed_limit_handle.spawn(async move {
-            let _write_guard = write_lock.lock().await;
-            if generation_state.load(Ordering::Acquire) != generation {
-                return;
+    let presets_store = store.clone();
+    let presets_events = events_tx.clone();
+    let presets_handle = handle.clone();
+    let presets_state = current_download_presets.clone();
+    let presets_generation = Arc::new(AtomicU64::new(0));
+    let presets_write_lock = Arc::new(AsyncMutex::new(()));
+    window.on_download_presets_changed(
+        move |audio_only, video_only, subtitle_only, audio_format, audio_quality, video_quality, speed_limit| {
+            let mut presets = DownloadPresets::from_ui_values(
+                audio_only,
+                video_only,
+                audio_format.as_str(),
+                audio_quality.as_str(),
+                video_quality.as_str(),
+            )
+            .with_download_speed_limit_label(speed_limit.as_str());
+            if subtitle_only {
+                presets.mode = DownloadMode::SubtitlesOnly;
             }
-            let previous = store
-                .load_download_presets()
-                .await
-                .map(|presets| presets.download_speed_limit_bytes_per_second)
-                .unwrap_or_default();
-            if generation_state.load(Ordering::Acquire) != generation {
-                return;
-            }
-            match store.set_download_speed_limit(bytes_per_second, now()).await {
-                Ok(()) => {
-                    let label = download_speed_limit_label(bytes_per_second);
-                    let _ = events.send(UiEvent::Status(if bytes_per_second == 0 {
-                        "Download speed is unlimited for new queue items.".to_owned()
-                    } else {
-                        format!("New queue items are limited to {label}.")
-                    }));
+            match presets_state.lock() {
+                Ok(mut current) => *current = presets,
+                Err(_) => {
+                    error!("current New Download choices are unavailable");
+                    return;
                 }
-                Err(error) => {
-                    error!(%error, "save download speed limit");
-                    if generation_state.load(Ordering::Acquire) == generation {
-                        let previous_value = download_speed_limit_label(previous).to_owned().into();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(window) = weak_window.upgrade() {
-                                window.set_download_speed_limit(previous_value);
-                            }
-                        });
+            }
+
+            let generation_state = presets_generation.clone();
+            let generation = generation_state.fetch_add(1, Ordering::AcqRel) + 1;
+            let write_lock = presets_write_lock.clone();
+            let state = presets_state.clone();
+            let store = presets_store.clone();
+            let events = presets_events.clone();
+            presets_handle.spawn(async move {
+                let _write_guard = write_lock.lock().await;
+                if generation_state.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let current = match state.lock() {
+                    Ok(current) => *current,
+                    Err(_) => {
+                        error!("current New Download choices are unavailable");
+                        return;
                     }
+                };
+                if let Err(error) = store.set_download_presets(current, now()).await {
+                    error!(%error, "save New Download choices");
                     let _ = events.send(UiEvent::Status(format!(
-                        "Could not save the download speed limit: {error}"
+                        "Your New Download choices are active for this session but could not be saved: {error}"
                     )));
                 }
-            }
-        });
-    });
+            });
+        },
+    );
 
     let retry_settings_store = store.clone();
     let retry_settings_events = events_tx.clone();
@@ -4857,9 +5122,9 @@ pub fn run() -> Result<()> {
         });
     });
 
-    configure_clipboard_popup(
+    clipboard_popup::configure_clipboard_popup(
         &popup,
-        ClipboardPopupContext {
+        clipboard_popup::ClipboardPopupContext {
             main_window: window.as_weak(),
             popup_window: popup.as_weak(),
             popup_generation: clipboard_popup_generation.clone(),
@@ -4867,14 +5132,16 @@ pub fn run() -> Result<()> {
         },
     );
 
-    configure_tray(
+    tray::configure_tray(
         &window,
         &tray,
-        TrayContext {
+        tray::TrayContext {
             store: store.clone(),
             handle: handle.clone(),
             events: events_tx.clone(),
             active_jobs: active_jobs.clone(),
+            subscription_check_active: playlist_subscription_check_active.clone(),
+            dispatch_gate: update_dispatch_gate.clone(),
             queue_wake: queue_wake.clone(),
             preferences: tray_preferences_state.clone(),
             shutdown_started,
@@ -4884,7 +5151,10 @@ pub fn run() -> Result<()> {
 
     info!(product = env!("YT_SAVE_PRODUCT_NAME"), "application started");
     window.run().context("run Slint event loop")?;
-    let _ = stop_clipboard_monitor(&clipboard_monitor_slot, &clipboard_monitor_generation);
+    let _ = clipboard_popup::stop_clipboard_monitor(
+        &clipboard_monitor_slot,
+        &clipboard_monitor_generation,
+    );
     runtime.shutdown_timeout(Duration::from_secs(3));
     Ok(())
 }
@@ -4899,1038 +5169,6 @@ struct CookieAuthContext<'a> {
     generation: Arc<AtomicU64>,
     login_session: Arc<AtomicU64>,
     shutdown_started: Arc<AtomicBool>,
-}
-
-#[cfg(windows)]
-fn configure_cookie_auth(context: CookieAuthContext<'_>) {
-    let CookieAuthContext {
-        main_window,
-        login_window,
-        cookie_store,
-        handle,
-        events,
-        generation,
-        login_session,
-        shutdown_started,
-    } = context;
-    main_window.on_cookie_runtime_download_requested(|| {
-        if let Err(error) = open_webview2_runtime_page() {
-            error!(%error, "open Microsoft WebView2 Runtime download page");
-        }
-    });
-
-    let webview_slot = Rc::new(RefCell::new(None::<wry::WebView>));
-    let login_url_slot = Rc::new(RefCell::new(None::<String>));
-
-    let state_store = cookie_store.clone();
-    let state_handle = handle.clone();
-    let state_events = events.clone();
-    let state_generation = generation.clone();
-    main_window.on_cookie_vault_state_requested(move |requested_url| {
-        let url = requested_url.to_string();
-        let request_generation = state_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if validate_cookie_sign_in_url(&url).is_err() {
-            let _ = state_events.send(UiEvent::CookieAuthState {
-                generation: request_generation,
-                url,
-                has_saved: Some(false),
-                message: None,
-                close_login: false,
-                login_session: None,
-                refresh_current_url: false,
-            });
-            return;
-        }
-
-        let store = state_store.clone();
-        let events = state_events.clone();
-        state_handle.spawn_blocking(move || {
-            let (has_saved, message) = match store.has_saved_for_url(&url) {
-                Ok(saved) => (saved, None),
-                Err(_) => (
-                    true,
-                    Some(
-                        "Saved sign-in data could not be read. Clear it and sign in again."
-                            .to_owned(),
-                    ),
-                ),
-            };
-            let _ = events.send(UiEvent::CookieAuthState {
-                generation: request_generation,
-                url,
-                has_saved: Some(has_saved),
-                message,
-                close_login: false,
-                login_session: None,
-                refresh_current_url: false,
-            });
-        });
-    });
-
-    let clear_store = cookie_store.clone();
-    let clear_handle = handle.clone();
-    let clear_events = events.clone();
-    let clear_generation = generation.clone();
-    main_window.on_cookie_clear_requested(move |requested_url| {
-        let url = requested_url.to_string();
-        let request_generation = clear_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if validate_cookie_sign_in_url(&url).is_err() {
-            let _ = clear_events.send(UiEvent::CookieAuthState {
-                generation: request_generation,
-                url,
-                has_saved: Some(false),
-                message: Some("Enter a secure HTTPS media URL first.".to_owned()),
-                close_login: false,
-                login_session: None,
-                refresh_current_url: false,
-            });
-            return;
-        }
-
-        let store = clear_store.clone();
-        let events = clear_events.clone();
-        let reported_url = url.clone();
-        let operation = clear_handle.spawn_blocking(move || store.clear_for_url(&url));
-        clear_handle.spawn(async move {
-            let outcome = operation.await;
-            let (has_saved, message) = match outcome {
-                Ok(Ok(_)) => (Some(false), Some("Saved sign-in removed.".to_owned())),
-                _ => {
-                    (Some(true), Some("Saved sign-in could not be removed. Try again.".to_owned()))
-                }
-            };
-            let _ = events.send(UiEvent::CookieAuthState {
-                generation: request_generation,
-                url: reported_url,
-                has_saved,
-                message,
-                close_login: false,
-                login_session: None,
-                refresh_current_url: false,
-            });
-        });
-    });
-
-    let sign_in_window = login_window.as_weak();
-    let sign_in_main = main_window.as_weak();
-    let sign_in_webview = webview_slot.clone();
-    let sign_in_url = login_url_slot.clone();
-    let sign_in_session = login_session.clone();
-    let sign_in_shutdown = shutdown_started.clone();
-    main_window.on_cookie_sign_in_requested(move |submitted_url| {
-        if sign_in_shutdown.load(Ordering::Acquire) {
-            if let Some(window) = sign_in_main.upgrade() {
-                window.set_status_message("The application is shutting down.".into());
-            }
-            return;
-        }
-        let target_url = submitted_url.to_string();
-        let (normalized_url, host) = match validate_cookie_sign_in_url(&target_url) {
-            Ok(target) => target,
-            Err(_) => {
-                if let Some(window) = sign_in_main.upgrade() {
-                    window.set_status_message(
-                        "Enter a secure HTTPS media URL before signing in.".into(),
-                    );
-                }
-                return;
-            }
-        };
-
-        if sign_in_window.upgrade().is_some_and(|login| login.get_saving()) {
-            if let Some(window) = sign_in_main.upgrade() {
-                window.set_status_message("Sign-in cookies are still being protected. Please wait.".into());
-            }
-            return;
-        }
-        sign_in_session.fetch_add(1, Ordering::AcqRel);
-
-        discard_cookie_webview(&sign_in_webview);
-        *sign_in_url.borrow_mut() = Some(normalized_url.clone());
-        let Some(login) = sign_in_window.upgrade() else {
-            return;
-        };
-        login.set_site_label(host.into());
-        login.set_login_status(
-            "Sign in on the page below, then choose Save cookies. Nothing is saved if you cancel."
-                .into(),
-        );
-        login.set_saving(false);
-        login.window().set_size(slint::LogicalSize::new(920.0, 720.0));
-        if let Err(error) = login.show() {
-            error!(%error, "show embedded sign-in window");
-            if let Some(window) = sign_in_main.upgrade() {
-                window.set_status_message("The sign-in window could not be opened.".into());
-            }
-            return;
-        }
-
-        use slint::winit_030::WinitWindowAccessor;
-        let scale = login.window().scale_factor();
-        let bounds = wry::Rect {
-            position: wry::dpi::Position::Physical(wry::dpi::PhysicalPosition::new(
-                0,
-                (108.0 * scale).round() as i32,
-            )),
-            size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
-                (920.0 * scale).round() as u32,
-                (500.0 * scale).round() as u32,
-            )),
-        };
-        let built = login.window().with_winit_window(|native_window| {
-            wry::WebViewBuilder::new()
-                .with_url(normalized_url)
-                .with_bounds(bounds)
-                .with_incognito(true)
-                .with_devtools(false)
-                .with_autoplay(false)
-                .with_navigation_handler(is_secure_web_navigation)
-                .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
-                .with_permission_handler(|_| wry::PermissionResponse::Deny)
-                .with_download_started_handler(|_, _| false)
-                .build_as_child(native_window)
-        });
-        match built {
-            Some(Ok(webview)) => {
-                *sign_in_webview.borrow_mut() = Some(webview);
-                if let Some(webview) = sign_in_webview.borrow().as_ref()
-                    && let Err(error) = webview.focus()
-                {
-                    error!(%error, "focus embedded sign-in view");
-                }
-            }
-            Some(Err(_)) | None => {
-                *sign_in_url.borrow_mut() = None;
-                let _ = login.hide();
-                if let Some(window) = sign_in_main.upgrade() {
-                    window.set_status_message(
-                        "The embedded sign-in view could not start. Check that Microsoft Edge WebView2 Runtime is installed.".into(),
-                    );
-                }
-            }
-        }
-    });
-
-    let save_login = login_window.as_weak();
-    let save_webview = webview_slot.clone();
-    let save_url = login_url_slot.clone();
-    let save_store = cookie_store.clone();
-    let save_handle = handle.clone();
-    let save_events = events.clone();
-    let save_generation = generation.clone();
-    let save_session = login_session.clone();
-    login_window.on_save_requested(move || {
-        let Some(target_url) = save_url.borrow().clone() else {
-            if let Some(login) = save_login.upgrade() {
-                login.set_login_status("Open a site before saving sign-in cookies.".into());
-            }
-            return;
-        };
-        let cookie_records = {
-            let borrowed = save_webview.borrow();
-            let Some(webview) = borrowed.as_ref() else {
-                if let Some(login) = save_login.upgrade() {
-                    login.set_login_status("The sign-in view is no longer active. Close it and try again.".into());
-                }
-                return;
-            };
-            let cookies = match webview.cookies_for_url(&target_url) {
-                Ok(cookies) => cookies,
-                Err(_) => {
-                    if let Some(login) = save_login.upgrade() {
-                        login.set_login_status("Yt Save could not read cookies for this URL. Finish sign-in and try again.".into());
-                    }
-                    return;
-                }
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
-                .unwrap_or_default();
-            cookies
-                .into_iter()
-                .filter_map(|cookie| {
-                    let domain = cookie.domain_raw()?.to_owned();
-                    let expires = cookie.expires_datetime().map(|date| date.unix_timestamp()).unwrap_or(0);
-                    if expires != 0 && expires <= now {
-                        return None;
-                    }
-                    Some(CookieRecord {
-                        domain,
-                        path: cookie.path().unwrap_or("/").to_owned(),
-                        name: cookie.name().to_owned(),
-                        value: cookie.value().to_owned(),
-                        secure: cookie.secure().unwrap_or(false),
-                        http_only: cookie.http_only().unwrap_or(false),
-                        expires,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        if cookie_records.is_empty() {
-            if let Some(login) = save_login.upgrade() {
-                login.set_login_status(
-                    "No unexpired cookies were found for this URL. Complete sign-in, then try again."
-                        .into(),
-                );
-            }
-            return;
-        }
-
-        *save_url.borrow_mut() = None;
-        discard_cookie_webview(&save_webview);
-        if let Some(login) = save_login.upgrade() {
-            login.set_saving(true);
-            login.set_login_status("Protecting your sign-in cookies with Windows DPAPI…".into());
-        }
-        let request_generation = save_generation.load(Ordering::Acquire);
-        let request_login_session = save_session.load(Ordering::Acquire);
-        let store = save_store.clone();
-        let target_for_save = target_url.clone();
-        let operation = save_handle.spawn_blocking(move || {
-            store.save_for_url(&target_for_save, &cookie_records)
-        });
-        let events = save_events.clone();
-        save_handle.spawn(async move {
-            let succeeded = matches!(operation.await, Ok(Ok(())));
-            let _ = events.send(UiEvent::CookieAuthState {
-                generation: request_generation,
-                url: target_url,
-                has_saved: Some(succeeded),
-                message: Some(if succeeded {
-                    "Saved sign-in cookies for this site. They will be used for matching HTTPS URLs.".to_owned()
-                } else {
-                    "Sign-in cookies could not be saved. Sign in again and retry.".to_owned()
-                }),
-                close_login: true,
-                login_session: Some(request_login_session),
-                refresh_current_url: true,
-            });
-        });
-    });
-
-    let cancel_webview = webview_slot.clone();
-    let cancel_url = login_url_slot.clone();
-    let cancel_login = login_window.as_weak();
-    let cancel_session = login_session.clone();
-    login_window.on_cancel_requested(move || {
-        cancel_session.fetch_add(1, Ordering::AcqRel);
-        discard_cookie_webview(&cancel_webview);
-        *cancel_url.borrow_mut() = None;
-        if let Some(login) = cancel_login.upgrade()
-            && let Err(error) = login.hide()
-        {
-            error!(%error, "cancel embedded sign-in");
-        }
-    });
-
-    let back_webview = webview_slot.clone();
-    login_window.on_back_requested(move || {
-        if let Some(webview) = back_webview.borrow().as_ref()
-            && webview.can_go_back().unwrap_or(false)
-            && let Err(error) = webview.go_back()
-        {
-            error!(%error, "navigate embedded sign-in view backward");
-        }
-    });
-
-    let forward_webview = webview_slot.clone();
-    login_window.on_forward_requested(move || {
-        if let Some(webview) = forward_webview.borrow().as_ref()
-            && webview.can_go_forward().unwrap_or(false)
-            && let Err(error) = webview.go_forward()
-        {
-            error!(%error, "navigate embedded sign-in view forward");
-        }
-    });
-
-    let reload_webview = webview_slot.clone();
-    login_window.on_reload_requested(move || {
-        if let Some(webview) = reload_webview.borrow().as_ref()
-            && let Err(error) = webview.reload()
-        {
-            error!(%error, "reload embedded sign-in view");
-        }
-    });
-
-    let close_webview = webview_slot.clone();
-    let close_url = login_url_slot.clone();
-    let close_login = login_window.as_weak();
-    let close_session = login_session.clone();
-    login_window.window().on_close_requested(move || {
-        if close_login.upgrade().is_some_and(|login| login.get_saving()) {
-            return CloseRequestResponse::KeepWindowShown;
-        }
-        close_session.fetch_add(1, Ordering::AcqRel);
-        discard_cookie_webview(&close_webview);
-        *close_url.borrow_mut() = None;
-        CloseRequestResponse::HideWindow
-    });
-}
-
-#[cfg(windows)]
-fn cookie_webview_runtime_status() -> (bool, String) {
-    match wry::webview_version() {
-        Ok(version) if supports_private_webview_runtime(&version) => (true, String::new()),
-        Ok(_) => (
-            false,
-            "Update Microsoft Edge WebView2 Runtime to enable secure site sign-in.".to_owned(),
-        ),
-        Err(_) => (
-            false,
-            "Install Microsoft Edge WebView2 Runtime to enable secure site sign-in.".to_owned(),
-        ),
-    }
-}
-
-#[cfg(windows)]
-fn supports_private_webview_runtime(version: &str) -> bool {
-    let Some(actual) = version
-        .split('.')
-        .take(4)
-        .map(str::parse::<u64>)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .ok()
-    else {
-        return false;
-    };
-    actual.len() == 4 && actual.as_slice() >= &[101, 0, 1210, 39]
-}
-
-#[cfg(windows)]
-fn open_webview2_runtime_page() -> Result<()> {
-    let mut command = Command::new("cmd.exe");
-    command.args([
-        "/C",
-        "start",
-        "",
-        "https://developer.microsoft.com/en-us/microsoft-edge/webview2/",
-    ]);
-    command.spawn().context("launch the official WebView2 Runtime page")?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn validate_cookie_sign_in_url(input: &str) -> Result<(String, String)> {
-    let url = url::Url::parse(input).context("Enter a complete secure HTTPS URL")?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        anyhow::bail!("Sign-in cookies require a secure HTTPS URL without embedded credentials");
-    }
-    let host = url
-        .host_str()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("The URL must include a website host"))?
-        .to_owned();
-    Ok((url.to_string(), host))
-}
-
-#[cfg(windows)]
-fn is_secure_web_navigation(input: String) -> bool {
-    url::Url::parse(&input).is_ok_and(|url| {
-        url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
-    })
-}
-
-#[cfg(windows)]
-fn discard_cookie_webview(slot: &Rc<RefCell<Option<wry::WebView>>>) {
-    if let Some(webview) = slot.borrow_mut().take() {
-        let _ = webview.clear_all_browsing_data();
-    }
-}
-
-#[derive(Clone)]
-struct ClipboardPopupContext {
-    main_window: slint::Weak<MainWindow>,
-    popup_window: slint::Weak<ClipboardPopup>,
-    popup_generation: Arc<AtomicU64>,
-    shutdown_started: Arc<AtomicBool>,
-}
-
-fn configure_clipboard_popup(popup: &ClipboardPopup, context: ClipboardPopupContext) {
-    let analyze_context = context.clone();
-    popup.on_analyze_requested(move |url| {
-        dismiss_clipboard_popup(&analyze_context);
-        if let Some(window) = analyze_context.main_window.upgrade() {
-            let url = url.to_string();
-            window.set_url_input(url.clone().into());
-            window.set_status_message("Reading media details…".into());
-            if let Err(error) = window.show() {
-                error!(%error, "show window to analyze copied link");
-                return;
-            }
-            window.invoke_analyze_requested(url.into());
-        }
-    });
-
-    let video_context = context.clone();
-    popup.on_add_video_requested(move |url| {
-        queue_clipboard_candidate(url.to_string(), false, video_context.clone());
-    });
-
-    let audio_context = context.clone();
-    popup.on_add_audio_requested(move |url| {
-        queue_clipboard_candidate(url.to_string(), true, audio_context.clone());
-    });
-
-    let options_context = context.clone();
-    popup.on_more_options_requested(move |url| {
-        dismiss_clipboard_popup(&options_context);
-        if let Some(window) = options_context.main_window.upgrade() {
-            window.set_url_input(url);
-            if let Err(error) = window.show() {
-                error!(%error, "show window for copied-link options");
-            }
-        }
-    });
-
-    popup.on_dismiss_requested(move || dismiss_clipboard_popup(&context));
-}
-
-fn dismiss_clipboard_popup(context: &ClipboardPopupContext) {
-    context.popup_generation.fetch_add(1, Ordering::Relaxed);
-    if let Some(window) = context.main_window.upgrade() {
-        window.set_clipboard_candidate(SharedString::default());
-    }
-    if let Some(popup) = context.popup_window.upgrade()
-        && let Err(error) = popup.hide()
-    {
-        error!(%error, "hide clipboard review popup");
-    }
-}
-
-fn queue_clipboard_candidate(url: String, audio_only: bool, context: ClipboardPopupContext) {
-    dismiss_clipboard_popup(&context);
-    if context.shutdown_started.load(Ordering::Acquire) {
-        if let Some(window) = context.main_window.upgrade() {
-            window.set_status_message("The application is shutting down.".into());
-        }
-        return;
-    }
-    let url = match validate_url(&url) {
-        Ok(url) => url,
-        Err(message) => {
-            if let Some(window) = context.main_window.upgrade() {
-                window.set_status_message(message.into());
-            }
-            return;
-        }
-    };
-
-    if let Some(window) = context.main_window.upgrade() {
-        window.set_url_input(url.clone().into());
-        window.set_audio_only(audio_only);
-        window.set_video_only(false);
-        window.set_subtitle_only(false);
-        window.set_format_choices(ModelRc::new(VecModel::from(vec![SharedString::from(
-            AUTOMATIC_FORMAT_CHOICE,
-        )])));
-        window.set_selected_format(SharedString::from(AUTOMATIC_FORMAT_CHOICE));
-        window.set_format_choice_mode(SharedString::default());
-        window.set_format_choice_source_url(SharedString::default());
-        window.set_format_choice_display_url(SharedString::default());
-        window.set_format_choice_list_truncated(false);
-        window.set_status_message("Checking the copied link before adding it to the queue…".into());
-        if let Err(error) = window.show() {
-            error!(%error, "show window to add copied link");
-            return;
-        }
-        window.invoke_enqueue_requested(url.into());
-    }
-}
-
-fn clipboard_source_host(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "Web media".to_owned())
-}
-
-fn initial_popup_position(
-    area: WorkArea,
-    scale: f32,
-    logical_width: i32,
-    logical_height: i32,
-) -> (i32, i32) {
-    let scale = scale.max(1.0);
-    let width = (logical_width as f32 * scale).round() as i32;
-    let height = (logical_height as f32 * scale).round() as i32;
-    (
-        area.right.saturating_sub(width).saturating_sub(16).max(area.left.saturating_add(16)),
-        area.bottom.saturating_sub(height).saturating_sub(16).max(area.top.saturating_add(16)),
-    )
-}
-
-#[cfg(windows)]
-fn configure_clipboard_popup_window(
-    popup: &ClipboardPopup,
-    work_area: Arc<Mutex<Option<WorkArea>>>,
-) {
-    use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
-
-    let native_style_ready = Arc::new(AtomicBool::new(false));
-    popup.window().on_winit_window_event(move |slint_window, event| {
-        if matches!(
-            event,
-            winit::event::WindowEvent::RedrawRequested
-                | winit::event::WindowEvent::Resized(_)
-                | winit::event::WindowEvent::ScaleFactorChanged { .. }
-        ) {
-            let work_area = work_area.lock().ok().and_then(|area| *area);
-            let native_style_ready = native_style_ready.clone();
-            slint_window.with_winit_window(|window| {
-                if !native_style_ready.load(Ordering::Acquire) && set_window_no_activate(window) {
-                    native_style_ready.store(true, Ordering::Release);
-                }
-
-                if let Some(area) = work_area {
-                    let size = window.inner_size();
-                    let width = i32::try_from(size.width).unwrap_or(i32::MAX);
-                    let height = i32::try_from(size.height).unwrap_or(i32::MAX);
-                    let x = area
-                        .right
-                        .saturating_sub(width)
-                        .saturating_sub(16)
-                        .max(area.left.saturating_add(16));
-                    let y = area
-                        .bottom
-                        .saturating_sub(height)
-                        .saturating_sub(16)
-                        .max(area.top.saturating_add(16));
-                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
-                }
-            });
-        }
-
-        EventResult::Propagate
-    });
-}
-
-#[cfg(windows)]
-fn main_window_has_focus(window: &MainWindow) -> bool {
-    use slint::winit_030::WinitWindowAccessor;
-    window.window().with_winit_window(|window| window.has_focus()).unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn set_window_no_activate(window: &slint::winit_030::winit::window::Window) -> bool {
-    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    };
-
-    let Ok(handle) = window.window_handle() else {
-        return false;
-    };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return false;
-    };
-    let hwnd = handle.hwnd.get() as *mut std::ffi::c_void;
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let required_style = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | required_style);
-        let updated_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if updated_style & required_style != required_style {
-            return false;
-        }
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-        ) != 0
-    }
-}
-
-fn start_clipboard_monitor(
-    slot: &Arc<Mutex<Option<ClipboardMonitor>>>,
-    generation: &AtomicU64,
-    events: mpsc::UnboundedSender<UiEvent>,
-) -> Result<()> {
-    let mut monitor_slot =
-        slot.lock().map_err(|_| anyhow::anyhow!("clipboard monitor state is unavailable"))?;
-    if monitor_slot.is_some() {
-        return Ok(());
-    }
-
-    let (monitor, candidates) = ClipboardMonitor::start()?;
-    let generation = generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    let dispatcher = std::thread::Builder::new()
-        .name("yt-save-clipboard-events".to_owned())
-        .spawn(move || {
-            while let Ok(candidate) = candidates.recv() {
-                if events.send(UiEvent::ClipboardCandidate { generation, candidate }).is_err() {
-                    break;
-                }
-            }
-        })
-        .context("start clipboard candidate dispatcher")?;
-    drop(dispatcher);
-    *monitor_slot = Some(monitor);
-    Ok(())
-}
-
-fn stop_clipboard_monitor(
-    slot: &Arc<Mutex<Option<ClipboardMonitor>>>,
-    generation: &AtomicU64,
-) -> Result<()> {
-    let mut monitor_slot =
-        slot.lock().map_err(|_| anyhow::anyhow!("clipboard monitor state is unavailable"))?;
-    generation.fetch_add(1, Ordering::Relaxed);
-    let monitor = monitor_slot.take();
-    drop(monitor_slot);
-    drop(monitor);
-    Ok(())
-}
-
-fn configure_tray(window: &MainWindow, tray: &AppTray, context: TrayContext) {
-    let TrayContext {
-        store,
-        handle,
-        events,
-        active_jobs,
-        queue_wake,
-        preferences,
-        shutdown_started,
-        shutdown_committed,
-    } = context;
-    let open_window = window.as_weak();
-    tray.on_open_requested(move || {
-        if let Some(window) = open_window.upgrade() {
-            window.window().set_minimized(false);
-            if let Err(error) = window.show() {
-                error!(%error, "show window from system tray");
-            }
-        }
-    });
-
-    let hide_window = window.as_weak();
-    tray.on_hide_requested(move || {
-        if let Some(window) = hide_window.upgrade()
-            && let Err(error) = window.hide()
-        {
-            error!(%error, "hide window to system tray");
-        }
-    });
-
-    let open_folder_window = window.as_weak();
-    tray.on_open_folder_requested(move || {
-        if let Some(window) = open_folder_window.upgrade() {
-            window.invoke_open_download_folder();
-        }
-    });
-
-    let pause_store = store.clone();
-    let pause_active_jobs = active_jobs.clone();
-    let pause_events = events.clone();
-    let pause_handle = handle.clone();
-    let pause_shutdown_guard = shutdown_started.clone();
-    tray.on_pause_all_requested(move || {
-        if pause_shutdown_guard.load(Ordering::Acquire) {
-            return;
-        }
-        let store = pause_store.clone();
-        let active_jobs = pause_active_jobs.clone();
-        let events = pause_events.clone();
-        pause_handle.spawn(async move {
-            match pause_all_downloads(&store, &active_jobs, true).await {
-                Ok((pending_count, active_count)) => {
-                    let _ = events.send(UiEvent::Refresh);
-                    let _ = events.send(UiEvent::Status(format!(
-                        "Paused {pending_count} pending item(s); requested a safe pause for {active_count} active item(s)."
-                    )));
-                }
-                Err(error) => {
-                    error!(%error, "pause all downloads from system tray");
-                    let _ = events.send(UiEvent::Status(format!("Could not pause all downloads: {error}")));
-                }
-            }
-        });
-    });
-
-    let resume_store = store.clone();
-    let resume_events = events.clone();
-    let resume_wake = queue_wake.clone();
-    let resume_handle = handle.clone();
-    let resume_shutdown_guard = shutdown_started.clone();
-    tray.on_resume_all_requested(move || {
-        if resume_shutdown_guard.load(Ordering::Acquire) {
-            return;
-        }
-        let store = resume_store.clone();
-        let events = resume_events.clone();
-        let queue_wake = resume_wake.clone();
-        resume_handle.spawn(async move {
-            match resume_all_downloads(store).await {
-                Ok(count) => {
-                    let _ = events.send(UiEvent::Refresh);
-                    let _ =
-                        events.send(UiEvent::Status(format!("Resumed {count} paused item(s).")));
-                    if count > 0 {
-                        queue_wake.notify_one();
-                    }
-                }
-                Err(error) => {
-                    error!(%error, "resume all downloads from system tray");
-                    let _ = events.send(UiEvent::Status(format!(
-                        "Could not resume paused downloads: {error}"
-                    )));
-                }
-            }
-        });
-    });
-
-    let quit_store = store.clone();
-    let quit_handle = handle.clone();
-    let quit_events = events.clone();
-    let quit_active_jobs = active_jobs.clone();
-    let quit_queue_wake = queue_wake.clone();
-    let quit_window = window.as_weak();
-    let quit_guard = shutdown_started.clone();
-    let quit_committed = shutdown_committed.clone();
-    tray.on_quit_requested(move || {
-        begin_orderly_quit(
-            quit_handle.clone(),
-            quit_store.clone(),
-            quit_active_jobs.clone(),
-            quit_queue_wake.clone(),
-            quit_events.clone(),
-            quit_window.clone(),
-            ShutdownState { started: quit_guard.clone(), committed: quit_committed.clone() },
-        );
-    });
-
-    let preferences_state = preferences.clone();
-    let preference_write_lock = Arc::new(AsyncMutex::new(()));
-    let close_preference_write_lock = preference_write_lock.clone();
-    let preference_store = store.clone();
-    let preference_handle = handle.clone();
-    let preference_events = events.clone();
-    let preference_window = window.as_weak();
-    window.on_close_to_tray_requested(move |enabled| {
-        if let Some(window) = preference_window.upgrade() {
-            window.set_close_to_tray_enabled(enabled);
-        }
-        save_tray_preference_update(
-            &preferences_state,
-            Some(enabled),
-            None,
-            close_preference_write_lock.clone(),
-            preference_store.clone(),
-            preference_handle.clone(),
-            preference_events.clone(),
-        );
-    });
-
-    let preferences_state = preferences.clone();
-    let minimize_preference_write_lock = preference_write_lock.clone();
-    let preference_store = store.clone();
-    let preference_handle = handle.clone();
-    let preference_events = events.clone();
-    let preference_window = window.as_weak();
-    window.on_minimize_to_tray_requested(move |enabled| {
-        if let Some(window) = preference_window.upgrade() {
-            window.set_minimize_to_tray_enabled(enabled);
-        }
-        save_tray_preference_update(
-            &preferences_state,
-            None,
-            Some(enabled),
-            minimize_preference_write_lock.clone(),
-            preference_store.clone(),
-            preference_handle.clone(),
-            preference_events.clone(),
-        );
-    });
-
-    let close_preferences = preferences.clone();
-    let close_store = store;
-    let close_handle = handle;
-    let close_events = events;
-    let close_active_jobs = active_jobs;
-    let close_queue_wake = queue_wake;
-    let close_window = window.as_weak();
-    let close_guard = shutdown_started;
-    let close_committed = shutdown_committed;
-    window.window().on_close_requested(move || {
-        let close_to_tray =
-            close_preferences.lock().map(|preferences| preferences.close_to_tray).unwrap_or(false);
-        if close_to_tray {
-            CloseRequestResponse::HideWindow
-        } else {
-            begin_orderly_quit(
-                close_handle.clone(),
-                close_store.clone(),
-                close_active_jobs.clone(),
-                close_queue_wake.clone(),
-                close_events.clone(),
-                close_window.clone(),
-                ShutdownState { started: close_guard.clone(), committed: close_committed.clone() },
-            );
-            CloseRequestResponse::KeepWindowShown
-        }
-    });
-}
-
-fn save_tray_preference_update(
-    state: &Arc<Mutex<TrayPreferences>>,
-    close_to_tray: Option<bool>,
-    minimize_to_tray: Option<bool>,
-    write_lock: Arc<AsyncMutex<()>>,
-    store: Store,
-    handle: tokio::runtime::Handle,
-    events: mpsc::UnboundedSender<UiEvent>,
-) {
-    match state.lock() {
-        Ok(mut preferences) => {
-            if let Some(enabled) = close_to_tray {
-                preferences.close_to_tray = enabled;
-            }
-            if let Some(enabled) = minimize_to_tray {
-                preferences.minimize_to_tray = enabled;
-            }
-        }
-        Err(_) => {
-            let _ = events.send(UiEvent::Status(
-                "Could not update tray behavior because settings state is unavailable.".to_owned(),
-            ));
-            return;
-        }
-    };
-
-    let state = state.clone();
-    handle.spawn(async move {
-        let _write_guard = write_lock.lock().await;
-        let preferences = match state.lock() {
-            Ok(preferences) => *preferences,
-            Err(_) => {
-                let _ = events.send(UiEvent::Status(
-                    "Tray behavior changed for this session but could not be saved because settings state is unavailable.".to_owned(),
-                ));
-                return;
-            }
-        };
-        if let Err(error) = store.set_tray_preferences(preferences, now()).await {
-            error!(%error, "save tray behavior preferences");
-            let _ = events.send(UiEvent::Status(format!(
-                "Tray behavior changed for this session but could not be saved: {error}"
-            )));
-        }
-    });
-}
-
-fn cancel_staged_update_helper(
-    helper_state: &Arc<Mutex<Option<crate::app_update::UpdateHelper>>>,
-) -> Result<()> {
-    let mut helper_state =
-        helper_state.lock().map_err(|_| anyhow::anyhow!("updater helper state is unavailable"))?;
-    if let Some(helper) = helper_state.as_mut() {
-        helper.cancel_and_wait()?;
-    }
-    helper_state.take();
-    Ok(())
-}
-
-fn begin_orderly_quit(
-    handle: tokio::runtime::Handle,
-    store: Store,
-    active_jobs: ActiveJobs,
-    queue_wake: Arc<Notify>,
-    events: mpsc::UnboundedSender<UiEvent>,
-    window: slint::Weak<MainWindow>,
-    shutdown: ShutdownState,
-) {
-    let shutdown_started = shutdown.started;
-    let shutdown_committed = shutdown.committed;
-    if shutdown_started.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    queue_wake.notify_one();
-    if let Some(window) = window.upgrade() {
-        window.set_status_message(
-            "Pausing queue work safely before quitting. Partial files are being preserved.".into(),
-        );
-    }
-
-    handle.spawn(async move {
-        let shutdown_result = async {
-            pause_all_downloads(&store, &active_jobs, false).await?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                let active_count = active_jobs
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("active download state is unavailable"))?
-                    .len();
-                if active_count == 0 {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "active jobs did not stop within 30 seconds; the app is still open"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-
-        match shutdown_result {
-            Ok(()) => {
-                let _ = events.send(UiEvent::Status(
-                    "Downloads are paused. The application is shutting down.".to_owned(),
-                ));
-                let quit_queue_wake = queue_wake.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window.upgrade()
-                        && let Err(error) = window.hide()
-                    {
-                        error!(%error, "hide window during orderly shutdown");
-                    }
-                    if let Err(error) = slint::quit_event_loop() {
-                        shutdown_started.store(false, Ordering::Release);
-                        shutdown_committed.store(false, Ordering::Release);
-                        quit_queue_wake.notify_one();
-                        error!(%error, "quit Slint event loop during orderly shutdown");
-                        if let Some(window) = window.upgrade() {
-                            window.set_status_message(
-                                format!("Could not finish shutting down: {error}").into(),
-                            );
-                            let _ = window.show();
-                        }
-                        return;
-                    }
-                    shutdown_committed.store(true, Ordering::Release);
-                    quit_queue_wake.notify_one();
-                });
-            }
-            Err(error) => {
-                shutdown_started.store(false, Ordering::Release);
-                shutdown_committed.store(false, Ordering::Release);
-                queue_wake.notify_one();
-                error!(%error, "orderly application shutdown");
-                let message = format!(
-                    "Could not safely quit: {error}. The window and tray remain available."
-                );
-                let _ = events.send(UiEvent::Status(message.clone()));
-                if let Err(invoke_error) = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window.upgrade() {
-                        window.window().set_minimized(false);
-                        window.set_status_message(message.into());
-                        if let Err(show_error) = window.show() {
-                            error!(%show_error, "show window after orderly shutdown failure");
-                        }
-                    }
-                }) {
-                    error!(%invoke_error, "restore window after orderly shutdown failure");
-                }
-            }
-        }
-    });
 }
 
 async fn pause_all_downloads(
@@ -7049,17 +6287,6 @@ fn playlist_group_action_label<'a>(
     }
 }
 
-#[cfg(test)]
-fn library_row_views(
-    records: &[DownloadRecord],
-    query: &str,
-    filter: &str,
-    sort: &str,
-) -> Vec<LibraryRowData> {
-    let cache = scan_library_entries(records);
-    library_row_views_from_cache(&cache, query, filter, sort)
-}
-
 fn library_cache_signature_for(records: &[DownloadRecord]) -> LibraryCacheSignature {
     records
         .iter()
@@ -7572,6 +6799,56 @@ fn validate_download_directory(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path).with_context(|| format!("resolve save folder {}", path.display()))
 }
 
+fn playlist_folder_component(title: &str, subscription_id: &str) -> String {
+    let mut component = title
+        .chars()
+        .map(|character| {
+            if character.is_control() || "<>:\"/\\|?*".contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    component =
+        component.trim().trim_matches(|character| character == '.' || character == ' ').to_owned();
+    if component.is_empty() || component == "." || component == ".." {
+        component = "Playlist".to_owned();
+    }
+    let device_name = component.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let reserved_device = matches!(device_name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (device_name.len() == 4
+            && (device_name.starts_with("COM") || device_name.starts_with("LPT"))
+            && device_name.as_bytes()[3].is_ascii_digit()
+            && device_name.as_bytes()[3] != b'0');
+    if reserved_device {
+        component.insert(0, '_');
+    }
+    let suffix = subscription_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    if suffix.is_empty() {
+        format!("{component} [playlist]")
+    } else {
+        format!("{component} [{suffix}]")
+    }
+}
+
+fn create_playlist_subscription_directory(
+    root: &Path,
+    playlist_title: &str,
+    subscription_id: &str,
+) -> Result<PathBuf> {
+    let root = validate_download_directory(root)?;
+    let destination = root.join(playlist_folder_component(playlist_title, subscription_id));
+    std::fs::create_dir_all(&destination)
+        .with_context(|| format!("create playlist folder {}", destination.display()))?;
+    validate_download_directory(&destination)
+}
+
 #[cfg(windows)]
 fn pick_download_directory() -> Result<Option<PathBuf>> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
@@ -7882,1501 +7159,4 @@ impl AppPaths {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn active_host_counts_release_on_worker_exit() {
-        let counts: ActiveHostCounts = Arc::new(Mutex::new(HashMap::new()));
-        let first = ActiveHostRegistration::register("media.example".to_owned(), counts.clone());
-        let second = ActiveHostRegistration::register("media.example".to_owned(), counts.clone());
-        let other = ActiveHostRegistration::register("other.example".to_owned(), counts.clone());
-
-        assert_eq!(active_host_counts_snapshot(&counts).get("media.example"), Some(&2));
-        assert_eq!(active_host_counts_snapshot(&counts).get("other.example"), Some(&1));
-
-        drop(first);
-        assert_eq!(active_host_counts_snapshot(&counts).get("media.example"), Some(&1));
-        drop(second);
-        drop(other);
-        assert!(active_host_counts_snapshot(&counts).is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn private_webview_gate_requires_a_runtime_with_incognito_support() {
-        assert!(supports_private_webview_runtime("101.0.1210.39"));
-        assert!(supports_private_webview_runtime("146.0.3856.59"));
-        assert!(!supports_private_webview_runtime("101.0.1210.38"));
-        assert!(!supports_private_webview_runtime("not-a-version"));
-    }
-
-    #[test]
-    fn playlist_subscription_frequency_labels_match_persisted_intervals() {
-        let choices = [
-            ("Manual", PLAYLIST_CHECK_INTERVAL_MANUAL),
-            ("Every hour", PLAYLIST_CHECK_INTERVAL_1_HOUR),
-            ("Every 6 hours", PLAYLIST_CHECK_INTERVAL_6_HOURS),
-            ("Every 12 hours", PLAYLIST_CHECK_INTERVAL_12_HOURS),
-            ("Daily", PLAYLIST_CHECK_INTERVAL_24_HOURS),
-            ("Weekly", PLAYLIST_CHECK_INTERVAL_7_DAYS),
-        ];
-
-        for (label, seconds) in choices {
-            assert_eq!(subscription_check_frequency_seconds(label), Some(seconds));
-            assert_eq!(subscription_check_frequency_label(seconds), label);
-        }
-        assert_eq!(subscription_check_frequency_seconds("Unknown"), None);
-    }
-
-    #[test]
-    fn subscription_entry_identity_falls_back_when_extractor_id_is_blank() {
-        let entries = vec![
-            PlaylistMediaEntry {
-                media_id: Some("  ".to_owned()),
-                media_url: " https://example.test/one ".to_owned(),
-                playlist_index: Some(1),
-                title: "One".to_owned(),
-                available: true,
-            },
-            PlaylistMediaEntry {
-                media_id: Some(" video-two ".to_owned()),
-                media_url: "https://example.test/two".to_owned(),
-                playlist_index: Some(2),
-                title: "Two".to_owned(),
-                available: true,
-            },
-            PlaylistMediaEntry {
-                media_id: None,
-                media_url: String::new(),
-                playlist_index: Some(3),
-                title: "Not addressable".to_owned(),
-                available: false,
-            },
-        ];
-
-        let inputs = playlist_subscription_entry_inputs(" Example ", &entries);
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0].media_key, "url:https://example.test/one");
-        assert_eq!(inputs[0].media_id, None);
-        assert_eq!(inputs[0].media_url, "https://example.test/one");
-        assert_eq!(inputs[1].media_key, "example:video-two");
-        assert_eq!(inputs[1].media_id.as_deref(), Some("video-two"));
-    }
-
-    #[test]
-    fn automatic_retry_backoff_doubles_and_caps_at_four_minutes() {
-        assert_eq!(automatic_retry_delay_secs(0), 15);
-        assert_eq!(automatic_retry_delay_secs(1), 30);
-        assert_eq!(automatic_retry_delay_secs(2), 60);
-        assert_eq!(automatic_retry_delay_secs(4), AUTO_RETRY_MAX_DELAY_SECS);
-        assert_eq!(automatic_retry_delay_secs(20), AUTO_RETRY_MAX_DELAY_SECS);
-        assert_eq!(automatic_retry_delay_secs(u32::MAX), AUTO_RETRY_MAX_DELAY_SECS);
-    }
-
-    #[test]
-    fn playlist_select_all_and_none_ignore_entries_without_indexes() {
-        let mut selection = PlaylistSelectionState {
-            request_id: 1,
-            source_url: "https://example.test/playlist".to_owned(),
-            source: "Example".to_owned(),
-            title: "Example playlist".to_owned(),
-            entries: vec![
-                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
-                PlaylistEntry { playlist_index: None, title: "Unavailable".to_owned() },
-                PlaylistEntry { playlist_index: Some(3), title: "Third".to_owned() },
-            ],
-            selected: vec![false, false, false],
-            next_page_start: 51,
-            has_more_entries: true,
-            loading_page: false,
-        };
-
-        set_playlist_selection(&mut selection, true);
-        assert_eq!(selection.selected, [true, false, true]);
-        assert_eq!(selection.selected_count(), 2);
-        assert_eq!(selection.selectable_count(), 2);
-
-        set_playlist_selection(&mut selection, false);
-        assert_eq!(selection.selected, [false, false, false]);
-        assert_eq!(selection.selected_count(), 0);
-    }
-
-    #[test]
-    fn playlist_range_selection_adds_only_available_indexes_inclusive() {
-        let mut selection = PlaylistSelectionState {
-            request_id: 1,
-            source_url: "https://example.test/playlist".to_owned(),
-            source: "Example".to_owned(),
-            title: "Example playlist".to_owned(),
-            entries: vec![
-                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
-                PlaylistEntry { playlist_index: Some(2), title: "Second".to_owned() },
-                PlaylistEntry { playlist_index: None, title: "Unavailable".to_owned() },
-                PlaylistEntry { playlist_index: Some(4), title: "Fourth".to_owned() },
-                PlaylistEntry { playlist_index: Some(5), title: "Fifth".to_owned() },
-            ],
-            selected: vec![true, false, false, false, false],
-            next_page_start: 51,
-            has_more_entries: true,
-            loading_page: false,
-        };
-
-        assert!(select_playlist_range(&mut selection, 2, 4));
-        assert_eq!(selection.selected, [true, true, false, true, false]);
-        assert!(!select_playlist_range(&mut selection, 0, 2));
-        assert!(!select_playlist_range(&mut selection, 5, 4));
-        assert!(!select_playlist_range(&mut selection, 7, 9));
-    }
-
-    #[test]
-    fn playlist_pages_keep_selection_and_ignore_duplicate_global_indexes() {
-        let mut selection = PlaylistSelectionState {
-            request_id: 7,
-            source_url: "https://example.test/playlist".to_owned(),
-            source: "Example".to_owned(),
-            title: "Example playlist".to_owned(),
-            entries: vec![
-                PlaylistEntry { playlist_index: Some(1), title: "First".to_owned() },
-                PlaylistEntry { playlist_index: Some(2), title: "Second".to_owned() },
-            ],
-            selected: vec![false, true],
-            next_page_start: 51,
-            has_more_entries: true,
-            loading_page: false,
-        };
-
-        merge_playlist_page(
-            &mut selection,
-            vec![
-                PlaylistEntry { playlist_index: Some(51), title: "Fifty first".to_owned() },
-                PlaylistEntry { playlist_index: Some(52), title: "Fifty second".to_owned() },
-            ],
-        );
-        assert!(select_playlist_range(&mut selection, 51, 52));
-        merge_playlist_page(
-            &mut selection,
-            vec![
-                PlaylistEntry { playlist_index: Some(51), title: "Duplicate page copy".to_owned() },
-                PlaylistEntry { playlist_index: Some(52), title: "Fifty second".to_owned() },
-                PlaylistEntry { playlist_index: Some(53), title: "Fifty third".to_owned() },
-            ],
-        );
-
-        assert_eq!(
-            selection.entries.iter().filter_map(|entry| entry.playlist_index).collect::<Vec<_>>(),
-            [1, 2, 51, 52, 53]
-        );
-        assert_eq!(selection.entries[2].title, "Fifty first");
-        assert_eq!(selection.selected, [false, true, true, true, false]);
-        assert_eq!(selection.selected_count(), 3);
-    }
-
-    #[tokio::test]
-    async fn orderly_shutdown_keeps_retry_waits_but_pause_all_pauses_them() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let mut retry = DownloadRecord::queued(
-            "retry-wait".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        retry.status = "Waiting for retry".to_owned();
-        retry.retry_attempts = 1;
-        retry.next_retry_at = Some(50);
-        retry.error = Some("A temporary network error interrupted the request.".to_owned());
-        store.save_download(retry).await.unwrap();
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-        assert_eq!(pause_all_downloads(&store, &active_jobs, false).await.unwrap().0, 0);
-        let waiting = store.list_downloads().await.unwrap().remove(0);
-        assert_eq!(waiting.status, "Waiting for retry");
-        assert_eq!(waiting.next_retry_at, Some(50));
-
-        assert_eq!(pause_all_downloads(&store, &active_jobs, true).await.unwrap().0, 1);
-        let paused = store.list_downloads().await.unwrap().remove(0);
-        assert_eq!(paused.status, "Paused");
-        assert_eq!(paused.next_retry_at, None);
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn scheduled_items_stay_waiting_on_shutdown_and_pause_explicitly() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let deadline = now() + 3600;
-        let mut scheduled = DownloadRecord::queued(
-            "scheduled-job".to_owned(),
-            "https://example.test/media".to_owned(),
-            now(),
-        );
-        scheduled.status = "Waiting for schedule".to_owned();
-        scheduled.scheduled_at = Some(deadline);
-        store.save_download(scheduled).await.unwrap();
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-        assert_eq!(pause_all_downloads(&store, &active_jobs, false).await.unwrap().0, 0);
-        let waiting = store.list_downloads().await.unwrap().remove(0);
-        assert_eq!(waiting.status, "Waiting for schedule");
-        assert_eq!(waiting.scheduled_at, Some(deadline));
-
-        assert_eq!(pause_all_downloads(&store, &active_jobs, true).await.unwrap().0, 1);
-        let paused = store.list_downloads().await.unwrap().remove(0);
-        assert_eq!(paused.status, "Paused");
-        assert_eq!(paused.scheduled_at, Some(deadline));
-
-        let resumed = store.resume_download("scheduled-job", now()).await.unwrap().unwrap();
-        assert_eq!(resumed.status, "Waiting for schedule");
-        assert_eq!(resumed.scheduled_at, Some(deadline));
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancel_all_cancels_pending_rows_and_signals_active_workers() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let queued = DownloadRecord::queued(
-            "queued".to_owned(),
-            "https://example.test/queued".to_owned(),
-            10,
-        );
-        let mut retry_wait = DownloadRecord::queued(
-            "retry-wait".to_owned(),
-            "https://example.test/retry".to_owned(),
-            11,
-        );
-        retry_wait.status = "Waiting for retry".to_owned();
-        let mut paused = DownloadRecord::queued(
-            "paused".to_owned(),
-            "https://example.test/paused".to_owned(),
-            12,
-        );
-        paused.status = "Paused".to_owned();
-        let mut active = DownloadRecord::queued(
-            "active".to_owned(),
-            "https://example.test/active".to_owned(),
-            13,
-        );
-        active.status = "Downloading".to_owned();
-        let mut failed = DownloadRecord::queued(
-            "failed".to_owned(),
-            "https://example.test/failed".to_owned(),
-            14,
-        );
-        failed.status = "Failed".to_owned();
-        let mut completed = DownloadRecord::queued(
-            "completed".to_owned(),
-            "https://example.test/completed".to_owned(),
-            15,
-        );
-        completed.status = "Completed".to_owned();
-        store
-            .save_downloads(vec![queued, retry_wait, paused, active, failed, completed])
-            .await
-            .unwrap();
-
-        let (active_sender, active_signal) = watch::channel(JobSignal::Continue);
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
-            "active".to_owned(),
-            Arc::new(active_sender),
-        )])));
-
-        assert_eq!(cancel_all_downloads(&store, &active_jobs).await.unwrap(), (3, 1));
-        assert_eq!(*active_signal.borrow(), JobSignal::Cancel);
-        let rows = store.list_downloads().await.unwrap();
-        for id in ["queued", "retry-wait", "paused"] {
-            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Canceled");
-        }
-        assert_eq!(rows.iter().find(|row| row.id == "active").unwrap().status, "Canceling");
-        assert_eq!(rows.iter().find(|row| row.id == "failed").unwrap().status, "Failed");
-        assert_eq!(rows.iter().find(|row| row.id == "completed").unwrap().status, "Completed");
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn retry_all_failed_requeues_only_failed_and_interrupted_rows() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let mut failed = DownloadRecord::queued(
-            "failed".to_owned(),
-            "https://example.test/failed".to_owned(),
-            10,
-        );
-        failed.status = "Failed".to_owned();
-        failed.error = Some("Temporary failure".to_owned());
-        let mut interrupted = DownloadRecord::queued(
-            "interrupted".to_owned(),
-            "https://example.test/interrupted".to_owned(),
-            11,
-        );
-        interrupted.status = "Interrupted".to_owned();
-        let mut canceled = DownloadRecord::queued(
-            "canceled".to_owned(),
-            "https://example.test/canceled".to_owned(),
-            12,
-        );
-        canceled.status = "Canceled".to_owned();
-        let mut completed = DownloadRecord::queued(
-            "completed".to_owned(),
-            "https://example.test/completed".to_owned(),
-            13,
-        );
-        completed.status = "Completed".to_owned();
-        store.save_downloads(vec![failed, interrupted, canceled, completed]).await.unwrap();
-
-        assert_eq!(retry_all_failed_downloads(&store).await.unwrap(), 2);
-        let rows = store.list_downloads().await.unwrap();
-        for id in ["failed", "interrupted"] {
-            let row = rows.iter().find(|row| row.id == id).unwrap();
-            assert_eq!(row.status, "Queued");
-            assert_eq!(row.error, None);
-        }
-        assert_eq!(rows.iter().find(|row| row.id == "canceled").unwrap().status, "Canceled");
-        assert_eq!(rows.iter().find(|row| row.id == "completed").unwrap().status, "Completed");
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[test]
-    fn dispatcher_capacity_tracks_raised_and_lowered_limits_without_stopping_workers() {
-        assert!(can_dispatch_more(1, 3));
-        assert!(!can_dispatch_more(3, 2));
-        assert!(!can_dispatch_more(2, 2));
-        assert!(can_dispatch_more(1, 2));
-        assert!(!can_dispatch_more(1, 1));
-    }
-
-    #[tokio::test]
-    async fn shutdown_worker_drain_resumes_when_shutdown_is_rolled_back() {
-        let shutdown_started = Arc::new(AtomicBool::new(true));
-        let queue_wake = Arc::new(Notify::new());
-        let mut workers = JoinSet::new();
-        workers.spawn(async { std::future::pending::<()>().await });
-
-        let rollback_shutdown = shutdown_started.clone();
-        let rollback_wake = queue_wake.clone();
-        let rollback = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            rollback_shutdown.store(false, Ordering::Release);
-            rollback_wake.notify_one();
-        });
-
-        let shutdown_committed = AtomicBool::new(false);
-        let should_exit = tokio::time::timeout(
-            Duration::from_secs(1),
-            drain_workers_during_shutdown(
-                &mut workers,
-                &queue_wake,
-                &shutdown_started,
-                &shutdown_committed,
-            ),
-        )
-        .await
-        .expect("the shutdown rollback should wake the dispatcher");
-        rollback.await.unwrap();
-
-        assert!(!should_exit);
-        assert_eq!(workers.len(), 1, "an active worker must not be discarded");
-        workers.abort_all();
-        while workers.join_next().await.is_some() {}
-    }
-
-    #[tokio::test]
-    async fn shutdown_worker_drain_waits_for_rollback_after_last_worker_finishes() {
-        let shutdown_started = Arc::new(AtomicBool::new(true));
-        let queue_wake = Arc::new(Notify::new());
-        let mut workers = JoinSet::new();
-        workers.spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
-
-        let rollback_shutdown = shutdown_started.clone();
-        let rollback_wake = queue_wake.clone();
-        let rollback = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            rollback_shutdown.store(false, Ordering::Release);
-            rollback_wake.notify_one();
-        });
-
-        let shutdown_committed = AtomicBool::new(false);
-        let should_exit = tokio::time::timeout(
-            Duration::from_secs(1),
-            drain_workers_during_shutdown(
-                &mut workers,
-                &queue_wake,
-                &shutdown_started,
-                &shutdown_committed,
-            ),
-        )
-        .await
-        .expect("the shutdown rollback should wake an empty dispatcher");
-        rollback.await.unwrap();
-        assert!(!should_exit);
-        assert!(workers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn shutdown_worker_drain_exits_after_shutdown_is_committed() {
-        let shutdown_started = AtomicBool::new(true);
-        let shutdown_committed = Arc::new(AtomicBool::new(false));
-        let queue_wake = Arc::new(Notify::new());
-        let mut workers = JoinSet::new();
-
-        let commit = shutdown_committed.clone();
-        let wake = queue_wake.clone();
-        let commit_shutdown = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            commit.store(true, Ordering::Release);
-            wake.notify_one();
-        });
-
-        let should_exit = tokio::time::timeout(
-            Duration::from_secs(1),
-            drain_workers_during_shutdown(
-                &mut workers,
-                &queue_wake,
-                &shutdown_started,
-                &shutdown_committed,
-            ),
-        )
-        .await
-        .expect("the committed shutdown should wake the dispatcher");
-        commit_shutdown.await.unwrap();
-        assert!(should_exit);
-    }
-    use crate::model::{AudioFormat, AudioQuality, VideoQuality};
-
-    #[test]
-    fn tray_summary_counts_only_active_and_paused_states() {
-        assert!(is_active_status("Analyzing"));
-        assert!(is_active_status("Downloading"));
-        assert!(is_active_status("Post-processing"));
-        assert!(is_active_status("Pausing"));
-        assert!(is_active_status("Canceling"));
-        assert!(!is_active_status("Queued"));
-        assert!(!is_active_status("Paused"));
-        assert!(!is_active_status("Completed"));
-        assert_eq!(tray_tooltip(0, 0), "Yt Save");
-        assert_eq!(tray_tooltip(1, 2), "Yt Save — 1 active, 2 paused");
-    }
-
-    #[test]
-    fn queue_action_state_enables_only_actions_with_matching_rows() {
-        assert_eq!(queue_action_state(&[]), QueueActionState::default());
-
-        let mut queued = DownloadRecord::queued(
-            "queued".to_owned(),
-            "https://example.test/queued".to_owned(),
-            10,
-        );
-        let mut paused = DownloadRecord::queued(
-            "paused".to_owned(),
-            "https://example.test/paused".to_owned(),
-            11,
-        );
-        paused.status = "Paused".to_owned();
-        let mut failed = DownloadRecord::queued(
-            "failed".to_owned(),
-            "https://example.test/failed".to_owned(),
-            12,
-        );
-        failed.status = "Failed".to_owned();
-
-        assert_eq!(
-            queue_action_state(&[queued.clone(), paused.clone(), failed.clone()]),
-            QueueActionState {
-                can_pause_all: true,
-                can_resume_all: true,
-                can_cancel_all: true,
-                can_retry_failed: true,
-            }
-        );
-
-        queued.status = "Completed".to_owned();
-        paused.status = "Completed".to_owned();
-        failed.status = "Canceled".to_owned();
-        assert_eq!(queue_action_state(&[queued, paused, failed]), QueueActionState::default());
-    }
-
-    #[test]
-    fn queue_rows_show_execution_positions_and_only_report_known_remaining_sizes() {
-        let mut first =
-            DownloadRecord::queued("first".to_owned(), "https://example.test/first".to_owned(), 10);
-        first.total_bytes = Some(1_000);
-        first.downloaded_bytes = Some(200);
-        let mut paused = DownloadRecord::queued(
-            "paused".to_owned(),
-            "https://example.test/paused".to_owned(),
-            11,
-        );
-        paused.status = "Paused".to_owned();
-        let second = DownloadRecord::queued(
-            "second".to_owned(),
-            "https://example.test/second".to_owned(),
-            12,
-        );
-
-        let rows = row_views(&[first.clone(), paused.clone(), second.clone()]);
-        assert_eq!(rows[0].queue_position.as_str(), "#1");
-        assert_eq!(rows[1].queue_position.as_str(), "Paused");
-        assert_eq!(rows[2].queue_position.as_str(), "#2");
-        assert_eq!(
-            queue_summary_text(&[first, paused, second]),
-            "2 queued · 1 paused · 800.0 B known; 2 sizes unknown"
-        );
-        assert_eq!(queue_summary_text(&[]), "No pending work");
-    }
-
-    #[test]
-    fn history_search_is_case_insensitive_and_preserves_full_queue_positions() {
-        let first =
-            DownloadRecord::queued("first".to_owned(), "https://example.test/first".to_owned(), 10);
-        let mut second = DownloadRecord::queued(
-            "second".to_owned(),
-            "https://media.example.test/featured".to_owned(),
-            11,
-        );
-        second.title = "Featured clip".to_owned();
-        second.source = "Example Site".to_owned();
-
-        let rows = row_views_filtered(&[first, second], "MEDIA.EXAMPLE.TEST");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id.as_str(), "second");
-        assert_eq!(rows[0].url.as_str(), "https://media.example.test/featured");
-        assert_eq!(rows[0].queue_position.as_str(), "#2");
-        assert!(row_views_filtered(&[], "no match").is_empty());
-    }
-
-    #[test]
-    fn media_library_filters_real_files_and_surfaces_missing_paths() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let video_path = temp_dir.join("tutorial.mp4");
-        let audio_path = temp_dir.join("track.mp3");
-        let subtitle_path = temp_dir.join("captions.srt");
-        std::fs::write(&video_path, b"video-bytes").unwrap();
-        std::fs::write(&audio_path, b"audio").unwrap();
-        std::fs::write(&subtitle_path, b"subs").unwrap();
-
-        let mut video = DownloadRecord::queued(
-            "video".to_owned(),
-            "https://video.example/watch/1".to_owned(),
-            10,
-        );
-        video.title = "Rust tutorial".to_owned();
-        video.source = "Video Example".to_owned();
-        video.status = "Completed".to_owned();
-        video.output_path = Some(video_path.to_string_lossy().into_owned());
-        video.updated_at = 20;
-
-        let mut audio = DownloadRecord::queued(
-            "audio".to_owned(),
-            "https://audio.example/track/2".to_owned(),
-            11,
-        );
-        audio.title = "Quiet track".to_owned();
-        audio.source = "Audio Example".to_owned();
-        audio.status = "Completed".to_owned();
-        audio.download_mode = DownloadMode::AudioOnly;
-        audio.output_path = Some(audio_path.to_string_lossy().into_owned());
-        audio.updated_at = 10;
-
-        let mut subtitles = DownloadRecord::queued(
-            "subtitles".to_owned(),
-            "https://video.example/watch/4".to_owned(),
-            12,
-        );
-        subtitles.title = "English captions".to_owned();
-        subtitles.source = "Video Example".to_owned();
-        subtitles.status = "Completed".to_owned();
-        subtitles.download_mode = DownloadMode::SubtitlesOnly;
-        subtitles.output_path = Some(subtitle_path.to_string_lossy().into_owned());
-        subtitles.updated_at = 15;
-
-        let mut missing = DownloadRecord::queued(
-            "missing".to_owned(),
-            "https://video.example/watch/3".to_owned(),
-            12,
-        );
-        missing.title = "Moved tutorial".to_owned();
-        missing.status = "Completed".to_owned();
-        missing.output_path = Some(temp_dir.join("moved.mp4").to_string_lossy().into_owned());
-        missing.updated_at = 30;
-
-        let records = [video, audio, subtitles, missing];
-        let all = library_row_views(&records, "", "All files", "Newest first");
-        assert_eq!(all.len(), 4);
-        assert_eq!(all[0].id.as_str(), "missing");
-        assert!(!all[0].path_available);
-        assert_eq!(all[0].file_status.as_str(), "Unavailable · locate moved file");
-        assert_eq!(all[1].id.as_str(), "video");
-        assert!(all[1].path_available);
-        assert!(all[1].size_label.as_str().contains("on disk"));
-        assert_eq!(all[2].id.as_str(), "subtitles");
-        assert_eq!(all[2].kind.as_str(), "Subtitles");
-
-        let audio_only = library_row_views(&records, "audio.example", "Audio", "Title A–Z");
-        assert_eq!(audio_only.len(), 1);
-        assert_eq!(audio_only[0].id.as_str(), "audio");
-        let subtitle_only = library_row_views(&records, "", "Subtitles", "Newest first");
-        assert_eq!(subtitle_only.len(), 1);
-        assert_eq!(subtitle_only[0].id.as_str(), "subtitles");
-        let missing_only = library_row_views(&records, "", "Missing files", "Newest first");
-        assert_eq!(missing_only.len(), 1);
-        assert_eq!(missing_only[0].id.as_str(), "missing");
-
-        let largest_first = library_row_views(&records, "", "All files", "Largest first");
-        assert_eq!(largest_first[0].id.as_str(), "video");
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[test]
-    fn library_relink_accepts_media_extensions_and_rejects_unrelated_files() {
-        assert!(has_supported_media_extension(Path::new("lesson.MP4")));
-        assert!(has_supported_media_extension(Path::new("recording.opus")));
-        assert!(has_supported_media_extension(Path::new("captions.SRT")));
-        assert!(has_supported_media_extension(Path::new("captions.vtt")));
-        assert!(!has_supported_media_extension(Path::new("notes.txt")));
-        assert!(!has_supported_media_extension(Path::new("extensionless")));
-    }
-
-    #[test]
-    fn library_cache_signature_ignores_queue_progress_but_tracks_completed_paths() {
-        let mut completed = DownloadRecord::queued(
-            "completed".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        completed.status = "Completed".to_owned();
-        completed.output_path = Some("C:/Media/old.mp4".to_owned());
-        let mut queued = DownloadRecord::queued(
-            "queued".to_owned(),
-            "https://example.test/queued".to_owned(),
-            11,
-        );
-        let baseline = library_cache_signature_for(&[completed.clone(), queued.clone()]);
-
-        queued.progress = 0.5;
-        completed.progress = 1.0;
-        assert_eq!(baseline, library_cache_signature_for(&[completed.clone(), queued.clone()]));
-
-        completed.output_path = Some("C:/Media/moved.mp4".to_owned());
-        assert_ne!(baseline, library_cache_signature_for(&[completed.clone(), queued.clone()]));
-        completed.status = "Failed".to_owned();
-        assert_ne!(baseline, library_cache_signature_for(&[completed, queued]));
-    }
-
-    #[test]
-    fn download_destination_must_be_an_existing_directory_and_is_canonicalized() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let selected = temp_dir.join("selected");
-        std::fs::create_dir_all(&selected).unwrap();
-        let file = temp_dir.join("not-a-folder");
-        std::fs::write(&file, b"x").unwrap();
-
-        assert_eq!(
-            validate_download_directory(&selected).unwrap(),
-            selected.canonicalize().unwrap()
-        );
-        assert!(validate_download_directory(&file).is_err());
-        assert!(validate_download_directory(&temp_dir.join("missing")).is_err());
-        assert!(validate_download_directory(Path::new("")).is_err());
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[test]
-    fn row_view_shows_terminal_error_before_saved_progress() {
-        let mut record = DownloadRecord::queued(
-            "canceling".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        record.status = "Failed".to_owned();
-        record.error = Some(
-            "Check that no media process is still using the partial file before retrying."
-                .to_owned(),
-        );
-        record.downloaded_bytes = Some(22);
-        record.total_bytes = Some(100);
-
-        let row = row_view_with_queue_position(&record, "", "", "");
-        assert!(row.detail.as_str().contains(record.error.as_deref().unwrap()));
-        assert!(row.detail.as_str().starts_with("Video · "));
-    }
-
-    #[test]
-    fn playlist_group_controls_reflect_all_members_and_survive_queue_filtering() {
-        let group_id = "playlist-group";
-        let mut queued = DownloadRecord::queued(
-            "queued-entry".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            10,
-        );
-        queued.title = "First entry".to_owned();
-        queued.status = "Queued".to_owned();
-        queued.playlist_group_id = Some(group_id.to_owned());
-        queued.playlist_group_title = Some("Example playlist".to_owned());
-        let mut paused = DownloadRecord::queued(
-            "paused-entry".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            11,
-        );
-        paused.title = "Second entry".to_owned();
-        paused.status = "Paused".to_owned();
-        paused.playlist_group_id = Some(group_id.to_owned());
-        paused.playlist_group_title = Some("Example playlist".to_owned());
-
-        let rows = row_views_filtered(&[queued.clone(), paused.clone()], "Second entry");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].playlist_group_id.as_str(), group_id);
-        assert_eq!(rows[0].playlist_group_action.as_str(), "Pause group");
-        assert!(rows[0].detail.as_str().contains("Playlist · Example playlist"));
-
-        queued.status = "Completed".to_owned();
-        let rows = row_views_filtered(&[queued.clone(), paused.clone()], "Second entry");
-        assert_eq!(rows[0].playlist_group_action.as_str(), "Resume group");
-
-        paused.status = "Completed".to_owned();
-        let rows = row_views_filtered(&[queued, paused], "Second entry");
-        assert!(rows[0].playlist_group_action.is_empty());
-        assert!(rows[0].playlist_group_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn playlist_group_pause_and_resume_transitions_waiting_items_and_signals_active_jobs() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let mut queued = DownloadRecord::queued(
-            "group-queued".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            10,
-        );
-        queued.playlist_group_id = Some("group-1".to_owned());
-        let mut retry = DownloadRecord::queued(
-            "group-retry".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            11,
-        );
-        retry.status = "Waiting for retry".to_owned();
-        retry.playlist_group_id = Some("group-1".to_owned());
-        let mut active = DownloadRecord::queued(
-            "group-active".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            12,
-        );
-        active.status = "Downloading".to_owned();
-        active.playlist_group_id = Some("group-1".to_owned());
-        let unrelated = DownloadRecord::queued(
-            "other-queued".to_owned(),
-            "https://example.test/other".to_owned(),
-            13,
-        );
-        store.save_downloads(vec![queued, retry, active, unrelated]).await.unwrap();
-
-        let (active_sender, active_signal) = watch::channel(JobSignal::Continue);
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
-            "group-active".to_owned(),
-            Arc::new(active_sender),
-        )])));
-        assert_eq!(pause_playlist_group(&store, &active_jobs, "group-1").await.unwrap(), (2, 1));
-        assert_eq!(*active_signal.borrow(), JobSignal::Pause);
-
-        let rows = store.list_downloads().await.unwrap();
-        for id in ["group-queued", "group-retry"] {
-            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Paused");
-        }
-        assert_eq!(rows.iter().find(|row| row.id == "group-active").unwrap().status, "Pausing");
-        assert_eq!(rows.iter().find(|row| row.id == "other-queued").unwrap().status, "Queued");
-
-        assert_eq!(resume_playlist_group(&store, "group-1").await.unwrap(), 2);
-        let rows = store.list_downloads().await.unwrap();
-        for id in ["group-queued", "group-retry"] {
-            assert_eq!(rows.iter().find(|row| row.id == id).unwrap().status, "Queued");
-        }
-        assert_eq!(rows.iter().find(|row| row.id == "group-active").unwrap().status, "Pausing");
-        assert_eq!(rows.iter().find(|row| row.id == "other-queued").unwrap().status, "Queued");
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn queue_worker_downloads_fixture_and_persists_completed_media() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-e2e-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let fixture_source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("fake_yt_dlp.rs");
-        let fake_yt_dlp = temp_dir.join("yt-dlp.exe");
-        let compilation = Command::new("rustc")
-            .arg("--edition=2024")
-            .arg(&fixture_source)
-            .arg("-o")
-            .arg(&fake_yt_dlp)
-            .output()
-            .expect("launch rustc for the deterministic yt-dlp fixture");
-        assert!(
-            compilation.status.success(),
-            "could not compile fake yt-dlp: {}",
-            String::from_utf8_lossy(&compilation.stderr)
-        );
-
-        let output_directory = temp_dir.join("downloads");
-        std::fs::create_dir_all(&output_directory).unwrap();
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let mut queued = DownloadRecord::queued(
-            "fixture-job".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        queued.download_directory = output_directory.to_string_lossy().into_owned();
-        store.save_download(queued).await.unwrap();
-        let active = store
-            .claim_queued_download_if_next("fixture-job", 11)
-            .await
-            .unwrap()
-            .expect("fixture job should be claimed");
-
-        let (signal_sender, signal_receiver) = watch::channel(JobSignal::Continue);
-        let signal_sender = Arc::new(signal_sender);
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
-            active.id.clone(),
-            signal_sender.clone(),
-        )])));
-        let registration = ActiveJobRegistration {
-            id: active.id.clone(),
-            jobs: active_jobs,
-            sender: signal_sender,
-        };
-        std::fs::write(temp_dir.join("ffmpeg.exe"), b"fixture ffmpeg placeholder").unwrap();
-        let dependencies = DependencyPaths {
-            directory: temp_dir.clone(),
-            yt_dlp: fake_yt_dlp.clone(),
-            deno: temp_dir.join("deno.exe"),
-            ffmpeg: temp_dir.join("ffmpeg.exe"),
-            ffprobe: temp_dir.join("ffprobe.exe"),
-        };
-        let engine = DownloadEngine::new(dependencies, output_directory.clone());
-        let (events, _receiver) = mpsc::unbounded_channel();
-        run_download_job(active, store.clone(), engine, events, signal_receiver, registration)
-            .await;
-
-        let completed = store
-            .list_downloads()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|record| record.id == "fixture-job")
-            .unwrap();
-        let expected_path = output_directory.join("Fixture media [fixture-123].mp4");
-        assert_eq!(completed.status, "Completed");
-        assert_eq!(completed.title, "Fixture media");
-        assert_eq!(completed.source, "Fixture");
-        assert_eq!(completed.progress, 100.0);
-        assert_eq!(completed.output_path.as_deref(), Some(expected_path.to_str().unwrap()));
-        assert_eq!(std::fs::read(expected_path).unwrap(), b"tiny deterministic media fixture");
-
-        let mut subtitle_queued = DownloadRecord::queued(
-            "fixture-subtitle-job".to_owned(),
-            "https://example.test/media-with-captions".to_owned(),
-            12,
-        );
-        subtitle_queued.download_directory = output_directory.to_string_lossy().into_owned();
-        subtitle_queued.download_mode = DownloadMode::SubtitlesOnly;
-        subtitle_queued.subtitle_languages = "en".to_owned();
-        subtitle_queued.subtitle_format = SubtitleFormat::Srt;
-        subtitle_queued.include_auto_subtitles = true;
-        store.save_download(subtitle_queued).await.unwrap();
-        let subtitle_active = store
-            .claim_queued_download_if_next("fixture-subtitle-job", 13)
-            .await
-            .unwrap()
-            .expect("subtitle fixture job should be claimed");
-        let (subtitle_sender, subtitle_receiver) = watch::channel(JobSignal::Continue);
-        let subtitle_sender = Arc::new(subtitle_sender);
-        let subtitle_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
-            subtitle_active.id.clone(),
-            subtitle_sender.clone(),
-        )])));
-        let subtitle_registration = ActiveJobRegistration {
-            id: subtitle_active.id.clone(),
-            jobs: subtitle_jobs,
-            sender: subtitle_sender,
-        };
-        let subtitle_dependencies = DependencyPaths {
-            directory: temp_dir.clone(),
-            yt_dlp: fake_yt_dlp,
-            deno: temp_dir.join("deno.exe"),
-            ffmpeg: temp_dir.join("ffmpeg.exe"),
-            ffprobe: temp_dir.join("ffprobe.exe"),
-        };
-        let subtitle_engine = DownloadEngine::new(subtitle_dependencies, output_directory.clone());
-        let (subtitle_events, _subtitle_event_receiver) = mpsc::unbounded_channel();
-        run_download_job(
-            subtitle_active,
-            store.clone(),
-            subtitle_engine,
-            subtitle_events,
-            subtitle_receiver,
-            subtitle_registration,
-        )
-        .await;
-
-        let subtitle_completed = store
-            .list_downloads()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|record| record.id == "fixture-subtitle-job")
-            .unwrap();
-        let expected_subtitle_path = output_directory.join("Fixture media [fixture-123].en.srt");
-        assert_eq!(subtitle_completed.status, "Completed");
-        assert_eq!(subtitle_completed.download_mode, DownloadMode::SubtitlesOnly);
-        assert_eq!(subtitle_completed.subtitle_languages, "en");
-        assert_eq!(subtitle_completed.subtitle_format, SubtitleFormat::Srt);
-        assert!(subtitle_completed.include_auto_subtitles);
-        assert_eq!(
-            subtitle_completed.output_path.as_deref(),
-            Some(expected_subtitle_path.to_str().unwrap())
-        );
-        assert_eq!(
-            std::fs::read(expected_subtitle_path).unwrap(),
-            b"1\n00:00:00,000 --> 00:00:01,000\nfixture subtitle\n"
-        );
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires packaged Windows media tools and live YouTube access"]
-    async fn packaged_yt_dlp_deno_ffmpeg_complete_a_youtube_queue_job() {
-        let package_bin = std::env::var_os("YT_SAVE_DEPENDENCY_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("..")
-                    .join("target")
-                    .join("package")
-                    .join("bin")
-            })
-            .canonicalize()
-            .expect("build package dependencies or set YT_SAVE_DEPENDENCY_DIR before running this acceptance test");
-        for dependency in ["yt-dlp.exe", "deno.exe", "ffmpeg.exe", "ffprobe.exe"] {
-            assert!(
-                package_bin.join(dependency).is_file(),
-                "packaged dependency is missing: {}",
-                package_bin.join(dependency).display()
-            );
-        }
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-live-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let output_directory = temp_dir.join("downloads");
-        std::fs::create_dir_all(&output_directory).unwrap();
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let mut queued = DownloadRecord::queued(
-            "youtube-live-job".to_owned(),
-            "https://www.youtube.com/watch?v=jNQXAC9IVRw".to_owned(),
-            now(),
-        );
-        queued.download_directory = output_directory.to_string_lossy().into_owned();
-        queued.video_quality = crate::model::VideoQuality::Lowest;
-        store.save_download(queued).await.unwrap();
-        let active = store
-            .claim_queued_download_if_next("youtube-live-job", now())
-            .await
-            .unwrap()
-            .expect("YouTube queue job should be claimed");
-
-        let (signal_sender, signal_receiver) = watch::channel(JobSignal::Continue);
-        let signal_sender = Arc::new(signal_sender);
-        let active_jobs: ActiveJobs = Arc::new(Mutex::new(std::collections::HashMap::from([(
-            active.id.clone(),
-            signal_sender.clone(),
-        )])));
-        let registration = ActiveJobRegistration {
-            id: active.id.clone(),
-            jobs: active_jobs,
-            sender: signal_sender,
-        };
-        let dependencies = DependencyPaths {
-            directory: package_bin.clone(),
-            yt_dlp: package_bin.join("yt-dlp.exe"),
-            deno: package_bin.join("deno.exe"),
-            ffmpeg: package_bin.join("ffmpeg.exe"),
-            ffprobe: package_bin.join("ffprobe.exe"),
-        };
-        let engine = DownloadEngine::new(dependencies, output_directory);
-        let (events, _receiver) = mpsc::unbounded_channel();
-        run_download_job(active, store.clone(), engine, events, signal_receiver, registration)
-            .await;
-
-        let completed = store
-            .list_downloads()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|record| record.id == "youtube-live-job")
-            .unwrap();
-        assert_eq!(completed.status, "Completed", "{:?}", completed.error);
-        assert!(completed.title.contains("zoo"), "unexpected title: {}", completed.title);
-        let output_path = PathBuf::from(completed.output_path.as_deref().unwrap());
-        assert!(output_path.is_file(), "missing downloaded file: {}", output_path.display());
-        assert!(std::fs::metadata(&output_path).unwrap().len() > 0);
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-
-    #[test]
-    fn retry_wait_has_a_visible_deadline_and_counts_as_pending_work() {
-        let mut record = DownloadRecord::queued(
-            "retrying".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        record.status = "Waiting for retry".to_owned();
-        record.retry_attempts = 2;
-        record.next_retry_at = Some(1_700_000_000);
-        record.error = Some("A temporary network issue interrupted this media request.".to_owned());
-
-        let row = row_view_with_queue_position(&record, "Retry", "", "");
-        assert_eq!(row.status.as_str(), "Waiting for retry");
-        assert_eq!(row.queue_position.as_str(), "Retry");
-        assert!(row.detail.as_str().contains("Retry 2 scheduled for"));
-        assert!(queue_summary_text(&[record]).contains("1 waiting for retry"));
-    }
-
-    #[test]
-    fn local_schedule_requires_a_valid_future_time() {
-        let current_timestamp = now();
-        let future_local = (chrono::Local::now() + chrono::Duration::hours(4))
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
-        let scheduled_at = parse_local_schedule(&future_local, current_timestamp).unwrap();
-        assert!(scheduled_at > current_timestamp);
-        assert!(parse_local_schedule("next Tuesday", current_timestamp).is_err());
-
-        let past_local = (chrono::Local::now() - chrono::Duration::hours(4))
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
-        assert!(parse_local_schedule(&past_local, current_timestamp).is_err());
-    }
-
-    #[test]
-    fn scheduled_queue_rows_show_local_start_time_and_bulk_actions() {
-        let mut record = DownloadRecord::queued(
-            "scheduled".to_owned(),
-            "https://example.test/media".to_owned(),
-            now(),
-        );
-        record.title = "Example media title".to_owned();
-        record.status = "Waiting for schedule".to_owned();
-        record.scheduled_at = Some(now() + 3600);
-
-        let row = row_view_with_queue_position(&record, "Scheduled", "", "");
-        assert_eq!(row.title.as_str(), "Example media title");
-        assert_eq!(row.status.as_str(), "Waiting for schedule");
-        assert_eq!(row.queue_position.as_str(), "Scheduled");
-        assert!(row.detail.as_str().contains("local time"));
-        assert!(row.detail.as_str().contains("app must be running"));
-        assert!(queue_summary_text(&[record.clone()]).contains("1 scheduled"));
-        let actions = queue_action_state(&[record.clone()]);
-        assert!(actions.can_pause_all);
-        assert!(actions.can_cancel_all);
-        record.status = "Paused".to_owned();
-        let paused_row = row_view_with_queue_position(&record, "Paused", "", "");
-        assert!(paused_row.detail.as_str().contains("Paused · planned for"));
-        assert!(paused_row.detail.as_str().contains("resume manually"));
-        assert!(!paused_row.detail.as_str().contains("Resumes"));
-    }
-
-    #[test]
-    fn row_view_labels_audio_output_and_video_only_selection() {
-        let mut record = DownloadRecord::queued(
-            "audio-job".to_owned(),
-            "https://example.test/media".to_owned(),
-            10,
-        );
-        record.download_mode = DownloadMode::AudioOnly;
-        record.audio_format = AudioFormat::Mp3;
-
-        let row = row_view_with_queue_position(&record, "", "", "");
-
-        assert!(row.detail.as_str().starts_with("Audio · MP3 · Best · "));
-
-        let mut video = DownloadRecord::queued(
-            "video-only-job".to_owned(),
-            "https://example.test/video".to_owned(),
-            11,
-        );
-        video.download_mode = DownloadMode::VideoOnly;
-        video.video_quality = crate::model::VideoQuality::P720;
-        video.selected_format_id = Some("video-137".to_owned());
-        let row = row_view_with_queue_position(&video, "", "", "");
-        assert!(row.detail.as_str().starts_with("Video only · Format video-137 · "));
-    }
-
-    #[test]
-    fn format_choices_include_only_formats_compatible_with_the_analyzed_mode() {
-        let value: serde_json::Value = serde_json::from_str(
-            r#"{"id":"sample","formats":[{"format_id":"av","ext":"mp4","vcodec":"avc1","acodec":"none"},{"format_id":"aa","ext":"m4a","vcodec":"none","acodec":"aac"},{"format_id":"muxed","ext":"mp4","vcodec":"avc1","acodec":"aac"}]}"#,
-        )
-        .unwrap();
-        let metadata = MediaMetadata::from_yt_dlp_json_for_playlist_item(
-            &value,
-            "https://example.test/watch",
-            None,
-        );
-        let video_only = media_format_choice_labels(&metadata.formats, DownloadMode::VideoOnly);
-        let video = media_format_choice_labels(&metadata.formats, DownloadMode::Video);
-        let audio = media_format_choice_labels(&metadata.formats, DownloadMode::AudioOnly);
-
-        assert_eq!(video_only.len(), 2);
-        assert!(video_only[0].as_str().starts_with("Automatic"));
-        assert!(video_only[1].as_str().starts_with("av · "));
-        assert_eq!(video.len(), 2);
-        assert!(video[1].as_str().starts_with("muxed · "));
-        assert_eq!(audio.len(), 2);
-        assert!(audio[1].as_str().starts_with("aa · "));
-    }
-
-    #[test]
-    fn exact_format_queue_choice_requires_the_current_url_and_mode() {
-        let selection = "137 · mp4 · 1080p · video only · avc1";
-        assert_eq!(
-            selected_format_id_from_ui(
-                selection,
-                "https://example.test/watch",
-                "video_only",
-                "https://example.test/watch",
-                DownloadMode::VideoOnly,
-            )
-            .unwrap()
-            .as_deref(),
-            Some("137")
-        );
-        assert!(
-            selected_format_id_from_ui(
-                selection,
-                "https://example.test/old",
-                "video_only",
-                "https://example.test/watch",
-                DownloadMode::VideoOnly,
-            )
-            .is_err()
-        );
-        assert!(
-            selected_format_id_from_ui(
-                selection,
-                "https://example.test/watch",
-                "video",
-                "https://example.test/watch",
-                DownloadMode::VideoOnly,
-            )
-            .is_err()
-        );
-        assert!(
-            selected_format_id_from_ui(
-                "137/140 · combined",
-                "https://example.test/watch",
-                "video",
-                "https://example.test/watch",
-                DownloadMode::Video,
-            )
-            .is_err()
-        );
-        assert_eq!(
-            selected_format_id_from_ui(
-                AUTOMATIC_FORMAT_CHOICE,
-                "https://example.test/old",
-                "audio",
-                "https://example.test/watch",
-                DownloadMode::Video,
-            )
-            .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn exact_format_menu_exposes_all_parsed_choices_up_to_the_display_cap() {
-        let formats = (0..120)
-            .map(|index| MediaFormatOption {
-                id: format!("video-{index}"),
-                extension: "mp4".to_owned(),
-                width: Some(1920),
-                height: Some(1080),
-                fps: None,
-                size_bytes: None,
-                size_is_estimate: false,
-                video_codec: Some("avc1".to_owned()),
-                audio_codec: None,
-            })
-            .collect::<Vec<_>>();
-
-        let choices = media_format_choice_labels(&formats, DownloadMode::VideoOnly);
-
-        assert_eq!(choices.len(), 101);
-        assert!(choices[100].as_str().starts_with("video-99 · "));
-    }
-
-    #[test]
-    fn accepts_http_urls_without_restricting_sites() {
-        assert_eq!(
-            validate_url(" https://peertube.example/videos/watch/abc ").unwrap(),
-            "https://peertube.example/videos/watch/abc"
-        );
-        assert_eq!(
-            validate_url("https://www.youtube.com/watch?v=abc").unwrap(),
-            "https://www.youtube.com/watch?v=abc"
-        );
-        assert!(validate_url("file:///C:/private.mp4").is_err());
-        assert!(validate_url("not a URL").is_err());
-    }
-
-    #[test]
-    fn batch_url_parser_handles_crlf_blanks_duplicates_and_line_errors() {
-        let parsed = parse_batch_urls(
-            "\r\n https://Media.example/watch/one \r\nhttps://media.example/watch/one\nftp://media.example/audio\nnot a url\nhttps://peer.example/video\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed.urls,
-            [
-                BatchUrl { line_number: 2, url: "https://media.example/watch/one".to_owned() },
-                BatchUrl { line_number: 6, url: "https://peer.example/video".to_owned() },
-            ]
-        );
-        assert_eq!(
-            parsed.issues,
-            [
-                "line 3: duplicate URL skipped",
-                "line 4: Only http and https media URLs are accepted.",
-                "line 5: Enter a complete http or https URL.",
-            ]
-        );
-    }
-
-    #[test]
-    fn batch_url_parser_rejects_empty_and_oversized_batches() {
-        assert!(parse_batch_urls("\n  \r\n").is_err());
-        assert!(
-            parse_batch_urls("file:///C:/private.mp4\nnot a URL").unwrap_err().contains("line 1")
-        );
-
-        let oversized = std::iter::repeat_n("https://media.example/watch", MAX_BATCH_URLS + 1)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(parse_batch_urls(&oversized).unwrap_err().contains("no more than 100"));
-    }
-
-    #[test]
-    fn queued_batch_records_snapshot_download_settings_and_schedule() {
-        let settings = BatchDownloadSettings {
-            presets: DownloadPresets::from_ui_values(true, false, "mp3", "192k", "720p")
-                .with_download_speed_limit_label("2 MB/s"),
-            subtitle_languages: "en,fr".to_owned(),
-            subtitle_format: SubtitleFormat::Srt,
-            include_auto_subtitles: true,
-            scheduled_at: Some(2_000_000_000),
-            download_directory: "C:\\Users\\Example\\Downloads".to_owned(),
-        };
-
-        let record = queued_batch_record(
-            "https://media.example/audio".to_owned(),
-            "Audio title".to_owned(),
-            "Media example".to_owned(),
-            1_900_000_000,
-            &settings,
-        );
-
-        assert_eq!(record.url, "https://media.example/audio");
-        assert_eq!(record.title, "Audio title");
-        assert_eq!(record.source, "Media example");
-        assert_eq!(record.download_mode, settings.presets.mode);
-        assert_eq!(record.audio_format, settings.presets.audio_format);
-        assert_eq!(record.audio_quality, settings.presets.audio_quality);
-        assert_eq!(record.video_quality, settings.presets.video_quality);
-        assert_eq!(record.download_speed_limit_bytes_per_second, 2_000_000);
-        assert_eq!(record.subtitle_languages, settings.subtitle_languages);
-        assert_eq!(record.subtitle_format, settings.subtitle_format);
-        assert!(record.include_auto_subtitles);
-        assert_eq!(record.scheduled_at, settings.scheduled_at);
-        assert_eq!(record.status, "Waiting for schedule");
-        assert_eq!(record.download_directory, settings.download_directory);
-    }
-
-    #[test]
-    fn clipboard_popup_position_accounts_for_dpi_and_monitor_origin() {
-        let area = WorkArea { left: -1920, top: 80, right: 0, bottom: 1160 };
-
-        assert_eq!(initial_popup_position(area, 1.5, 440, 214), (-676, 823));
-    }
-
-    #[test]
-    fn clipboard_popup_displays_the_source_host_for_any_extractor_site() {
-        assert_eq!(clipboard_source_host("https://media.example/watch/1"), "media.example");
-        assert_eq!(clipboard_source_host("https://[invalid"), "Web media");
-    }
-
-    #[test]
-    fn missing_output_file_fails_before_launching_a_handler() {
-        let path = std::env::temp_dir().join(format!("yt-save-missing-{}.mp4", Uuid::new_v4()));
-        assert!(open_file(&path).is_err());
-    }
-
-    #[test]
-    fn existing_media_file_passes_validation_without_launching_a_handler() {
-        let path = std::env::temp_dir().join(format!("yt-save-media {}.mp4", Uuid::new_v4()));
-        std::fs::write(&path, b"fixture media").unwrap();
-
-        let result = validate_output_file(&path);
-
-        std::fs::remove_file(&path).unwrap();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn a_directory_is_not_accepted_as_a_completed_media_file() {
-        let path = std::env::temp_dir().join(format!("yt-save-directory-{}", Uuid::new_v4()));
-        std::fs::create_dir(&path).unwrap();
-
-        let result = open_file(&path);
-
-        std::fs::remove_dir(&path).unwrap();
-        assert!(result.is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_open_arguments_preserve_spaces_and_unicode_without_shell_quoting() {
-        use std::os::windows::ffi::OsStringExt;
-
-        let path = std::env::temp_dir().join("Yt Save media Ω.mp4");
-        let encoded_path = wide_null_terminated(path.as_os_str());
-        let decoded_path = std::ffi::OsString::from_wide(&encoded_path[..encoded_path.len() - 1]);
-        let encoded_operation = wide_null_terminated(std::ffi::OsStr::new("open"));
-
-        assert_eq!(decoded_path, path.as_os_str());
-        assert_eq!(encoded_path.last(), Some(&0));
-        assert_eq!(
-            std::ffi::OsString::from_wide(&encoded_operation[..encoded_operation.len() - 1])
-                .as_os_str(),
-            std::ffi::OsStr::new("open")
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_requeues_saved_and_interrupted_downloads() {
-        let temp_dir = std::env::temp_dir().join(format!("yt-save-test-{}", Uuid::new_v4()));
-        let store = Store::open(temp_dir.join("state.sqlite3")).unwrap();
-        let saved_presets = DownloadPresets {
-            mode: DownloadMode::VideoOnly,
-            audio_format: AudioFormat::Flac,
-            audio_quality: AudioQuality::K320,
-            video_quality: VideoQuality::P1440,
-            download_speed_limit_bytes_per_second: 2_000_000,
-        };
-        store
-            .set_download_speed_limit(saved_presets.download_speed_limit_bytes_per_second, 1)
-            .await
-            .unwrap();
-        store.set_download_presets(saved_presets, 1).await.unwrap();
-        let queued = DownloadRecord::queued(
-            "queued".to_owned(),
-            "https://example.test/queued".to_owned(),
-            10,
-        );
-        let mut active = DownloadRecord::queued(
-            "active".to_owned(),
-            "https://example.test/active".to_owned(),
-            20,
-        );
-        active.status = "Downloading".to_owned();
-        active.playlist_index = Some(3);
-        active.download_mode = DownloadMode::VideoOnly;
-        active.audio_format = AudioFormat::Opus;
-        active.audio_quality = AudioQuality::K192;
-        active.video_quality = VideoQuality::P720;
-        active.download_directory = "C:\\Media\\Archive".to_owned();
-        active.downloaded_bytes = Some(75);
-        active.total_bytes = Some(100);
-        let mut later_playlist_item = DownloadRecord::queued(
-            "selected-later".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            30,
-        );
-        later_playlist_item.playlist_index = Some(9);
-        let mut earlier_playlist_item = DownloadRecord::queued(
-            "selected-earlier".to_owned(),
-            "https://example.test/playlist".to_owned(),
-            30,
-        );
-        earlier_playlist_item.playlist_index = Some(2);
-        let mut canceling = DownloadRecord::queued(
-            "canceling".to_owned(),
-            "https://example.test/canceling".to_owned(),
-            40,
-        );
-        canceling.status = "Canceling".to_owned();
-        canceling.progress = 22.0;
-        canceling.downloaded_bytes = Some(22);
-        canceling.total_bytes = Some(100);
-        let mut pausing = DownloadRecord::queued(
-            "pausing".to_owned(),
-            "https://example.test/pausing".to_owned(),
-            41,
-        );
-        pausing.status = "Pausing".to_owned();
-        pausing.downloaded_bytes = Some(15);
-        let mut paused = DownloadRecord::queued(
-            "paused".to_owned(),
-            "https://example.test/paused".to_owned(),
-            42,
-        );
-        paused.status = "Paused".to_owned();
-        paused.progress = 51.0;
-        paused.downloaded_bytes = Some(510);
-        store.save_download(queued.clone()).await.unwrap();
-        store.save_download(active.clone()).await.unwrap();
-        store.save_download(later_playlist_item).await.unwrap();
-        store.save_download(earlier_playlist_item).await.unwrap();
-        store.save_download(canceling).await.unwrap();
-        store.save_download(pausing).await.unwrap();
-        store.save_download(paused).await.unwrap();
-
-        let pending = recover_pending(&store).await.unwrap();
-        assert_eq!(store.load_download_presets().await.unwrap(), saved_presets);
-        assert_eq!(pending.len(), 4);
-        assert!(pending.iter().all(|record| record.status == "Queued"));
-        assert_eq!(
-            pending.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
-            ["queued", "active", "selected-later", "selected-earlier"]
-        );
-        let rows = store.list_downloads().await.unwrap();
-        let recovered_active = rows.iter().find(|record| record.id == "active").unwrap();
-        assert_eq!(recovered_active.status, "Queued");
-        assert_eq!(recovered_active.downloaded_bytes, Some(75));
-        assert_eq!(recovered_active.playlist_index, Some(3));
-        assert_eq!(recovered_active.download_mode, DownloadMode::VideoOnly);
-        assert_eq!(recovered_active.audio_format, AudioFormat::Opus);
-        assert_eq!(recovered_active.audio_quality, AudioQuality::K192);
-        assert_eq!(recovered_active.video_quality, VideoQuality::P720);
-        assert_eq!(recovered_active.download_directory, "C:\\Media\\Archive");
-        let recovered_canceling = rows.iter().find(|record| record.id == "canceling").unwrap();
-        assert_eq!(recovered_canceling.status, "Failed");
-        assert_eq!(recovered_canceling.progress, 22.0);
-        assert_eq!(recovered_canceling.downloaded_bytes, Some(22));
-        assert!(
-            recovered_canceling.error.as_deref().unwrap().contains("process-tree cancellation")
-        );
-        assert!(!pending.iter().any(|record| record.id == "canceling"));
-        let recovered_pausing = rows.iter().find(|record| record.id == "pausing").unwrap();
-        assert_eq!(recovered_pausing.status, "Failed");
-        assert_eq!(recovered_pausing.downloaded_bytes, Some(15));
-        assert!(recovered_pausing.error.as_deref().unwrap().contains("process-tree pause"));
-        let recovered_paused = rows.iter().find(|record| record.id == "paused").unwrap();
-        assert_eq!(recovered_paused.status, "Paused");
-        assert_eq!(recovered_paused.progress, 51.0);
-        assert_eq!(recovered_paused.downloaded_bytes, Some(510));
-        assert!(!pending.iter().any(|record| record.id == "paused"));
-        std::fs::remove_dir_all(temp_dir).unwrap();
-    }
-}
+mod tests;

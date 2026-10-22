@@ -31,6 +31,12 @@ The project selects Slint's GPL-3.0-or-later open-source license and therefore l
 - **Clipboard URL review and tray:** Windows clipboard monitoring is off by default and starts only after an explicit user choice. A dedicated message-loop thread forwards only a locally parsed, single HTTP(S) URL with the foreground monitor's work area and Windows notification state; raw clipboard text is not stored. When notifications are allowed, a Slint popup appears above the taskbar work area without taking keyboard focus. It expires after 12 seconds, and metadata lookup or queueing begins only after an explicit button click. Add-to-queue inspects playlist state first and presents playlist entry selection. The Slint system tray menu exposes window, queue, download-folder, and orderly-quit actions; close-to-tray and minimize-to-tray preferences are off by default and persisted in SQLite. Windows runtime acceptance remains pending.
 - **Windows packaging:** WiX Toolset 5.0.2 for MSI and Inno Setup 6 for EXE installers.
 
+## Rust module layout
+
+The app crate keeps one shared `app` state boundary, with focused child modules for independent Windows workflows. `app.rs` owns Slint startup and cross-feature wiring; `app/tray.rs` owns tray actions and orderly shutdown; `app/cookie_login.rs` owns the compact WebView2 sign-in flow and its URL-scoped cookie handoff. Keep those modules narrow: UI components stay on the Slint event loop, and process, database, and network work stays on Tokio or blocking workers.
+
+`persistence.rs` owns SQLite opening, migrations, the shared `Store` type, and row conversion helpers. `persistence/downloads.rs`, `persistence/settings.rs`, and `persistence/subscriptions.rs` implement the `Store` operations for their respective domains. Persistence tests live under `persistence/tests/`, grouped by those same responsibilities. This keeps the public store API stable while making schema, download state, settings, and subscription logic reviewable in smaller files.
+
 ## First vertical slice
 
 The implemented flow accepts any HTTP(S) URL, obtains metadata with yt-dlp JSON output, runs a download, parses machine-readable progress, and stores completion or failure. The app does not maintain a site allowlist. yt-dlp decides whether a URL has a usable extractor. Download destinations are checked as existing directories and canonicalized before a queue item is persisted. Queue actions inspect playlist URLs before persistence so users can select entries rather than accidentally queueing a whole playlist.
